@@ -572,7 +572,7 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
                             logging.info(f"wer score : {score}")
                             self.logger.experiment.add_scalar('WER', score, self.global_step)
                         else:
-                            audio_len = (labels[0][0] != 0).sum().item()
+                            audio_len = self.decoder_context_len + (labels[0][0][self.decoder_context_len:] != 0).sum().item()
                             labels_to_1024 = self.convert_tokens_to_range(labels[0, :, 0:audio_len])
                             label_wav = self.decode_wav_from_codec_model(labels_to_1024)
                             dec_input_to_1024 = self.convert_tokens_to_range(dec_input[0, :, 0:audio_len])
@@ -943,7 +943,7 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
                     logging.info(f"wer score : {score}")
                     self.logger.experiment.add_scalar('WER', score, self.global_step)
                 else:
-                    audio_len = (labels[0][0] != 0).sum().item()
+                    audio_len = self.decoder_context_len + (labels[0][0][self.decoder_context_len:] != 0).sum().item()
                     labels_to_1024 = self.convert_tokens_to_range(labels[0, :, 0:audio_len])
                     label_wav = self.decode_wav_from_codec_model(labels_to_1024)
                     dec_input_to_1024 = self.convert_tokens_to_range(dec_input[0, :, 0:audio_len])
@@ -1638,7 +1638,7 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
             audio_to_pred = []
             audio_to_pred_zh = []
             for i in range(batch_size):
-                audio_len = (labels[i][0] != 0).sum().item()
+                audio_len = self.decoder_context_len + (labels[i][0][self.decoder_context_len:] != 0).sum().item()
                 # step = batch_idx * self.test_dataloader().batch_size + i
                 if global_step is not None:
                     # During validation, step is simply global_step + i
@@ -1719,13 +1719,17 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
                         context_tokens = self.convert_tokens_to_range(context_tokens, pattern=self.context_pattern)
                         context_wav = self.decode_wav_from_codec_model(context_tokens)
                     else:
-                        raise NotImplementedError("During prediction, there was no context found.")
-                    self.logger.experiment.add_audio("Context Wav", context_wav, step, self.sample_rate)
-                    context_wav_fp = os.path.join(_exp_dir_path, f'context_wav_{wav_num}.wav')
-                    sf.write(context_wav_fp, context_wav.cpu().numpy(), self.sample_rate)
+                        context_wav = None
+                        spk_embedding_context = spk_embedding_gt
+                        # raise NotImplementedError("During prediction, there was no context found.")
+                    if context_wav is not None:
+                        self.logger.experiment.add_audio("Context Wav", context_wav, step, self.sample_rate)
+                        context_wav_fp = os.path.join(_exp_dir_path, f'context_wav_{wav_num}.wav')
+                        sf.write(context_wav_fp, context_wav.cpu().numpy(), self.sample_rate)
 
-                    spk_embedding_context = nemo_sv_model.get_embedding(context_wav_fp)
-                    spk_embedding_context = spk_embedding_context.cpu().detach().numpy().flatten()
+                        spk_embedding_context = nemo_sv_model.get_embedding(context_wav_fp)
+                        spk_embedding_context = spk_embedding_context.cpu().detach().numpy().flatten()
+                        
                     pred_similarity_context = np.dot(spk_embedding_context, spk_embedding_pred) / (
                         np.linalg.norm(spk_embedding_context) * np.linalg.norm(spk_embedding_pred)
                     )
