@@ -15,8 +15,10 @@
 
 """Transformer."""
 from contextlib import nullcontext
+from importlib.metadata import version
 from typing import Any, Callable, Optional
 
+import packaging
 import torch
 import torch.nn as nn
 from einops import rearrange
@@ -44,6 +46,7 @@ from nemo.collections.nlp.modules.common.megatron.utils import ApexGuardDefaults
 from nemo.collections.nlp.parts import utils_funcs
 from nemo.core import adapter_mixins
 from nemo.utils import logging
+from nemo.utils.import_utils import safe_import_from
 
 try:
     from apex.normalization import MixedFusedRMSNorm
@@ -69,16 +72,13 @@ except (ImportError, ModuleNotFoundError):
 
     HAVE_MEGATRON_CORE = False
 
-try:
-    from transformer_engine.common import recipe
-    from transformer_engine.pytorch import TransformerLayer, fp8_autocast
-    from transformer_engine.pytorch.distributed import checkpoint as te_checkpoint
+recipe, HAVE_RECIPE = safe_import_from("transformer_engine.common", "recipe")
+TransformerLayer, HAVE_LAYER = safe_import_from("transformer_engine.pytorch", "TransformerLayer")
+fp8_autocast, HAVE_AUTOCAST = safe_import_from("transformer_engine.pytorch", "fp8_autocast")
+te_checkpoint, HAVE_CKPT = safe_import_from("transformer_engine.pytorch.distributed", "checkpoint")
+HAVE_TE = HAVE_RECIPE and HAVE_LAYER and HAVE_AUTOCAST and HAVE_CKPT
 
-    HAVE_TE = True
-
-except:
-    HAVE_TE = False
-
+if not HAVE_TE:
     # fake missing class
     class TransformerLayer(ApexGuardDefaults):
         def __init__(self):
@@ -547,7 +547,7 @@ class ParallelTransformerLayer_(MegatronModule, adapter_mixins.AdapterModuleMixi
 
             if self.is_adapter_available():
                 adapter_1 = self.get_adapter_module(AdapterName.PRE_ATTN_ADAPTER)
-                if adapter_1:
+                if adapter_1 and self.adapter_cfg[AdapterName.PRE_ATTN_ADAPTER]['enabled']:
                     attention_output = (
                         adapter_1(attention_output) + attention_output
                     )  # simple adapter call with residual connection
@@ -627,7 +627,7 @@ class ParallelTransformerLayer_(MegatronModule, adapter_mixins.AdapterModuleMixi
         if self.is_adapter_available():
             # TODO: (@adithyre) was able to move adapter_2 back to the end of the transformer after ptl 1.7 update.
             adapter_2 = self.get_adapter_module(AdapterName.POST_ATTN_ADAPTER)
-            if adapter_2:
+            if adapter_2 and self.adapter_cfg[AdapterName.POST_ATTN_ADAPTER]['enabled']:
                 mlp_output = adapter_2(mlp_output) + mlp_output  # simple adapter call with residual connection
 
         residual = layernorm_input
@@ -823,41 +823,66 @@ class AutocastTransformerLayer(TransformerLayer):
         drop_path_rate: float = 0,
         use_emha: bool = False,
         ub_tp_comm_overlap: bool = False,
+        ub_bulk_wgrad: bool = True,
+        ub_bulk_dgrad: bool = True,
         autocast_dtype: Any = 16,
         zero_centered_gamma: bool = False,
         device: str = 'cuda',
+        **kwargs,
     ) -> None:
-        super().__init__(
-            hidden_size=hidden_size,
-            ffn_hidden_size=ffn_hidden_size,
-            layernorm_epsilon=layernorm_epsilon,
-            num_attention_heads=num_attention_heads,
-            init_method=init_method,
-            output_layer_init_method=output_layer_init_method,
-            hidden_dropout=hidden_dropout,
-            attention_dropout=attention_dropout,
-            layer_number=layer_number,
-            kv_channels=kv_channels,
-            self_attn_mask_type=self_attn_mask_type,
-            tp_group=tp_group,
-            tp_size=tp_size,
-            params_dtype=params_dtype,
-            get_rng_state_tracker=get_rng_state_tracker,
-            fuse_wgrad_accumulation=fuse_wgrad_accumulation,
-            seq_length=seq_length,
-            micro_batch_size=micro_batch_size,
-            sequence_parallel=sequence_parallel,
-            apply_residual_connection_post_layernorm=apply_residual_connection_post_layernorm,
-            output_layernorm=output_layernorm,
-            layer_type=layer_type,
-            drop_path_rate=drop_path_rate,
-            set_parallel_mode=tp_size > 1,
-            fuse_qkv_params=True,
-            zero_centered_gamma=zero_centered_gamma,
-            ub_tp_comm_overlap=ub_tp_comm_overlap,
-            device=device,
-        )
-        # use_emha=use_emha,
+        transformer_layer_args = {
+            "hidden_size": hidden_size,
+            "ffn_hidden_size": ffn_hidden_size,
+            "layernorm_epsilon": layernorm_epsilon,
+            "num_attention_heads": num_attention_heads,
+            "init_method": init_method,
+            "output_layer_init_method": output_layer_init_method,
+            "hidden_dropout": hidden_dropout,
+            "attention_dropout": attention_dropout,
+            "layer_number": layer_number,
+            "kv_channels": kv_channels,
+            "self_attn_mask_type": self_attn_mask_type,
+            "tp_group": tp_group,
+            "tp_size": tp_size,
+            "params_dtype": params_dtype,
+            "get_rng_state_tracker": get_rng_state_tracker,
+            "fuse_wgrad_accumulation": fuse_wgrad_accumulation,
+            "seq_length": seq_length,
+            "micro_batch_size": micro_batch_size,
+            "sequence_parallel": sequence_parallel,
+            "apply_residual_connection_post_layernorm": apply_residual_connection_post_layernorm,
+            "output_layernorm": output_layernorm,
+            "layer_type": layer_type,
+            "drop_path_rate": drop_path_rate,
+            "set_parallel_mode": tp_size > 1,
+            "fuse_qkv_params": True,
+            "zero_centered_gamma": zero_centered_gamma,
+            "ub_tp_comm_overlap": ub_tp_comm_overlap,
+            "ub_bulk_wgrad": ub_bulk_wgrad,
+            "ub_bulk_dgrad": ub_bulk_dgrad,
+            "device": device,
+        }
+        te_version = packaging.version.Version(version("transformer-engine"))
+        if te_version > packaging.version.Version("1.5.0"):
+            for comm in ["ag", "rs"]:
+                ub_overlap_flag = "ub_overlap_" + comm
+                split_gemm_flag = "ub_split_" + comm
+                atomic_gemm_flag = "ub_atomic_gemm_" + comm
+                # Use old overlap flags if they were supplied instead
+                if ub_overlap_flag in kwargs:
+                    transformer_layer_args[ub_overlap_flag] = kwargs[ub_overlap_flag]
+                else:
+                    transformer_layer_args[ub_overlap_flag] = kwargs.get(split_gemm_flag, True) or kwargs.get(
+                        atomic_gemm_flag, False
+                    )
+            if te_version > packaging.version.Version("1.6.0.dev0"):
+                transformer_layer_args["ub_overlap_rs_dgrad"] = kwargs.get("ub_overlap_rs_dgrad", False)
+        else:
+            transformer_layer_args["ub_split_ag"] = kwargs.get("ub_split_ag", True)
+            transformer_layer_args["ub_split_rs"] = kwargs.get("ub_split_rs", True)
+            transformer_layer_args["ub_atomic_gemm_ag"] = kwargs.get("ub_atomic_gemm_ag", False)
+            transformer_layer_args["ub_atomic_gemm_rs"] = kwargs.get("ub_atomic_gemm_rs", False)
+        super().__init__(**transformer_layer_args)
 
         # Dtype for forward pass - ignore amp O2
         self.dtype = utils_funcs.torch_dtype_from_precision(autocast_dtype, megatron_amp_O2=None)
@@ -1082,32 +1107,57 @@ class ParallelTransformer(MegatronModule):
                 lt = LayerType(lt)
 
             if self.transformer_engine:
-                return AutocastTransformerLayer(
-                    hidden_size=hidden_size,
-                    ffn_hidden_size=ffn_hidden_size,
-                    layernorm_epsilon=layernorm_epsilon,
-                    num_attention_heads=num_attention_heads,
-                    init_method=init_method,
-                    output_layer_init_method=output_layer_init_method,
-                    hidden_dropout=hidden_dropout,
-                    attention_dropout=attention_dropout,
-                    layer_number=layer_number + layer_number_offset,
-                    kv_channels=kv_channels,
-                    self_attn_mask_type=self_attn_mask_type.name,
-                    tp_size=parallel_state.get_tensor_model_parallel_world_size(),
-                    params_dtype=config.params_dtype,
-                    get_rng_state_tracker=tensor_parallel.random.get_cuda_rng_tracker,
-                    fuse_wgrad_accumulation=config.gradient_accumulation_fusion,
-                    seq_length=None,  # used for jit warmup
-                    micro_batch_size=None,  # used for jit warmup
-                    sequence_parallel=config.sequence_parallel,
-                    apply_residual_connection_post_layernorm=False,
-                    autocast_dtype=precision,
-                    use_emha=use_emha,
-                    ub_tp_comm_overlap=ub_tp_comm_overlap,
-                    zero_centered_gamma=normalization == 'layernorm1p',
-                    device='cpu' if config.use_cpu_initialization else 'cuda',
-                )
+                transformer_layer_args = {
+                    "hidden_size": hidden_size,
+                    "ffn_hidden_size": ffn_hidden_size,
+                    "layernorm_epsilon": layernorm_epsilon,
+                    "num_attention_heads": num_attention_heads,
+                    "init_method": init_method,
+                    "output_layer_init_method": output_layer_init_method,
+                    "hidden_dropout": hidden_dropout,
+                    "attention_dropout": attention_dropout,
+                    "layer_number": layer_number + layer_number_offset,
+                    "kv_channels": kv_channels,
+                    "self_attn_mask_type": self_attn_mask_type.name,
+                    "tp_size": parallel_state.get_tensor_model_parallel_world_size(),
+                    "params_dtype": config.params_dtype,
+                    "get_rng_state_tracker": tensor_parallel.random.get_cuda_rng_tracker,
+                    "fuse_wgrad_accumulation": config.gradient_accumulation_fusion,
+                    "seq_length": None,  # used for jit warmup
+                    "micro_batch_size": None,  # used for jit warmup
+                    "sequence_parallel": config.sequence_parallel,
+                    "apply_residual_connection_post_layernorm": False,
+                    "autocast_dtype": precision,
+                    "use_emha": use_emha,
+                    "ub_tp_comm_overlap": ub_tp_comm_overlap,
+                    "ub_bulk_wgrad": config.tp_comm_bulk_wgrad,
+                    "ub_bulk_dgrad": config.tp_comm_bulk_dgrad,
+                    "zero_centered_gamma": normalization == 'layernorm1p',
+                    "device": 'cpu' if config.use_cpu_initialization else 'cuda',
+                }
+                te_version = packaging.version.Version(version("transformer-engine"))
+                if te_version > packaging.version.Version("1.5.0"):
+                    # Use old overlap flags if they were supplied instead
+                    transformer_layer_args["ub_overlap_ag"] = (
+                        config.tp_comm_overlap_ag
+                        if hasattr(config, "tp_comm_overlap_ag")
+                        else config.tp_comm_split_ag or config.tp_comm_atomic_ag
+                    )
+                    transformer_layer_args["ub_overlap_rs"] = (
+                        config.tp_comm_overlap_rs
+                        if hasattr(config, "tp_comm_overlap_rs")
+                        else config.tp_comm_split_rs or config.tp_comm_atomic_rs
+                    )
+                    if te_version > packaging.version.Version("1.6.0.dev0"):
+                        transformer_layer_args["ub_overlap_rs_dgrad"] = (
+                            config.tp_comm_overlap_rs_dgrad if hasattr(config, "tp_comm_overlap_rs_dgrad") else False
+                        )
+                else:
+                    transformer_layer_args["ub_split_ag"] = config.tp_comm_split_ag
+                    transformer_layer_args["ub_split_rs"] = config.tp_comm_split_rs
+                    transformer_layer_args["ub_atomic_gemm_ag"] = config.tp_comm_atomic_ag
+                    transformer_layer_args["ub_atomic_gemm_rs"] = config.tp_comm_atomic_rs
+                return AutocastTransformerLayer(**transformer_layer_args)
             else:
                 return ParallelTransformerLayer(
                     config=config,
@@ -1511,7 +1561,12 @@ class ParallelTransformer(MegatronModule):
         It indicates if the current step in the forward pass is the first in a gradient accumulation cycle.
         If set, FP8 weights are cached and some minor optimizations are applied to fuse_wgrad_accumulation
         """
-        from apex.transformer.pipeline_parallel.utils import _GLOBAL_NUM_MICROBATCHES_CALCULATOR
+        try:
+            from megatron.core.num_microbatches_calculator import _GLOBAL_NUM_MICROBATCHES_CALCULATOR
+
+        except (ImportError, ModuleNotFoundError):
+            logging.warning("Megatron num_microbatches_calculator not found, using Apex version.")
+            from apex.transformer.pipeline_parallel.utils import _GLOBAL_NUM_MICROBATCHES_CALCULATOR
 
         num_micro_batches = getattr(_GLOBAL_NUM_MICROBATCHES_CALCULATOR, 'num_micro_batches', 1)
 

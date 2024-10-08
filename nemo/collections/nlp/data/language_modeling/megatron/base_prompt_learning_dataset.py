@@ -13,11 +13,12 @@
 # limitations under the License.
 
 import torch
+import omegaconf
 
 from nemo.collections.nlp.modules.common import VirtualPromptSource
 from nemo.core import Dataset
 from nemo.utils import logging
-import omegaconf
+from nemo.utils.decorators import deprecated_warning
 
 __all__ = ['BasePromptLearningDataset']
 
@@ -42,6 +43,9 @@ class BasePromptLearningDataset(Dataset):
         add_eos: bool = True,
         for_train: bool = True,
     ):
+        # deprecation warning
+        deprecated_warning("BasePromptLearningDataset")
+
         self.tokenizer = tokenizer
         self.virtual_prompt_source = virtual_prompt_source
         self.task_templates = task_templates
@@ -86,18 +90,18 @@ class BasePromptLearningDataset(Dataset):
                 dataset_lengths.append(len(dataset_examples))
                 total_examples += len(dataset_examples)
                 target_probs.append(prob)
-            
+
             # Normalize the target probs
             target_probs = [prob / sum(target_probs) for prob in target_probs]
             current_probs = [dataset_lengths[i] / total_examples for i in range(len(dataset_lengths))]
-            
+
             # Increase number of examples needed without reducing the larger datasets with low target probs
             new_total_examples = total_examples
             for dataset_idx in range(len(datasets)):
                 if target_probs[dataset_idx] < current_probs[dataset_idx]:
                     target_total_examples = int(dataset_lengths[dataset_idx] / target_probs[dataset_idx])
                     new_total_examples = max(new_total_examples, target_total_examples)
-            
+
             final_total_examples = 0
             final_dataset_lengths = []
             for dataset_idx in range(len(datasets)):
@@ -108,7 +112,7 @@ class BasePromptLearningDataset(Dataset):
                 final_dataset_lengths.append(len(dataset_examples_repeated))
                 final_total_examples += len(dataset_examples_repeated)
                 self.examples.extend(dataset_examples_repeated)
-            
+
             final_probs = [final_dataset_lengths[i] / final_total_examples for i in range(len(final_dataset_lengths))]
             logging.info("Target probs: {}".format(target_probs))
             logging.info("Final probs: {}".format(final_probs))
@@ -118,7 +122,7 @@ class BasePromptLearningDataset(Dataset):
             raise ValueError("Datasets must be a list of dicts or a list of filepath strings")
 
     def _insert_virtual_token_placeholders(self, input_example, virtual_token_splits):
-        """ Insert the correct number of pseudo tokens at the <|VIRTUAL_PROMPT_n|> markers """
+        """Insert the correct number of pseudo tokens at the <|VIRTUAL_PROMPT_n|> markers"""
         total_inserted_tokens = 0
 
         for idx in range(len(virtual_token_splits)):
@@ -131,7 +135,7 @@ class BasePromptLearningDataset(Dataset):
         return input_example
 
     def _truncate_input(self, truncation_field, input_ids, taskname, doc, total_virtual_tokens=0):
-        """ Try to truncate input text to fit into the max sequence length """
+        """Try to truncate input text to fit into the max sequence length"""
         logging.info(
             f"Input greater than max sequence length. Attempting to truncate: '{truncation_field}' in task: '{taskname}'"
         )
@@ -161,7 +165,7 @@ class BasePromptLearningDataset(Dataset):
         return input_ids
 
     def _add_leading_space(self, taskname, field_name, field_text):
-        """ Add leading space to text if there is a space before it in the template """
+        """Add leading space to text if there is a space before it in the template"""
         prompt_template = self.task_templates[taskname]["prompt_template"]
         field_text_start = prompt_template.find("{" + field_name + "}")
         if field_text_start != 0 and prompt_template[field_text_start - 1] == " ":
@@ -233,11 +237,11 @@ class BasePromptLearningDataset(Dataset):
 
 
 def find_subsequence_location(sequence, subsequence):
-    """ Finds the start and end index of the first occurance 
-        of a given subsequence within a larger list. Returns 
-        the two indices corresponding to the postition of 
-        the first and last token of the subseqeunce.
-        Assumes subsequence is known to be in sequence. 
+    """Finds the start and end index of the first occurance
+    of a given subsequence within a larger list. Returns
+    the two indices corresponding to the postition of
+    the first and last token of the subseqeunce.
+    Assumes subsequence is known to be in sequence.
     """
     assert len(sequence) >= len(subsequence), "subsequence too long"
 

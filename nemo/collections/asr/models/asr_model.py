@@ -12,15 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import logging
-from abc import ABC, abstractmethod
-from typing import List
+from abc import ABC
+from typing import List, Optional
 
 import torch
 
+from nemo.collections.common.parts.optional_cuda_graphs import WithOptionalCudaGraphs
 from nemo.core.classes import ModelPT
 from nemo.core.classes.common import PretrainedModelInfo
 from nemo.core.classes.exportable import Exportable
 from nemo.core.classes.mixins import AccessMixin
+from nemo.core.neural_types import AudioSignal, LabelsType, LengthsType, NeuralType
 from nemo.core.utils.neural_type_utils import get_io_names
 from nemo.utils import logging, model_utils
 from nemo.utils.cast_utils import cast_all
@@ -30,18 +32,60 @@ __all__ = ['ASRModel']
 
 class ASRModel(ModelPT, ABC):
     def multi_validation_epoch_end(self, outputs, dataloader_idx: int = 0):
-        val_loss_mean = torch.stack([x['val_loss'] for x in outputs]).mean()
-        wer_num = torch.stack([x['val_wer_num'] for x in outputs]).sum()
-        wer_denom = torch.stack([x['val_wer_denom'] for x in outputs]).sum()
-        tensorboard_logs = {'val_loss': val_loss_mean, 'val_wer': wer_num / wer_denom}
-        return {'val_loss': val_loss_mean, 'log': tensorboard_logs}
+        val_loss = {}
+        tensorboard_logs = {}
+
+        if 'val_loss' in outputs[0]:
+            val_loss_mean = torch.stack([x['val_loss'] for x in outputs]).mean()
+            val_loss = {'val_loss': val_loss_mean}
+
+            tensorboard_logs.update(val_loss)
+
+        if "val_wer_num" in outputs[0]:
+            wer_num = torch.stack([x['val_wer_num'] for x in outputs]).sum()
+            wer_denom = torch.stack([x['val_wer_denom'] for x in outputs]).sum()
+            val_wer = {'val_wer': wer_num / wer_denom}
+
+            tensorboard_logs.update(val_wer)
+
+        if "val_bleu_num" in outputs[0]:
+            bleu_pred_len = torch.stack([x[f"val_bleu_pred_len"] for x in outputs]).sum()
+            bleu_target_len = torch.stack([x[f"val_bleu_target_len"] for x in outputs]).sum()
+            bleu_num = torch.stack([x[f"val_bleu_num"] for x in outputs]).sum(dim=0)
+            bleu_denom = torch.stack([x[f"val_bleu_denom"] for x in outputs]).sum(dim=0)
+            val_bleu = {"val_bleu": self.bleu._compute_bleu(bleu_pred_len, bleu_target_len, bleu_num, bleu_denom)}
+
+            tensorboard_logs.update(val_bleu)
+
+        return {**val_loss, 'log': tensorboard_logs}
 
     def multi_test_epoch_end(self, outputs, dataloader_idx: int = 0):
-        val_loss_mean = torch.stack([x['test_loss'] for x in outputs]).mean()
-        wer_num = torch.stack([x['test_wer_num'] for x in outputs]).sum()
-        wer_denom = torch.stack([x['test_wer_denom'] for x in outputs]).sum()
-        tensorboard_logs = {'test_loss': val_loss_mean, 'test_wer': wer_num / wer_denom}
-        return {'test_loss': val_loss_mean, 'log': tensorboard_logs}
+        val_loss = {}
+        tensorboard_logs = {}
+
+        if 'test_loss' in outputs[0]:
+            val_loss_mean = torch.stack([x['test_loss'] for x in outputs]).mean()
+            val_loss = {'test_loss': val_loss_mean}
+
+            tensorboard_logs.update(val_loss)
+
+        if "test_wer_num" in outputs[0]:
+            wer_num = torch.stack([x['test_wer_num'] for x in outputs]).sum()
+            wer_denom = torch.stack([x['test_wer_denom'] for x in outputs]).sum()
+            val_wer = {'test_wer': wer_num / wer_denom}
+
+            tensorboard_logs.update(val_wer)
+
+        if "test_bleu_num" in outputs[0]:
+            bleu_pred_len = torch.stack([x[f"test_bleu_pred_len"] for x in outputs]).sum()
+            bleu_target_len = torch.stack([x[f"test_bleu_target_len"] for x in outputs]).sum()
+            bleu_num = torch.stack([x[f"test_bleu_num"] for x in outputs]).sum()
+            bleu_denom = torch.stack([x[f"test_bleu_denom"] for x in outputs]).sum()
+            val_bleu = {"test_bleu": self.wer._compute_bleu(bleu_pred_len, bleu_target_len, bleu_num, bleu_denom)}
+
+            tensorboard_logs.update(val_bleu)
+
+        return {**val_loss, 'log': tensorboard_logs}
 
     @classmethod
     def list_available_models(cls) -> 'List[PretrainedModelInfo]':
@@ -66,7 +110,7 @@ class ASRModel(ModelPT, ABC):
             Loss tensor used for back propagation.
         """
         # Add adapter auxiliary losses, if registered
-        if AccessMixin.is_access_enabled():
+        if AccessMixin.is_access_enabled(self.model_guid):
             registry = AccessMixin.get_module_registry(self)
             log_dict = {}
 
@@ -129,6 +173,72 @@ class ASRModel(ModelPT, ABC):
                 logging.warning(f'detected inf or nan values in gradients! Setting gradients to zero.')
                 self.zero_grad()
 
+    def on_train_epoch_start(self) -> None:
+        """
+        Decoder with CUDA graphs does not release memory, thus we disable it for training epoch.
+        EncDecRNNTModel.decoding.decoding is the inference class with CUDA graphs
+        """
+        WithOptionalCudaGraphs.disable_cuda_graphs_recursive(self, attribute_path="decoding.decoding")
+
+    def on_train_epoch_end(self) -> None:
+        """
+        After training, we can enable the decoder with CUDA graphs.
+        EncDecRNNTModel.decoding.decoding is the inference class with CUDA graphs
+        """
+        WithOptionalCudaGraphs.enable_cuda_graphs_recursive(self, attribute_path="decoding.decoding")
+
+    def on_validation_epoch_start(self) -> None:
+        """
+        For validation, we enable CUDA graphs to speedup validation.
+        EncDecRNNTModel.decoding.decoding is the inference class with CUDA graphs.
+        """
+        WithOptionalCudaGraphs.enable_cuda_graphs_recursive(self, attribute_path="decoding.decoding")
+
+    def on_validation_epoch_end(self) -> Optional[dict[str, dict[str, torch.Tensor]]]:
+        """
+        After validation, we disable CUDA graphs, since `validation` can be called in training loop, and
+        training will continue after validation
+        EncDecRNNTModel.decoding.decoding is the inference class with CUDA graphs.
+        """
+        WithOptionalCudaGraphs.disable_cuda_graphs_recursive(self, attribute_path="decoding.decoding")
+        return super().on_validation_epoch_end()
+
+    def on_test_epoch_start(self) -> None:
+        """
+        For testing, we enable CUDA graphs to speedup validation.
+        We do not need to disable CUDA graphs after testing, since `test` cannot be called in training loop.
+        EncDecRNNTModel.decoding.decoding is the inference class with CUDA graphs.
+        """
+        WithOptionalCudaGraphs.enable_cuda_graphs_recursive(self, attribute_path="decoding.decoding")
+
+    def on_predict_epoch_start(self) -> None:
+        """
+        For predicting, we enable CUDA graphs to speedup validation.
+        We do not need to disable CUDA graphs after predicting, since `predict` cannot be called in training loop.
+        EncDecRNNTModel.decoding.decoding is the inference class with CUDA graphs
+        """
+        WithOptionalCudaGraphs.enable_cuda_graphs_recursive(self, attribute_path="decoding.decoding")
+
+    @property
+    def oomptimizer_schema(self) -> dict:
+        """
+        Return a typing schema for optimal batch size calibration for various
+        sequence lengths using OOMptimizer.
+        """
+        return {
+            "cls": tuple,
+            "inputs": [
+                {"type": NeuralType(("B", "T"), AudioSignal()), "seq_length": "input"},
+                {"type": NeuralType(("B",), LengthsType()), "seq_length": "input"},
+                {
+                    "type": NeuralType(("B", "T"), LabelsType()),
+                    "seq_length": "output",
+                    "vocab_size": self.tokenizer.vocab_size,
+                },
+                {"type": NeuralType(("B",), LengthsType()), "seq_length": "output"},
+            ],
+        }
+
 
 class ExportableEncDecModel(Exportable):
     """
@@ -151,19 +261,19 @@ class ExportableEncDecModel(Exportable):
         if getattr(self.input_module, 'export_cache_support', False):
             in_types = self.input_module.output_types
             otypes = {n: t for (n, t) in list(otypes.items())[:1]}
-            for (n, t) in list(in_types.items())[1:]:
+            for n, t in list(in_types.items())[1:]:
                 otypes[n] = t
         return get_io_names(otypes, self.disabled_deployment_output_names)
 
     def forward_for_export(
-        self, input, length=None, cache_last_channel=None, cache_last_time=None, cache_last_channel_len=None
+        self, audio_signal, length=None, cache_last_channel=None, cache_last_time=None, cache_last_channel_len=None
     ):
         """
         This forward is used when we need to export the model to ONNX format.
         Inputs cache_last_channel and cache_last_time are needed to be passed for exporting streaming models.
+
         Args:
-            input: Tensor that represents a batch of raw audio signals,
-                of shape [B, T]. T here represents timesteps.
+            input: Tensor that represents a batch of raw audio signals of shape [B, T]. T here represents timesteps.
             length: Vector of length B, that contains the individual lengths of the audio sequences.
             cache_last_channel: Tensor of shape [N, B, T, H] which contains the cache for last channel layers
             cache_last_time: Tensor of shape [N, B, H, T] which contains the cache for last time layers
@@ -175,12 +285,12 @@ class ExportableEncDecModel(Exportable):
         """
         enc_fun = getattr(self.input_module, 'forward_for_export', self.input_module.forward)
         if cache_last_channel is None:
-            encoder_output = enc_fun(audio_signal=input, length=length)
+            encoder_output = enc_fun(audio_signal=audio_signal, length=length)
             if isinstance(encoder_output, tuple):
                 encoder_output = encoder_output[0]
         else:
             encoder_output, length, cache_last_channel, cache_last_time, cache_last_channel_len = enc_fun(
-                audio_signal=input,
+                audio_signal=audio_signal,
                 length=length,
                 cache_last_channel=cache_last_channel,
                 cache_last_time=cache_last_time,

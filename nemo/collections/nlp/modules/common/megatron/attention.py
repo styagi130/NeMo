@@ -21,6 +21,7 @@ from einops import rearrange, repeat
 from nemo.collections.nlp.modules.common.megatron.adapters.parallel_adapters import (
     AdapterName,
     InfusedAdapterConfig,
+    LoraDenseAttentionAdapterConfig,
     LoraKQVAdapterConfig,
     LoraKQVAdapterWeightTyingConfig,
     LoraKVAdapterConfig,
@@ -67,13 +68,9 @@ except (ImportError, ModuleNotFoundError):
 
 try:
     # Flash Attention Triton
-    import pkg_resources
     from flash_attn.flash_attn_triton import flash_attn_func as flash_attn_func_triton
 
-    # pinned triton version for flash-attention triton https://github.com/HazyResearch/flash-attention/blob/main/flash_attn/flash_attn_triton.py#L3
-    assert pkg_resources.get_distribution("triton").version == '2.0.0.dev20221202'
-
-except (ImportError, ModuleNotFoundError, AssertionError):
+except (ImportError, ModuleNotFoundError):
 
     flash_attn_func_triton = None
 
@@ -173,6 +170,7 @@ class ParallelAttention(MegatronModule, adapter_mixins.AdapterModuleMixin):
                 LoraQAdapterConfig._target_,
                 LoraKVAdapterConfig._target_,
                 LoraKQVAdapterWeightTyingConfig._target_,
+                LoraDenseAttentionAdapterConfig._target_,
             ]
         )
 
@@ -204,7 +202,12 @@ class ParallelAttention(MegatronModule, adapter_mixins.AdapterModuleMixin):
         else:
             assert attention_type == AttnType.cross_attn
             self.query = tensor_parallel.ColumnParallelLinear(
-                hidden_size, projection_size, config=config, gather_output=False, init_method=init_method, bias=bias,
+                hidden_size,
+                projection_size,
+                config=config,
+                gather_output=False,
+                init_method=init_method,
+                bias=bias,
             )
 
             self.key_value = tensor_parallel.ColumnParallelLinear(
@@ -338,7 +341,7 @@ class ParallelAttention(MegatronModule, adapter_mixins.AdapterModuleMixin):
             """[s, b, num_splits * np * hn]
             -->(view) [s, b, num_splits, np, hn]
             -->(tranpose) [s, b, np, num_splits, hn]
-            -->(view) [s, b, np * num_splits * hn] """
+            -->(view) [s, b, np * num_splits * hn]"""
 
             intermediate_shape = input_shape[:-1] + (
                 num_splits,
@@ -352,7 +355,7 @@ class ParallelAttention(MegatronModule, adapter_mixins.AdapterModuleMixin):
             """[s, b, np * hn * num_splits]
             -->(view) [s, b, np, hn, num_splits]
             -->(tranpose) [s, b, np, num_splits, hn]
-            -->(view) [s, b, np * num_splits * hn] """
+            -->(view) [s, b, np * num_splits * hn]"""
 
             intermediate_shape = input_shape[:-1] + (
                 self.num_attention_heads_per_partition,
@@ -419,7 +422,7 @@ class ParallelAttention(MegatronModule, adapter_mixins.AdapterModuleMixin):
             mixed_x_layer, _ = self.query_key_value(hidden_states)
             if self.is_adapter_available():
                 lora_kqv_adapter = self.get_adapter_module(AdapterName.LORA_KQV_ADAPTER)
-                if lora_kqv_adapter:
+                if lora_kqv_adapter and self.adapter_cfg[AdapterName.LORA_KQV_ADAPTER]['enabled']:
                     lora_mixed_x_layer = lora_kqv_adapter(hidden_states)
                     mixed_x_layer = mixed_x_layer + lora_mixed_x_layer
 
@@ -438,6 +441,7 @@ class ParallelAttention(MegatronModule, adapter_mixins.AdapterModuleMixin):
             )
         else:  # Else in cross_attention
             # Attention heads [sk, b, h] --> [sk, b, (np * 2 * hn)]
+<<<<<<< HEAD
             if (
                 inference_max_sequence_len is None
             ) or self.inference_current_sequence_len < inference_max_sequence_len:
@@ -450,6 +454,14 @@ class ParallelAttention(MegatronModule, adapter_mixins.AdapterModuleMixin):
                     if lora_kv_adapter:
                         lora_mixed_kv_layer = lora_kv_adapter(encoder_output)
                         mixed_kv_layer = mixed_kv_layer + lora_mixed_kv_layer
+=======
+            mixed_kv_layer, _ = self.key_value(encoder_output)
+            if self.is_adapter_available():
+                lora_kv_adapter = self.get_adapter_module(AdapterName.LORA_KV_ADAPTER)
+                if lora_kv_adapter and self.adapter_cfg[AdapterName.LORA_KV_ADAPTER]['enabled']:
+                    lora_mixed_kv_layer = lora_kv_adapter(encoder_output)
+                    mixed_kv_layer = mixed_kv_layer + lora_mixed_kv_layer
+>>>>>>> nvidia/main
 
                 # [sk, b, (np * 2 * hn)] --> [sk, b, np, 2 * hn]
                 new_tensor_shape = mixed_kv_layer.size()[:-1] + (
@@ -475,7 +487,7 @@ class ParallelAttention(MegatronModule, adapter_mixins.AdapterModuleMixin):
             query_layer, _ = self.query(hidden_states)
             if self.is_adapter_available():
                 lora_q_adapter = self.get_adapter_module(AdapterName.LORA_Q_ADAPTER)
-                if lora_q_adapter:
+                if lora_q_adapter and self.adapter_cfg[AdapterName.LORA_Q_ADAPTER]['enabled']:
                     lora_q_layer = lora_q_adapter(hidden_states)
                     query_layer = query_layer + lora_q_layer
             # [sq, b, hp] --> [sq, b, np, hn]
@@ -488,11 +500,11 @@ class ParallelAttention(MegatronModule, adapter_mixins.AdapterModuleMixin):
         if self.is_adapter_available():
             key_infused_adapter = self.get_adapter_module(AdapterName.KEY_INFUSED)
             value_infused_adapter = self.get_adapter_module(AdapterName.VALUE_INFUSED)
-            if key_infused_adapter:
+            if key_infused_adapter and self.adapter_cfg[AdapterName.KEY_INFUSED]['enabled']:
                 assert value_infused_adapter is not None, "Expected value_infused_adapter not found!"
                 kls = key_layer.shape
                 key_layer = key_infused_adapter(key_layer.reshape(kls[0], kls[1], -1)).reshape(kls)
-            if value_infused_adapter:
+            if value_infused_adapter and self.adapter_cfg[AdapterName.VALUE_INFUSED]['enabled']:
                 assert key_infused_adapter is not None, "Expected key_infused_adapter not found!"
                 vls = value_layer.shape
                 value_layer = value_infused_adapter(value_layer.reshape(vls[0], vls[1], -1)).reshape(vls)
@@ -557,7 +569,10 @@ class ParallelAttention(MegatronModule, adapter_mixins.AdapterModuleMixin):
             )
             v = _cast_if_autocast_enabled(rearrange(value_layer, 'sk b np hn -> b sk np hn'))
             context_layer = flash_attn_with_kvcache(
-                q=q, k_cache=k, v_cache=v, causal=self.attn_mask_type == AttnMaskType.causal,
+                q=q,
+                k_cache=k,
+                v_cache=v,
+                causal=self.attn_mask_type == AttnMaskType.causal,
             )
             context_layer = rearrange(context_layer, 'b sq np hn -> sq b (np hn)')
 
@@ -594,6 +609,11 @@ class ParallelAttention(MegatronModule, adapter_mixins.AdapterModuleMixin):
         # =================
 
         output, bias = self.dense(context_layer)
+        if self.is_adapter_available():
+            lora_dense_adapter = self.get_adapter_module(AdapterName.LORA_DENSE_ATTENTION_ADAPTER)
+            if lora_dense_adapter and self.adapter_cfg[AdapterName.LORA_DENSE_ATTENTION_ADAPTER]['enabled']:
+                lora_dense_output = lora_dense_adapter(context_layer)
+                output = output + lora_dense_output
 
         if get_key_value:
             output = [output, present]
@@ -765,9 +785,9 @@ class ParallelChunkedCrossAttention(MegatronModule):
 
 
 class CoreAttention(MegatronModule):
-    """ Region where selective activation recomputation is applied.
-        See Figure 3. in Reducing Activation Recomputation in Large Transformer Models
-        https://arxiv.org/pdf/2205.05198.pdf for more details.
+    """Region where selective activation recomputation is applied.
+    See Figure 3. in Reducing Activation Recomputation in Large Transformer Models
+    https://arxiv.org/pdf/2205.05198.pdf for more details.
 
     """
 
@@ -1115,10 +1135,21 @@ class CoreAttention(MegatronModule):
 
         if attention_bias is not None:
             return self.flash_attention_triton(
-                query_layer, key_layer, value_layer, attention_mask, attention_bias, is_causal,
+                query_layer,
+                key_layer,
+                value_layer,
+                attention_mask,
+                attention_bias,
+                is_causal,
             )
         else:
-            return self.flash_attention_cuda(query_layer, key_layer, value_layer, attention_mask, is_causal,)
+            return self.flash_attention_cuda(
+                query_layer,
+                key_layer,
+                value_layer,
+                attention_mask,
+                is_causal,
+            )
 
     def flash_attention_cuda(self, query_layer, key_layer, value_layer, attention_mask, is_causal):
         batch_size, seqlen, nheads, _ = query_layer.shape
@@ -1192,7 +1223,13 @@ class CoreAttention(MegatronModule):
             if attention_bias.shape[3] == attention_mask_kv.shape[3]:
                 attention_bias = attention_bias.masked_fill(~attention_mask_kv, torch.finfo(query_layer.dtype).min)
 
-        context_layer = flash_attn_func_triton(query_layer, key_layer, value_layer, attention_bias, is_causal,)
+        context_layer = flash_attn_func_triton(
+            query_layer,
+            key_layer,
+            value_layer,
+            attention_bias,
+            is_causal,
+        )
 
         # [b, sq, np, hn] -> [b, np, sq, hn]
         context_layer = context_layer.permute(0, 2, 1, 3)

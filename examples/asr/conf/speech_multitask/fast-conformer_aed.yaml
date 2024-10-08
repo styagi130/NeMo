@@ -13,6 +13,14 @@ name: "FastConformer-Transformer-MultiTask"
 #  may help (or even be required to) stabilize the training.
 init_from_nemo_model: null
 
+# If using example training script, below will be used to instantiate spl_tokens tokenizer.
+# Similar can be done by calling CanaryTokenizer.build_special_tokenizer(tokens, output_dir).
+# If a tokenizer exists in dir, will skip building and use already built tokenizer.
+spl_tokens:
+  model_dir: ???
+  tokens: ["translate", "transcribe", "en", "es", "de", "fr"]
+  force_rebuild: False  # Set to True to build new tokenizer each time.
+
 model:
   sample_rate: 16000
   label_smoothing: 0.0
@@ -75,7 +83,7 @@ model:
     type: agg  # Can be either bpe (SentencePiece tokenizer) or wpe (WordPiece tokenizer) or `agg` for aggregate tokenizers
     langs:
       spl_tokens: # special tokens model
-        dir: ???
+        dir: null # Passed in training script
         type: bpe
       en: # English tokenizer (example, replace with whichever language you would like or add tokenizers to add tokenizer for additional languages) 
         dir: ???
@@ -240,10 +248,12 @@ trainer:
   max_steps: 100000 # computed at runtime if not set
   val_check_interval: 1.0 # Set to 0.25 to check 4 times per epoch, or an int for number of iterations
   accelerator: auto
-  strategy: ddp
+  strategy:
+    _target_: pytorch_lightning.strategies.DDPStrategy
+    gradient_as_bucket_view: true
   accumulate_grad_batches: 1
   gradient_clip_val: 0.0
-  precision: 16 # Should be set to 16 for O1 and O2 to enable the AMP.
+  precision: bf16-mixed # Should be set to bf16-mixed/16-mixed for O1 and O2 to enable the AMP.
   log_every_n_steps: 100  # Interval of logging.
   enable_progress_bar: True
   num_sanity_val_steps: 2 # number of steps to perform validation steps for sanity check the validation process before starting the training, setting to 0 disables it
@@ -251,6 +261,7 @@ trainer:
   sync_batchnorm: true
   enable_checkpointing: False  # Provided by exp_manager
   logger: false  # Provided by exp_manager
+  use_distributed_sampler: false  # Lhotse has its own distributed sampler
 
 exp_manager:
   exp_dir: null

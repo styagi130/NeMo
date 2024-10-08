@@ -13,7 +13,8 @@
 # limitations under the License.
 
 import itertools
-from typing import Any, Dict, List, Optional
+import queue
+from typing import Any, Dict, Iterator, List, Optional
 
 import torch
 import torch.nn.functional as F
@@ -25,7 +26,13 @@ from nemo.collections.nlp.data.language_modeling.megatron.data_samplers import (
     MegatronPretrainingRandomSampler,
     MegatronPretrainingSampler,
 )
-from nemo.collections.nlp.models.language_modeling.megatron.bert_model import BertModel
+from nemo.collections.nlp.models.language_modeling.megatron.bert.bert_model import (
+    MCoreBertModelWrapperWithPostLNSupport,
+    NeMoBertModel,
+)
+from nemo.collections.nlp.models.language_modeling.megatron.bert.bert_spec import (
+    bert_layer_with_transformer_engine_spec_postln,
+)
 from nemo.collections.nlp.models.language_modeling.megatron_base_model import MegatronBaseModel
 from nemo.collections.nlp.modules.common.megatron.build_model import build_model
 from nemo.collections.nlp.modules.common.megatron.module import Float16Module
@@ -34,20 +41,10 @@ from nemo.collections.nlp.modules.common.megatron.utils import (
     average_losses_across_data_parallel_group,
     get_params_for_weight_decay_optimization,
 )
-from nemo.collections.nlp.parts.nlp_overrides import GradScaler
 from nemo.collections.nlp.parts.utils_funcs import get_last_rank
 from nemo.core.classes.common import PretrainedModelInfo
 from nemo.core.neural_types import ChannelType, MaskType, NeuralType
-from nemo.utils import AppState, logging
-
-try:
-    from apex.transformer.pipeline_parallel.utils import get_num_microbatches
-
-    HAVE_APEX = True
-
-except (ImportError, ModuleNotFoundError):
-
-    HAVE_APEX = False
+from nemo.utils import logging
 
 try:
     import logging
@@ -60,6 +57,7 @@ except (ImportError, ModuleNotFoundError):
 
 try:
     from megatron.core import parallel_state
+    from megatron.core.models.bert.bert_layer_specs import bert_layer_with_transformer_engine_spec
     from megatron.core.pipeline_parallel.schedules import get_forward_backward_func
     from megatron.core.transformer.module import Float16Module as MCoreFloat16Module
     from megatron.core.transformer.transformer_config import TransformerConfig
@@ -69,6 +67,13 @@ try:
 except (ImportError, ModuleNotFoundError):
     TransformerConfig = ApexGuardDefaults
     HAVE_MEGATRON_CORE = False
+
+try:
+    from megatron.core.num_microbatches_calculator import get_num_microbatches
+
+except (ImportError, ModuleNotFoundError):
+    logging.warning("Megatron num_microbatches_calculator not found, using Apex version.")
+    from apex.transformer.pipeline_parallel.utils import get_num_microbatches
 
 
 class MegatronBertModel(MegatronBaseModel):
@@ -129,24 +134,30 @@ class MegatronBertModel(MegatronBaseModel):
             # Model wrapper to convert both model and inputs to half precision
             self._wrap_model_for_O2()
 
-        if hasattr(self, '_nsys_profile_enabled'):
+        if hasattr(self, '_nsys_profile_enabled') or hasattr(self, '_memory_profile_enabled'):
             mp_size = cfg.get('tensor_model_parallel_size', 1) * cfg.get('pipeline_model_parallel_size', 1)
             data_parallel_world_size = trainer.world_size // mp_size
             grad_accum_steps = cfg.get('global_batch_size') // (cfg.get('micro_batch_size') * data_parallel_world_size)
-            self._nsys_profile_start_step *= grad_accum_steps
-            self._nsys_profile_end_step *= grad_accum_steps
+            if hasattr(self, '_nsys_profile_enabled'):
+                self._nsys_profile_start_step *= grad_accum_steps
+                self._nsys_profile_end_step *= grad_accum_steps
+            if hasattr(self, '_memory_profile_enabled'):
+                self._memory_profile_start_step *= grad_accum_steps
+                self._memory_profile_end_step *= grad_accum_steps
 
     def model_provider_func(self, pre_process, post_process):
         cfg = self.cfg
         num_tokentypes = 2 if cfg.bert_binary_head else 0
-
+        transformer_block_type = cfg.get('transformer_block_type', 'pre_ln')
         if self.mcore_bert:
-            from megatron.core.models.bert.bert_layer_specs import bert_layer_with_transformer_engine_spec
-            from megatron.core.models.bert.bert_model import BertModel as MCoreBertModel
+            if transformer_block_type == 'pre_ln':
+                layer_spec = bert_layer_with_transformer_engine_spec
+            else:
+                layer_spec = bert_layer_with_transformer_engine_spec_postln
 
-            model = MCoreBertModel(
+            model = MCoreBertModelWrapperWithPostLNSupport(
                 config=self.transformer_config,
-                transformer_layer_spec=bert_layer_with_transformer_engine_spec,
+                transformer_layer_spec=layer_spec,
                 vocab_size=self.padded_vocab_size,
                 max_sequence_length=cfg.max_position_embeddings,
                 num_tokentypes=num_tokentypes,
@@ -155,9 +166,11 @@ class MegatronBertModel(MegatronBaseModel):
                 parallel_output=True,
                 pre_process=pre_process,
                 post_process=post_process,
+                transformer_block_type=transformer_block_type,
+                add_pooler=self.cfg.get('add_pooler', False),
             )
         else:
-            model = BertModel(
+            model = NeMoBertModel(
                 config=self.model_parallel_config,
                 vocab_size=self.padded_vocab_size,
                 hidden_size=cfg.hidden_size,
@@ -185,21 +198,22 @@ class MegatronBertModel(MegatronBaseModel):
                 layernorm_epsilon=cfg.get('layernorm_epsilon', 1e-5),
                 masked_softmax_fusion=cfg.get('masked_softmax_fusion', True),
                 normalization=cfg.get('normalization', 'layernorm'),
-                transformer_block_type=cfg.get('transformer_block_type', 'pre_ln'),
+                transformer_block_type=transformer_block_type,
                 bias_gelu_fusion=cfg.get('bias_gelu_fusion', True),
                 bias_dropout_add_fusion=cfg.get("bias_dropout_add_fusion", True),
                 onnx_safe=cfg.get('onnx_safe', False),
                 add_binary_head=cfg.bert_binary_head,
-                skip_head=cfg.get('skip_head', False),
                 megatron_legacy=cfg.get('megatron_legacy', False),
                 position_embedding_type=self.cfg.get("position_embedding_type", "learned_absolute"),
+                add_pooler=cfg.get('add_pooler', True),
+                add_lm_head=cfg.get('add_lm_head', True),
             )
 
         return model
 
     def _validate_trainer(self):
-        """ Certain trainer configurations can break training.
-            Here we try to catch them and raise an error.
+        """Certain trainer configurations can break training.
+        Here we try to catch them and raise an error.
         """
         if self.trainer.accumulate_grad_batches > 1:
             raise ValueError(
@@ -209,7 +223,7 @@ class MegatronBertModel(MegatronBaseModel):
     def get_forward_output_and_loss_func(self):
         def fwd_output_and_loss_func(dataloader_iter, model, checkpoint_activations_all_layers=None):
             if parallel_state.get_pipeline_model_parallel_world_size() == 1:
-                batch = next(dataloader_iter)
+                batch, batch_idx, dataloader_idx = next(dataloader_iter)
                 tokens, types, sentence_order, loss_mask, lm_labels, padding_mask = (
                     batch['text'].cuda(non_blocking=True),
                     batch['types'].cuda(non_blocking=True),
@@ -219,7 +233,7 @@ class MegatronBertModel(MegatronBaseModel):
                     batch['padding_mask'].cuda(non_blocking=True),
                 )
             else:
-                batch = next(dataloader_iter)
+                batch, batch_idx, dataloader_idx = next(dataloader_iter)
                 if parallel_state.is_pipeline_first_stage():
                     tokens = batch['text'].cuda(non_blocking=True)
                     types = batch['types'].cuda(non_blocking=True)
@@ -236,6 +250,9 @@ class MegatronBertModel(MegatronBaseModel):
                     padding_mask = batch['padding_mask'].cuda(non_blocking=True)
                     sentence_order = batch['is_random'].cuda(non_blocking=True)
                     tokens, types, loss_mask, lm_labels = None, None, None, None
+
+            dataloader_iter._dataloader_idx = dataloader_idx
+            dataloader_iter._batch_idx = batch_idx
 
             if not self.cfg.bert_binary_head:
                 types = None
@@ -287,13 +304,21 @@ class MegatronBertModel(MegatronBaseModel):
     ):
         if model is None:
             model = self.model
-        output_tensor = model(
-            input_ids,
-            attention_mask,
-            token_type_ids=token_type_ids,
-            lm_labels=lm_labels,
-            checkpoint_activations_all_layers=checkpoint_activations_all_layers,
-        )
+
+        if self.mcore_bert:
+            output_tensor = model(
+                input_ids,
+                attention_mask,
+                tokentype_ids=token_type_ids,
+            )
+        else:
+            output_tensor = model(
+                input_ids,
+                attention_mask,
+                token_type_ids=token_type_ids,
+                lm_labels=lm_labels,
+                checkpoint_activations_all_layers=checkpoint_activations_all_layers,
+            )
         if parallel_state.is_pipeline_last_stage():
             # Return the output tensor of encoder and transpose from [seq_len, batch, hidden] to [batch, seq_len, hidden]
             if torch.is_tensor(output_tensor):
@@ -308,7 +333,7 @@ class MegatronBertModel(MegatronBaseModel):
 
         return output_tensor
 
-    def training_step(self, dataloader_iter, batch_idx):
+    def training_step(self, dataloader_iter):
 
         self._optimizer.zero_grad()
 
@@ -343,8 +368,8 @@ class MegatronBertModel(MegatronBaseModel):
 
         losses_reduced_per_micro_batch = fwd_bwd_function(
             forward_step_func=self.get_forward_output_and_loss_func(),
-            data_iterator=dataloader_iter,
-            model=[self.model],
+            data_iterator=self._make_data_iterator_list(dataloader_iter),
+            model=self.model,
             num_microbatches=get_num_microbatches(),
             forward_only=False,
             seq_length=seq_length,
@@ -390,7 +415,7 @@ class MegatronBertModel(MegatronBaseModel):
             if loss_scale is not None:
                 self.log('loss_scale', loss_scale, batch_size=1)
 
-        if (batch_idx + 1) % self.trainer.accumulate_grad_batches == 0:
+        if (dataloader_iter._batch_idx + 1) % self.trainer.accumulate_grad_batches == 0:
             # Reduced loss for logging.
             self.log('reduced_train_loss', loss_mean[0], prog_bar=True, batch_size=1)
             if len(loss_mean) > 2:
@@ -400,10 +425,72 @@ class MegatronBertModel(MegatronBaseModel):
             self.log('lr', lr, batch_size=1)
             self.log('global_step', self.trainer.global_step, prog_bar=True, batch_size=1)
             self.log(
-                'consumed_samples', self._compute_consumed_samples_after_training_step(), prog_bar=True, batch_size=1,
+                'consumed_samples',
+                self._compute_consumed_samples_after_training_step(),
+                prog_bar=True,
+                batch_size=1,
             )
 
         return loss_mean[0]
+
+    def _make_data_iterator_list(self, data_iterator: Iterator) -> List[Iterator]:
+        """Convert data iterator into form expected by Megatron
+        With interleaved pipeline parallelism, Megatron expects a
+        list of one data iterator per model chunk. Each model
+        chunk independently gets data from its data iterator, so
+        we need to interact with the data iterator multiple times
+        for each microbatch step. Instead of incorporating this
+        logic into the data loader, we cache the iterator's output
+        to the first model chunk and reuse it in the other model
+        chunks.
+        """
+
+        if not isinstance(self.model, list) or len(self.model) == 1:
+            return data_iterator  # TODO @tmoon: Remove
+            # TODO @tmoon: Use once available in Megatron-LM
+            # return DataIteratorList([data_iterator])
+
+        class CachingIterator:
+            """Iterator wrapper that caches values"""
+
+            class Proxy:
+                """Returns values from caching iterator wrapper
+                Assumed to never advance past the caching iterator.
+                """
+
+                def __init__(self):
+                    self.cache = queue.Queue()
+
+                def __iter__(self):
+                    return self
+
+                def __next__(self):
+                    return self.cache.get_nowait()
+
+            def __init__(self, iterator: Iterator):
+                self.iterator = iterator
+                self.proxies = []
+
+            def make_proxy(self):
+                self.proxies.append(CachingIterator.Proxy())
+                return self.proxies[-1]
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                val = next(self.iterator)
+                for proxy in self.proxies:
+                    proxy.cache.put(val)
+                return val
+
+        # Make list of iterator wrappers
+        iters = [CachingIterator(data_iterator)]
+        while len(iters) < len(self.model):
+            iters.append(iters[0].make_proxy())
+        return iters  # TODO @tmoon: Remove
+        # TODO @tmoon: Use once available in Megatron-LM
+        # return DataIteratorList(iters)
 
     def allreduce_first_last_embeddings(self):
 
@@ -416,17 +503,16 @@ class MegatronBertModel(MegatronBaseModel):
             parallel_state.is_pipeline_first_stage(ignore_virtual=True)
             or parallel_state.is_pipeline_last_stage(ignore_virtual=True)
         ):
+            module_list = self.get_model_module_list()
             if parallel_state.is_pipeline_first_stage(ignore_virtual=True):
-                if isinstance(self.model, list):
-                    module = self.model[0]  # only the first virtual rank has the embeddings
-                else:
-                    module = self.model
-            if parallel_state.is_pipeline_last_stage(ignore_virtual=True):
-                if isinstance(self.model, list):
-                    module = self.model[-1]  # only the last virtual rank has the embeddings
-                else:
-                    module = self.model
-            if module.share_token_embeddings:
+                module = module_list[0]
+            elif parallel_state.is_pipeline_last_stage(ignore_virtual=True):
+                module = module_list[-1]
+
+            share_embeddings = (
+                module.share_embeddings_and_output_weights if self.mcore_bert else module.share_token_embeddings
+            )
+            if share_embeddings:
                 word_embeddings_weight = (
                     module.shared_embedding_or_output_weight() if self.mcore_bert else module.word_embeddings_weight()
                 )
@@ -438,11 +524,7 @@ class MegatronBertModel(MegatronBaseModel):
                     grad = word_embeddings_weight.grad
                 torch.distributed.all_reduce(grad, group=parallel_state.get_embedding_group())
 
-    def validation_step(self, dataloader_iter, batch_idx):
-        # Check if iterator is exhausted
-        dataloader_iter, done = self._val_iterator_done(dataloader_iter)
-        if done:
-            return
+    def validation_step(self, dataloader_iter):
         prefix = "test" if self.trainer.testing else "val"
         if self.cfg.data.dataloader_type == "LDDL":
             seq_length = dataloader_iter.iterator.get_seqlen()
@@ -453,8 +535,8 @@ class MegatronBertModel(MegatronBaseModel):
 
         losses_reduced_per_micro_batch = fwd_bwd_function(
             forward_step_func=self.get_forward_output_and_loss_func(),
-            data_iterator=dataloader_iter,
-            model=[self.model],
+            data_iterator=self._make_data_iterator_list(dataloader_iter),
+            model=self.model,
             num_microbatches=get_num_microbatches(),
             forward_only=True,
             seq_length=seq_length,
@@ -483,8 +565,8 @@ class MegatronBertModel(MegatronBaseModel):
         self.log('val_loss', averaged_loss, prog_bar=True, batch_size=1)
         self.validation_step_outputs.clear()  # free memory
 
-    def test_step(self, batch, batch_idx):
-        return self.validation_step(batch, batch_idx)
+    def test_step(self, dataloader_iter):
+        return self.validation_step(dataloader_iter)
 
     def on_test_epoch_end(self):
         averaged_loss = average_losses_across_data_parallel_group(self.test_step_outputs)
@@ -610,8 +692,6 @@ class MegatronBertModel(MegatronBaseModel):
         logging.info(f'Finished building LDDL Dataloaders')
 
     def build_train_valid_test_datasets(self):
-        # Override limit_val_batches to be a multiple of num microbatches to prevent val_step from exiting in between a step
-        self._reconfigure_val_batches()
         logging.info('Building Bert datasets.')
         if self.trainer.limit_val_batches > 1.0 and isinstance(self.trainer.limit_val_batches, float):
             raise ValueError("limit_val_batches must be an integer or float less than or equal to 1.0.")
@@ -628,9 +708,9 @@ class MegatronBertModel(MegatronBaseModel):
         ]
 
         if self.trainer.limit_val_batches <= 1.0 and isinstance(self.trainer.limit_val_batches, float):
-            train_valid_test_num_samples[
-                1
-            ] = 1  # This is to make sure we only have one epoch on every validation iteration
+            train_valid_test_num_samples[1] = (
+                1  # This is to make sure we only have one epoch on every validation iteration
+            )
 
         self._train_ds, self._validation_ds, self._test_ds = dataset_utils.build_train_valid_test_datasets(
             cfg=self.cfg,
@@ -657,23 +737,27 @@ class MegatronBertModel(MegatronBaseModel):
         if self._test_ds is not None:
             logging.info(f'Length of test dataset: {len(self._test_ds)}')
         logging.info(f'Finished building Bert datasets.')
+
+        # Override limit_val_batches to be a multiple of num microbatches to prevent val_step from exiting in between a step
+        self._reconfigure_limit_batches(self.trainer.limit_val_batches, self._validation_dl, 'val')
+
         return self._train_ds, self._validation_ds, self._test_ds
 
     def backward(self, *args, **kwargs):
-        """ LightningModule hook to do backward.
-            We want this to do nothing since we run backward in the fwd/bwd functions from megatron-core.
-            No need to call it here.
+        """LightningModule hook to do backward.
+        We want this to do nothing since we run backward in the fwd/bwd functions from megatron-core.
+        No need to call it here.
         """
         return
 
     def optimizer_zero_grad(self, *args, **kwargs):
-        """ LightningModule hook to zero grad.
-            We want this to do nothing as we are zeroing grads during the training_step.
+        """LightningModule hook to zero grad.
+        We want this to do nothing as we are zeroing grads during the training_step.
         """
         return
 
     def _append_sequence_parallel_module_grads(self, module, grads):
-        """ Helper method for allreduce_sequence_parallel_gradients"""
+        """Helper method for allreduce_sequence_parallel_gradients"""
 
         for param in module.parameters():
             sequence_parallel_param = getattr(param, 'sequence_parallel', False)
@@ -685,16 +769,16 @@ class MegatronBertModel(MegatronBaseModel):
                 grads.append(grad.data)
 
     def setup(self, stage=None):
-        """ PTL hook that is executed after DDP spawns.
-            We setup datasets here as megatron datasets require DDP to instantiate.
-            See https://pytorch-lightning.readthedocs.io/en/latest/common/lightning_module.html#setup for more information.
+        """
+        PTL hook that is executed after DDP spawns.
+        We setup datasets here as megatron datasets require DDP to instantiate.
+        See https://pytorch-lightning.readthedocs.io/en/latest/common/lightning_module.html#setup for more information.
+
         Args:
             stage (str, optional): Can be 'fit', 'validate', 'test' or 'predict'. Defaults to None.
         """
 
-        num_parameters_on_device, total_num_parameters = self._get_total_params_across_model_parallel_groups_gpt_bert(
-            self.model
-        )
+        num_parameters_on_device, total_num_parameters = self._get_total_params_across_model_parallel_groups_gpt_bert()
 
         logging.info(
             f'Pipeline model parallel rank: {parallel_state.get_pipeline_model_parallel_rank()}, '
@@ -727,34 +811,28 @@ class MegatronBertModel(MegatronBaseModel):
 
         # when using pipeline model parallel the final stage need to initialize word embeddings
         if parallel_state.get_pipeline_model_parallel_world_size() > 1:
-            if isinstance(self.model, list):
-                for i, module in enumerate(self.model):
-                    parallel_state.set_virtual_pipeline_model_parallel_rank(i)
+            for index, module in enumerate(self.get_model_module_list()):
+                if parallel_state.get_virtual_pipeline_model_parallel_world_size() is not None:
+                    parallel_state.set_virtual_pipeline_model_parallel_rank(index)
                     sync_embeddings = (
-                        module.initialize_last_stage_with_word_embeddings
+                        module.setup_embeddings_and_output_layer
                         if self.mcore_bert
                         else module.sync_initial_word_embeddings
                     )
                     sync_embeddings()
-                parallel_state.set_virtual_pipeline_model_parallel_rank(0)
-            else:
-                sync_embeddings = (
-                    self.model.initialize_last_stage_with_word_embeddings
-                    if self.mcore_bert
-                    else self.model.sync_initial_word_embeddings
-                )
-                sync_embeddings()
+                    if parallel_state.get_virtual_pipeline_model_parallel_world_size() is not None:
+                        parallel_state.set_virtual_pipeline_model_parallel_rank(0)
 
         if self.cfg.get('transformer_engine', False) or self.cfg.get('mcore_bert', False):
             self.setup_transformer_engine_tp_groups()
 
     def setup_transformer_engine_tp_groups(self):
-        """ This should be called after model parallel groups have been initialized
-            and only needs to be called when using Transformer Engine.
+        """This should be called after model parallel groups have been initialized
+        and only needs to be called when using Transformer Engine.
         """
         for module in self.get_bert_module_list():
             """Set TP group
-               Copied from: https://github.com/NVIDIA/TransformerEngine/blob/main/transformer_engine/pytorch/transformer.py#L398
+            Copied from: https://github.com/NVIDIA/TransformerEngine/blob/main/transformer_engine/pytorch/transformer.py#L398
             """
             # Deep iterate but skip self to avoid infinite recursion.
             for index, child in enumerate(module.modules()):
@@ -776,9 +854,9 @@ class MegatronBertModel(MegatronBaseModel):
             return [self.model]
 
     def allreduce_sequence_parallel_gradients(self):
-        """ All-reduce layernorm parameters across model parallel nodes when sequence parallelism is used.
-            Modified from megatron-lm:
-            https://gitlab-master.nvidia.com/ADLR/megatron-lm/-/blob/3f91f09bb2ab32f9904b47f46f19d2fc3f518ed8/megatron/training.py#L425
+        """All-reduce layernorm parameters across model parallel nodes when sequence parallelism is used.
+        Modified from megatron-lm:
+        https://gitlab-master.nvidia.com/ADLR/megatron-lm/-/blob/3f91f09bb2ab32f9904b47f46f19d2fc3f518ed8/megatron/training.py#L425
         """
 
         grads = []
@@ -858,10 +936,10 @@ class MegatronBertModel(MegatronBaseModel):
             self._test_dl = self.build_pretraining_data_loader(self._test_ds, consumed_samples)
 
     def transfer_batch_to_device(self, batch: Any, device: torch.device, dataloader_idx: int) -> Any:
-        """ PTL hook: https://pytorch-lightning.readthedocs.io/en/latest/common/lightning_module.html#transfer-batch-to-device
-            When using pipeline parallelism, we need the global batch to remain on the CPU,
-            since the memory overhead will be too high when using a large number of microbatches.
-            Microbatches are transferred from CPU to GPU inside the pipeline.
+        """PTL hook: https://pytorch-lightning.readthedocs.io/en/latest/common/lightning_module.html#transfer-batch-to-device
+        When using pipeline parallelism, we need the global batch to remain on the CPU,
+        since the memory overhead will be too high when using a large number of microbatches.
+        Microbatches are transferred from CPU to GPU inside the pipeline.
         """
         return batch
 
@@ -917,22 +995,28 @@ class MegatronBertModel(MegatronBaseModel):
             # Disable overlapped grad sync for embedding grad when
             # pipeline parallelism is enabled
             if parallel_state.get_pipeline_model_parallel_world_size() > 1:
+                modules = self.get_model_module_list()
                 if parallel_state.is_pipeline_first_stage(ignore_virtual=True):
-                    if isinstance(self.model, list):
-                        module = self.model[0]  # only the first virtual rank has the embeddings
-                    else:
-                        module = self.model
-                    if module.share_token_embeddings:
-                        param = module.word_embeddings_weight()
+                    module = modules[0]  # only the first virtual rank has the embeddings
+                    if self.cfg.get('share_embeddings_and_output_weights', True):
+                        param = (
+                            module.shared_embedding_or_output_weight()
+                            if self.mcore_bert
+                            else module.word_embeddings_weight()
+                        )
                         param._disable_greedy_grad_copy = not self.megatron_amp_O2
                         param._disable_overlap_grad_sync = True
                 if parallel_state.is_pipeline_last_stage(ignore_virtual=True):
-                    if isinstance(self.model, list):
-                        module = self.model[-1]  # only the last virtual rank has the embeddings
+                    if len(modules) > 1:
+                        module = modules[-1]  # only the last virtual rank has the embeddings
                     else:
-                        module = self.model
-                    if module.share_token_embeddings:
-                        param = module.word_embeddings_weight()
+                        module = modules[0]
+                    if self.cfg.get('share_embeddings_and_output_weights', True):
+                        param = (
+                            module.shared_embedding_or_output_weight()
+                            if self.mcore_bert
+                            else module.word_embeddings_weight()
+                        )
                         param._disable_greedy_grad_copy = not self.megatron_amp_O2
                         param._disable_overlap_grad_sync = True
 
@@ -1009,38 +1093,85 @@ class MegatronBertModel(MegatronBaseModel):
         input_dict = {"input_ids": input_ids, "attention_mask": attention_mask, "token_type_ids": token_type_ids}
         return tuple([input_dict])
 
+    def sharded_state_dict(self, prefix: str = '') -> Dict[str, Any]:
+        """
+        Creates the sharded state dict which is used by dist_checkpoint to save the sharded tensors to disk.
+        When given the sharded_stated_dict, dist_checkpoint.load will load the tensors corresponding to
+        self.state_dict().
+        The sharded tensor mapping is defined in the GPTModel class from mcore.
+        """
+        if self.mcore_bert:
+            module_prefix = f'{prefix}model.'
+            sharded_state_dict = {}
+            for index, module in enumerate(self.get_model_module_list()):
+                if parallel_state.get_virtual_pipeline_model_parallel_world_size() is not None:
+                    # virtual pipline rank must be set so that GPTModel returns the correct sharded state dict
+                    parallel_state.set_virtual_pipeline_model_parallel_rank(index)
+                    module_sharded_state_dict = module.sharded_state_dict(prefix=module_prefix)
+                    sharded_state_dict[f'model_{index}'] = module_sharded_state_dict
+                else:
+                    module_sharded_state_dict = module.sharded_state_dict(prefix=module_prefix)
+                    sharded_state_dict.update(module_sharded_state_dict)
+
+            # reset vp rank
+            if parallel_state.get_virtual_pipeline_model_parallel_world_size() is not None:
+                parallel_state.set_virtual_pipeline_model_parallel_rank(0)
+
+            return sharded_state_dict
+
     def on_save_checkpoint(self, checkpoint) -> None:
         """LightningModule hook:
         https://pytorch-lightning.readthedocs.io/en/stable/common/lightning_module.html#on-save-checkpoint
         """
-        if isinstance(self.model, list):
-            for i in range(len(self.model)):
-                parallel_state.set_virtual_pipeline_model_parallel_rank(i)
-                checkpoint[f'model{i}'] = self.model[i].module.state_dict_for_save_checkpoint()
-            parallel_state.set_virtual_pipeline_model_parallel_rank(0)
+        if self.mcore_bert:
+            checkpoint['sharded_state_dict'] = self.sharded_state_dict()
+        else:
+            if isinstance(self.model, list):
+                for i in range(len(self.model)):
+                    parallel_state.set_virtual_pipeline_model_parallel_rank(i)
+                    checkpoint[f'model{i}'] = self.model[i].module.state_dict_for_save_checkpoint()
+                parallel_state.set_virtual_pipeline_model_parallel_rank(0)
 
     def on_load_checkpoint(self, checkpoint) -> None:
         """LightningModule hook:
         https://pytorch-lightning.readthedocs.io/en/stable/common/lightning_module.html#on-load-checkpoint
         """
-        if isinstance(self.model, list):
-            for i in range(len(self.model)):
-                parallel_state.set_virtual_pipeline_model_parallel_rank(i)
-                self.model[i].module.load_state_dict(checkpoint[f'model{i}'], strict=True)
-            parallel_state.set_virtual_pipeline_model_parallel_rank(0)
+        if self.mcore_bert:
+            if 'state_dict' in checkpoint and checkpoint['state_dict']:
+                for index, module in enumerate(self.get_model_module_list()):
+                    if parallel_state.get_virtual_pipeline_model_parallel_world_size() is not None:
+                        checkpoint_state_dict = checkpoint['state_dict'][f'model_{index}']
+                    else:
+                        checkpoint_state_dict = checkpoint['state_dict']
+                    # checkpoint_state_dict has "model." but module does not so we need to remove it when loading
+                    checkpoint_state_dict = {
+                        key.replace('model.', ''): checkpoint_state_dict.pop(key)
+                        for key in list(checkpoint_state_dict.keys())
+                    }
+                    module.load_state_dict(checkpoint_state_dict, strict=True)
+            else:
+                checkpoint['state_dict'] = {}
+        else:
+            if isinstance(self.model, list):
+                for i in range(len(self.model)):
+                    parallel_state.set_virtual_pipeline_model_parallel_rank(i)
+                    self.model[i].module.load_state_dict(checkpoint[f'model{i}'], strict=True)
+                parallel_state.set_virtual_pipeline_model_parallel_rank(0)
 
     def build_transformer_config(self) -> TransformerConfig:
-        """ Builds the megatron core gpt transformer config for the model.
-            For attributes in the nemo model config that are the same
-            as the megatron core TransformerConfig, we will use the value from the nemo model config.
-            For attributes in TransformerConfig that are not in the nemo model config, we add custom logic.
+        """Builds the megatron core gpt transformer config for the model.
+        For attributes in the nemo model config that are the same
+        as the megatron core TransformerConfig, we will use the value from the nemo model config.
+        For attributes in TransformerConfig that are not in the nemo model config, we add custom logic.
         """
         activation = self.cfg.get('activation', 'gelu')
         assert activation == 'gelu', "Only gelu activation is support for BERT at the moment."
 
         normalization = self.cfg.get('normalization', 'layernorm')
 
-        layernorm_zero_centered_gamma = self.cfg.get('normalization', 'layernorm') == 'layernorm1p'
+        layernorm_zero_centered_gamma = self.cfg.get('normalization', 'layernorm') == 'layernorm1p' or self.cfg.get(
+            "layernorm_zero_centered_gamma", False
+        )
         if normalization == 'layernorm':
             normalization = 'LayerNorm'
         elif normalization == 'rmsnorm':

@@ -40,110 +40,152 @@ class AbstractCTCDecoding(ConfidenceMixin):
 
     Args:
         decoding_cfg: A dict-like object which contains the following key-value pairs.
-            strategy: str value which represents the type of decoding that can occur.
+            strategy:
+                str value which represents the type of decoding that can occur.
                 Possible values are :
-                -   greedy (for greedy decoding).
-                -   beam (for DeepSpeed KenLM based decoding).
 
-            compute_timestamps: A bool flag, which determines whether to compute the character/subword, or
+                    greedy (for greedy decoding).
+
+                    beam (for DeepSpeed KenLM based decoding).
+
+            compute_timestamps:
+                A bool flag, which determines whether to compute the character/subword, or
                 word based timestamp mapping the output log-probabilities to discrite intervals of timestamps.
                 The timestamps will be available in the returned Hypothesis.timestep as a dictionary.
 
-            ctc_timestamp_type: A str value, which represents the types of timestamps that should be calculated.
+            ctc_timestamp_type:
+                A str value, which represents the types of timestamps that should be calculated.
                 Can take the following values - "char" for character/subword time stamps, "word" for word level
                 time stamps and "all" (default), for both character level and word level time stamps.
 
-            word_seperator: Str token representing the seperator between words.
+            word_seperator:
+                Str token representing the seperator between words.
 
-            preserve_alignments: Bool flag which preserves the history of logprobs generated during
+            preserve_alignments:
+                Bool flag which preserves the history of logprobs generated during
                 decoding (sample / batched). When set to true, the Hypothesis will contain
                 the non-null value for `logprobs` in it. Here, `logprobs` is a torch.Tensors.
 
-            confidence_cfg: A dict-like object which contains the following key-value pairs related to confidence
+            confidence_cfg:
+                A dict-like object which contains the following key-value pairs related to confidence
                 scores. In order to obtain hypotheses with confidence scores, please utilize
                 `ctc_decoder_predictions_tensor` function with the `preserve_frame_confidence` flag set to True.
 
-                preserve_frame_confidence: Bool flag which preserves the history of per-frame confidence scores
+                preserve_frame_confidence:
+                    Bool flag which preserves the history of per-frame confidence scores
                     generated during decoding. When set to true, the Hypothesis will contain
                     the non-null value for `frame_confidence` in it. Here, `frame_confidence` is a List of floats.
-                preserve_token_confidence: Bool flag which preserves the history of per-token confidence scores
+
+                preserve_token_confidence:
+                    Bool flag which preserves the history of per-token confidence scores
                     generated during greedy decoding (sample / batched). When set to true, the Hypothesis will contain
                     the non-null value for `token_confidence` in it. Here, `token_confidence` is a List of floats.
 
                     The length of the list corresponds to the number of recognized tokens.
-                preserve_word_confidence: Bool flag which preserves the history of per-word confidence scores
+
+                preserve_word_confidence:
+                    Bool flag which preserves the history of per-word confidence scores
                     generated during greedy decoding (sample / batched). When set to true, the Hypothesis will contain
                     the non-null value for `word_confidence` in it. Here, `word_confidence` is a List of floats.
 
                     The length of the list corresponds to the number of recognized words.
-                exclude_blank: Bool flag indicating that blank token confidence scores are to be excluded
+
+                exclude_blank:
+                    Bool flag indicating that blank token confidence scores are to be excluded
                     from the `token_confidence`.
-                aggregation: Which aggregation type to use for collapsing per-token confidence into per-word confidence.
+
+                aggregation:
+                    Which aggregation type to use for collapsing per-token confidence into per-word confidence.
                     Valid options are `mean`, `min`, `max`, `prod`.
-                method_cfg: A dict-like object which contains the method name and settings to compute per-frame
+
+                tdt_include_duration: Bool flag indicating that the duration confidence scores are to be calculated and
+                    attached to the regular frame confidence,
+                    making TDT frame confidence element a pair: (`prediction_confidence`, `duration_confidence`).
+
+                method_cfg:
+                    A dict-like object which contains the method name and settings to compute per-frame
                     confidence scores.
 
-                    name: The method name (str).
+                    name:
+                        The method name (str).
                         Supported values:
-                            - 'max_prob' for using the maximum token probability as a confidence.
-                            - 'entropy' for using a normalized entropy of a log-likelihood vector.
 
-                    entropy_type: Which type of entropy to use (str).
+                            'max_prob' for using the maximum token probability as a confidence.
+
+                            'entropy' for using a normalized entropy of a log-likelihood vector.
+
+                    entropy_type:
+                        Which type of entropy to use (str).
                         Used if confidence_method_cfg.name is set to `entropy`.
                         Supported values:
+
                             - 'gibbs' for the (standard) Gibbs entropy. If the alpha (α) is provided,
                                 the formula is the following: H_α = -sum_i((p^α_i)*log(p^α_i)).
                                 Note that for this entropy, the alpha should comply the following inequality:
                                 (log(V)+2-sqrt(log^2(V)+4))/(2*log(V)) <= α <= (1+log(V-1))/log(V-1)
                                 where V is the model vocabulary size.
+
                             - 'tsallis' for the Tsallis entropy with the Boltzmann constant one.
                                 Tsallis entropy formula is the following: H_α = 1/(α-1)*(1-sum_i(p^α_i)),
                                 where α is a parameter. When α == 1, it works like the Gibbs entropy.
                                 More: https://en.wikipedia.org/wiki/Tsallis_entropy
+
                             - 'renyi' for the Rényi entropy.
                                 Rényi entropy formula is the following: H_α = 1/(1-α)*log_2(sum_i(p^α_i)),
                                 where α is a parameter. When α == 1, it works like the Gibbs entropy.
                                 More: https://en.wikipedia.org/wiki/R%C3%A9nyi_entropy
 
-                    alpha: Power scale for logsoftmax (α for entropies). Here we restrict it to be > 0.
+                    alpha:
+                        Power scale for logsoftmax (α for entropies). Here we restrict it to be > 0.
                         When the alpha equals one, scaling is not applied to 'max_prob',
                         and any entropy type behaves like the Shannon entropy: H = -sum_i(p_i*log(p_i))
 
-                    entropy_norm: A mapping of the entropy value to the interval [0,1].
+                    entropy_norm:
+                        A mapping of the entropy value to the interval [0,1].
                         Supported values:
+
                             - 'lin' for using the linear mapping.
+
                             - 'exp' for using exponential mapping with linear shift.
 
-            batch_dim_index: Index of the batch dimension of ``targets`` and ``predictions`` parameters of
+            batch_dim_index:
+                Index of the batch dimension of ``targets`` and ``predictions`` parameters of
                 ``ctc_decoder_predictions_tensor`` methods. Can be either 0 or 1.
 
             The config may further contain the following sub-dictionaries:
-            "greedy":
-                preserve_alignments: Same as above, overrides above value.
-                compute_timestamps: Same as above, overrides above value.
-                preserve_frame_confidence: Same as above, overrides above value.
-                confidence_method_cfg: Same as above, overrides confidence_cfg.method_cfg.
 
-            "beam":
-                beam_size: int, defining the beam size for beam search. Must be >= 1.
-                    If beam_size == 1, will perform cached greedy search. This might be slightly different
-                    results compared to the greedy search above.
+                "greedy":
+                    preserve_alignments: Same as above, overrides above value.
+                    compute_timestamps: Same as above, overrides above value.
+                    preserve_frame_confidence: Same as above, overrides above value.
+                    confidence_method_cfg: Same as above, overrides confidence_cfg.method_cfg.
 
-                return_best_hypothesis: optional bool, whether to return just the best hypothesis or all of the
-                    hypotheses after beam search has concluded. This flag is set by default.
+                "beam":
+                    beam_size:
+                        int, defining the beam size for beam search. Must be >= 1.
+                        If beam_size == 1, will perform cached greedy search. This might be slightly different
+                        results compared to the greedy search above.
 
-                beam_alpha: float, the strength of the Language model on the final score of a token.
-                    final_score = acoustic_score + beam_alpha * lm_score + beam_beta * seq_length.
+                    return_best_hypothesis:
+                        optional bool, whether to return just the best hypothesis or all of the
+                        hypotheses after beam search has concluded. This flag is set by default.
 
-                beam_beta: float, the strength of the sequence length penalty on the final score of a token.
-                    final_score = acoustic_score + beam_alpha * lm_score + beam_beta * seq_length.
+                    beam_alpha:
+                        float, the strength of the Language model on the final score of a token.
+                        final_score = acoustic_score + beam_alpha * lm_score + beam_beta * seq_length.
 
-                kenlm_path: str, path to a KenLM ARPA or .binary file (depending on the strategy chosen).
-                    If the path is invalid (file is not found at path), will raise a deferred error at the moment
-                    of calculation of beam search, so that users may update / change the decoding strategy
-                    to point to the correct file.
+                    beam_beta:
+                        float, the strength of the sequence length penalty on the final score of a token.
+                        final_score = acoustic_score + beam_alpha * lm_score + beam_beta * seq_length.
 
-        blank_id: The id of the RNNT blank token.
+                    kenlm_path:
+                        str, path to a KenLM ARPA or .binary file (depending on the strategy chosen).
+                        If the path is invalid (file is not found at path), will raise a deferred error at the moment
+                        of calculation of beam search, so that users may update / change the decoding strategy
+                        to point to the correct file.
+
+        blank_id
+            The id of the RNNT blank token.
     """
 
     def __init__(self, decoding_cfg, blank_id: int):
@@ -171,20 +213,20 @@ class AbstractCTCDecoding(ConfidenceMixin):
         self.batch_dim_index = self.cfg.get('batch_dim_index', 0)
         self.word_seperator = self.cfg.get('word_seperator', ' ')
 
-        possible_strategies = ['greedy', 'beam', 'pyctcdecode', 'flashlight']
+        possible_strategies = ['greedy', 'greedy_batch', 'beam', 'pyctcdecode', 'flashlight', 'wfst']
         if self.cfg.strategy not in possible_strategies:
             raise ValueError(f"Decoding strategy must be one of {possible_strategies}. Given {self.cfg.strategy}")
 
         # Update preserve alignments
         if self.preserve_alignments is None:
-            if self.cfg.strategy in ['greedy']:
+            if self.cfg.strategy in ['greedy', 'greedy_batch']:
                 self.preserve_alignments = self.cfg.greedy.get('preserve_alignments', False)
             else:
                 self.preserve_alignments = self.cfg.beam.get('preserve_alignments', False)
 
         # Update compute timestamps
         if self.compute_timestamps is None:
-            if self.cfg.strategy in ['greedy']:
+            if self.cfg.strategy in ['greedy', 'greedy_batch']:
                 self.compute_timestamps = self.cfg.greedy.get('compute_timestamps', False)
             elif self.cfg.strategy in ['beam']:
                 self.compute_timestamps = self.cfg.beam.get('compute_timestamps', False)
@@ -192,10 +234,10 @@ class AbstractCTCDecoding(ConfidenceMixin):
         # initialize confidence-related fields
         self._init_confidence(self.cfg.get('confidence_cfg', None))
 
-        # Confidence estimation is not implemented for strategies other than `greedy`
+        # Confidence estimation is not implemented for strategies other than `greedy` and `greedy_batch`
         if (
             not self.preserve_frame_confidence
-            and self.cfg.strategy != 'greedy'
+            and self.cfg.strategy not in ('greedy', 'greedy_batch')
             and self.cfg.beam.get('preserve_frame_confidence', False)
         ):
             raise NotImplementedError(f"Confidence calculation is not supported for strategy `{self.cfg.strategy}`")
@@ -205,8 +247,16 @@ class AbstractCTCDecoding(ConfidenceMixin):
             self.compute_timestamps |= self.preserve_frame_confidence
 
         if self.cfg.strategy == 'greedy':
-
             self.decoding = ctc_greedy_decoding.GreedyCTCInfer(
+                blank_id=self.blank_id,
+                preserve_alignments=self.preserve_alignments,
+                compute_timestamps=self.compute_timestamps,
+                preserve_frame_confidence=self.preserve_frame_confidence,
+                confidence_method_cfg=self.confidence_method_cfg,
+            )
+
+        elif self.cfg.strategy == "greedy_batch":
+            self.decoding = ctc_greedy_decoding.GreedyBatchedCTCInfer(
                 blank_id=self.blank_id,
                 preserve_alignments=self.preserve_alignments,
                 compute_timestamps=self.compute_timestamps,
@@ -260,6 +310,28 @@ class AbstractCTCDecoding(ConfidenceMixin):
                 beam_beta=self.cfg.beam.get('beam_beta', 0.0),
                 kenlm_path=self.cfg.beam.get('kenlm_path', None),
                 flashlight_cfg=self.cfg.beam.get('flashlight_cfg', None),
+            )
+
+            self.decoding.override_fold_consecutive_value = False
+
+        elif self.cfg.strategy == 'wfst':
+
+            self.decoding = ctc_beam_decoding.WfstCTCInfer(
+                blank_id=blank_id,
+                beam_size=self.cfg.wfst.get('beam_size', 1),
+                search_type=self.cfg.wfst.get('search_type', 'riva'),
+                return_best_hypothesis=self.cfg.wfst.get('return_best_hypothesis', True),
+                preserve_alignments=self.preserve_alignments,
+                compute_timestamps=self.compute_timestamps,
+                decoding_mode=self.cfg.wfst.get('decoding_mode', 'nbest'),
+                open_vocabulary_decoding=self.cfg.wfst.get('open_vocabulary_decoding', False),
+                beam_width=self.cfg.wfst.get('beam_width', 10.0),
+                lm_weight=self.cfg.wfst.get('lm_weight', 1.0),
+                device=self.cfg.wfst.get('device', 'cuda'),
+                arpa_lm_path=self.cfg.wfst.get('arpa_lm_path', None),
+                wfst_lm_path=self.cfg.wfst.get('wfst_lm_path', None),
+                riva_decoding_cfg=self.cfg.wfst.get('riva_decoding_cfg', None),
+                k2_decoding_cfg=self.cfg.wfst.get('k2_decoding_cfg', None),
             )
 
             self.decoding.override_fold_consecutive_value = False
@@ -324,48 +396,56 @@ class AbstractCTCDecoding(ConfidenceMixin):
             hypotheses_list = hypotheses_list[0]  # type: List[Hypothesis]
 
         if isinstance(hypotheses_list[0], NBestHypotheses):
-            hypotheses = []
-            all_hypotheses = []
+            if self.cfg.strategy == 'wfst':
+                all_hypotheses = [hyp.n_best_hypotheses for hyp in hypotheses_list]
+                hypotheses = [hyp[0] for hyp in all_hypotheses]
+            else:
+                hypotheses = []
+                all_hypotheses = []
 
-            for nbest_hyp in hypotheses_list:  # type: NBestHypotheses
-                n_hyps = nbest_hyp.n_best_hypotheses  # Extract all hypotheses for this sample
-                decoded_hyps = self.decode_hypothesis(
-                    n_hyps, fold_consecutive
-                )  # type: List[Union[Hypothesis, NBestHypotheses]]
+                for nbest_hyp in hypotheses_list:  # type: NBestHypotheses
+                    n_hyps = nbest_hyp.n_best_hypotheses  # Extract all hypotheses for this sample
+                    decoded_hyps = self.decode_hypothesis(
+                        n_hyps, fold_consecutive
+                    )  # type: List[Union[Hypothesis, NBestHypotheses]]
 
-                # If computing timestamps
-                if self.compute_timestamps is True:
-                    timestamp_type = self.cfg.get('ctc_timestamp_type', 'all')
-                    for hyp_idx in range(len(decoded_hyps)):
-                        decoded_hyps[hyp_idx] = self.compute_ctc_timestamps(decoded_hyps[hyp_idx], timestamp_type)
+                    # If computing timestamps
+                    if self.compute_timestamps is True:
+                        timestamp_type = self.cfg.get('ctc_timestamp_type', 'all')
+                        for hyp_idx in range(len(decoded_hyps)):
+                            decoded_hyps[hyp_idx] = self.compute_ctc_timestamps(decoded_hyps[hyp_idx], timestamp_type)
 
-                hypotheses.append(decoded_hyps[0])  # best hypothesis
-                all_hypotheses.append(decoded_hyps)
+                    hypotheses.append(decoded_hyps[0])  # best hypothesis
+                    all_hypotheses.append(decoded_hyps)
 
             if return_hypotheses:
                 return hypotheses, all_hypotheses
 
             best_hyp_text = [h.text for h in hypotheses]
+            # alaptev: The line below might contain a bug. Do we really want all_hyp_text to be flat?
             all_hyp_text = [h.text for hh in all_hypotheses for h in hh]
             return best_hyp_text, all_hyp_text
 
         else:
-            hypotheses = self.decode_hypothesis(
-                hypotheses_list, fold_consecutive
-            )  # type: List[Union[Hypothesis, NBestHypotheses]]
+            if self.cfg.strategy == 'wfst':
+                hypotheses = hypotheses_list
+            else:
+                hypotheses = self.decode_hypothesis(
+                    hypotheses_list, fold_consecutive
+                )  # type: List[Union[Hypothesis, NBestHypotheses]]
 
-            # If computing timestamps
-            if self.compute_timestamps is True:
-                # greedy decoding, can get high-level confidence scores
-                if return_hypotheses and (self.preserve_word_confidence or self.preserve_token_confidence):
-                    hypotheses = self.compute_confidence(hypotheses)
-                else:
-                    # remove unused token_repetitions from Hypothesis.text
-                    for hyp in hypotheses:
-                        hyp.text = hyp.text[:2]
-                timestamp_type = self.cfg.get('ctc_timestamp_type', 'all')
-                for hyp_idx in range(len(hypotheses)):
-                    hypotheses[hyp_idx] = self.compute_ctc_timestamps(hypotheses[hyp_idx], timestamp_type)
+                # If computing timestamps
+                if self.compute_timestamps is True:
+                    # greedy decoding, can get high-level confidence scores
+                    if return_hypotheses and (self.preserve_word_confidence or self.preserve_token_confidence):
+                        hypotheses = self.compute_confidence(hypotheses)
+                    else:
+                        # remove unused token_repetitions from Hypothesis.text
+                        for hyp in hypotheses:
+                            hyp.text = hyp.text[:2]
+                    timestamp_type = self.cfg.get('ctc_timestamp_type', 'all')
+                    for hyp_idx in range(len(hypotheses)):
+                        hypotheses[hyp_idx] = self.compute_ctc_timestamps(hypotheses[hyp_idx], timestamp_type)
 
             if return_hypotheses:
                 return hypotheses, None
@@ -819,114 +899,158 @@ class CTCDecoding(AbstractCTCDecoding):
 
     Args:
         decoding_cfg: A dict-like object which contains the following key-value pairs.
-            strategy: str value which represents the type of decoding that can occur.
-                Possible values are :
-                -   greedy (for greedy decoding).
-                -   beam (for DeepSpeed KenLM based decoding).
 
-            compute_timestamps: A bool flag, which determines whether to compute the character/subword, or
+            strategy:
+                str value which represents the type of decoding that can occur.
+                Possible values are :
+
+                    -   greedy (for greedy decoding).
+
+                    -   beam (for DeepSpeed KenLM based decoding).
+
+            compute_timestamps:
+                A bool flag, which determines whether to compute the character/subword, or
                 word based timestamp mapping the output log-probabilities to discrite intervals of timestamps.
                 The timestamps will be available in the returned Hypothesis.timestep as a dictionary.
 
-            ctc_timestamp_type: A str value, which represents the types of timestamps that should be calculated.
+            ctc_timestamp_type:
+                A str value, which represents the types of timestamps that should be calculated.
                 Can take the following values - "char" for character/subword time stamps, "word" for word level
                 time stamps and "all" (default), for both character level and word level time stamps.
 
-            word_seperator: Str token representing the seperator between words.
+            word_seperator:
+                Str token representing the seperator between words.
 
-            preserve_alignments: Bool flag which preserves the history of logprobs generated during
+            preserve_alignments:
+                Bool flag which preserves the history of logprobs generated during
                 decoding (sample / batched). When set to true, the Hypothesis will contain
                 the non-null value for `logprobs` in it. Here, `logprobs` is a torch.Tensors.
 
-            confidence_cfg: A dict-like object which contains the following key-value pairs related to confidence
+            confidence_cfg:
+                A dict-like object which contains the following key-value pairs related to confidence
                 scores. In order to obtain hypotheses with confidence scores, please utilize
                 `ctc_decoder_predictions_tensor` function with the `preserve_frame_confidence` flag set to True.
 
-                preserve_frame_confidence: Bool flag which preserves the history of per-frame confidence scores
+                preserve_frame_confidence:
+                    Bool flag which preserves the history of per-frame confidence scores
                     generated during decoding. When set to true, the Hypothesis will contain
                     the non-null value for `frame_confidence` in it. Here, `frame_confidence` is a List of floats.
-                preserve_token_confidence: Bool flag which preserves the history of per-token confidence scores
+
+                preserve_token_confidence:
+                    Bool flag which preserves the history of per-token confidence scores
                     generated during greedy decoding (sample / batched). When set to true, the Hypothesis will contain
                     the non-null value for `token_confidence` in it. Here, `token_confidence` is a List of floats.
 
                     The length of the list corresponds to the number of recognized tokens.
-                preserve_word_confidence: Bool flag which preserves the history of per-word confidence scores
+
+                preserve_word_confidence:
+                    Bool flag which preserves the history of per-word confidence scores
                     generated during greedy decoding (sample / batched). When set to true, the Hypothesis will contain
                     the non-null value for `word_confidence` in it. Here, `word_confidence` is a List of floats.
 
                     The length of the list corresponds to the number of recognized words.
-                exclude_blank: Bool flag indicating that blank token confidence scores are to be excluded
+
+                exclude_blank:
+                    Bool flag indicating that blank token confidence scores are to be excluded
                     from the `token_confidence`.
-                aggregation: Which aggregation type to use for collapsing per-token confidence into per-word confidence.
+
+                aggregation:
+                    Which aggregation type to use for collapsing per-token confidence into per-word confidence.
                     Valid options are `mean`, `min`, `max`, `prod`.
-                method_cfg: A dict-like object which contains the method name and settings to compute per-frame
+
+                tdt_include_duration: Bool flag indicating that the duration confidence scores are to be calculated and
+                    attached to the regular frame confidence,
+                    making TDT frame confidence element a pair: (`prediction_confidence`, `duration_confidence`).
+
+                method_cfg:
+                    A dict-like object which contains the method name and settings to compute per-frame
                     confidence scores.
 
-                    name: The method name (str).
+                    name:
+                        The method name (str).
                         Supported values:
+
                             - 'max_prob' for using the maximum token probability as a confidence.
+
                             - 'entropy' for using a normalized entropy of a log-likelihood vector.
 
-                    entropy_type: Which type of entropy to use (str).
+                    entropy_type:
+                        Which type of entropy to use (str).
                         Used if confidence_method_cfg.name is set to `entropy`.
                         Supported values:
+
                             - 'gibbs' for the (standard) Gibbs entropy. If the alpha (α) is provided,
                                 the formula is the following: H_α = -sum_i((p^α_i)*log(p^α_i)).
                                 Note that for this entropy, the alpha should comply the following inequality:
                                 (log(V)+2-sqrt(log^2(V)+4))/(2*log(V)) <= α <= (1+log(V-1))/log(V-1)
                                 where V is the model vocabulary size.
+
                             - 'tsallis' for the Tsallis entropy with the Boltzmann constant one.
                                 Tsallis entropy formula is the following: H_α = 1/(α-1)*(1-sum_i(p^α_i)),
                                 where α is a parameter. When α == 1, it works like the Gibbs entropy.
                                 More: https://en.wikipedia.org/wiki/Tsallis_entropy
+
                             - 'renyi' for the Rényi entropy.
                                 Rényi entropy formula is the following: H_α = 1/(1-α)*log_2(sum_i(p^α_i)),
                                 where α is a parameter. When α == 1, it works like the Gibbs entropy.
                                 More: https://en.wikipedia.org/wiki/R%C3%A9nyi_entropy
 
-                    alpha: Power scale for logsoftmax (α for entropies). Here we restrict it to be > 0.
+                    alpha:
+                        Power scale for logsoftmax (α for entropies). Here we restrict it to be > 0.
                         When the alpha equals one, scaling is not applied to 'max_prob',
                         and any entropy type behaves like the Shannon entropy: H = -sum_i(p_i*log(p_i))
 
-                    entropy_norm: A mapping of the entropy value to the interval [0,1].
+                    entropy_norm:
+                        A mapping of the entropy value to the interval [0,1].
                         Supported values:
+
                             - 'lin' for using the linear mapping.
+
                             - 'exp' for using exponential mapping with linear shift.
 
-            batch_dim_index: Index of the batch dimension of ``targets`` and ``predictions`` parameters of
+            batch_dim_index:
+                Index of the batch dimension of ``targets`` and ``predictions`` parameters of
                 ``ctc_decoder_predictions_tensor`` methods. Can be either 0 or 1.
 
             The config may further contain the following sub-dictionaries:
-            "greedy":
-                preserve_alignments: Same as above, overrides above value.
-                compute_timestamps: Same as above, overrides above value.
-                preserve_frame_confidence: Same as above, overrides above value.
-                confidence_method_cfg: Same as above, overrides confidence_cfg.method_cfg.
 
-            "beam":
-                beam_size: int, defining the beam size for beam search. Must be >= 1.
-                    If beam_size == 1, will perform cached greedy search. This might be slightly different
-                    results compared to the greedy search above.
+                "greedy":
+                    preserve_alignments: Same as above, overrides above value.
+                    compute_timestamps: Same as above, overrides above value.
+                    preserve_frame_confidence: Same as above, overrides above value.
+                    confidence_method_cfg: Same as above, overrides confidence_cfg.method_cfg.
 
-                return_best_hypothesis: optional bool, whether to return just the best hypothesis or all of the
-                    hypotheses after beam search has concluded. This flag is set by default.
+                "beam":
+                    beam_size:
+                        int, defining the beam size for beam search. Must be >= 1.
+                        If beam_size == 1, will perform cached greedy search. This might be slightly different
+                        results compared to the greedy search above.
 
-                beam_alpha: float, the strength of the Language model on the final score of a token.
-                    final_score = acoustic_score + beam_alpha * lm_score + beam_beta * seq_length.
+                    return_best_hypothesis:
+                        optional bool, whether to return just the best hypothesis or all of the
+                        hypotheses after beam search has concluded. This flag is set by default.
 
-                beam_beta: float, the strength of the sequence length penalty on the final score of a token.
-                    final_score = acoustic_score + beam_alpha * lm_score + beam_beta * seq_length.
+                    beam_alpha:
+                        float, the strength of the Language model on the final score of a token.
+                        final_score = acoustic_score + beam_alpha * lm_score + beam_beta * seq_length.
 
-                kenlm_path: str, path to a KenLM ARPA or .binary file (depending on the strategy chosen).
-                    If the path is invalid (file is not found at path), will raise a deferred error at the moment
-                    of calculation of beam search, so that users may update / change the decoding strategy
-                    to point to the correct file.
+                    beam_beta:
+                        float, the strength of the sequence length penalty on the final score of a token.
+                        final_score = acoustic_score + beam_alpha * lm_score + beam_beta * seq_length.
+
+                    kenlm_path:
+                        str, path to a KenLM ARPA or .binary file (depending on the strategy chosen).
+                        If the path is invalid (file is not found at path), will raise a deferred error at the moment
+                        of calculation of beam search, so that users may update / change the decoding strategy
+                        to point to the correct file.
 
         blank_id: The id of the RNNT blank token.
     """
 
     def __init__(
-        self, decoding_cfg, vocabulary,
+        self,
+        decoding_cfg,
+        vocabulary,
     ):
         blank_id = len(vocabulary)
         self.vocabulary = vocabulary
@@ -988,108 +1112,150 @@ class CTCBPEDecoding(AbstractCTCDecoding):
 
     Args:
         decoding_cfg: A dict-like object which contains the following key-value pairs.
-            strategy: str value which represents the type of decoding that can occur.
-                Possible values are :
-                -   greedy (for greedy decoding).
-                -   beam (for DeepSpeed KenLM based decoding).
 
-            compute_timestamps: A bool flag, which determines whether to compute the character/subword, or
+            strategy:
+                str value which represents the type of decoding that can occur.
+                Possible values are :
+
+                    -   greedy (for greedy decoding).
+
+                    -   beam (for DeepSpeed KenLM based decoding).
+
+            compute_timestamps:
+                A bool flag, which determines whether to compute the character/subword, or
                 word based timestamp mapping the output log-probabilities to discrite intervals of timestamps.
                 The timestamps will be available in the returned Hypothesis.timestep as a dictionary.
 
-            ctc_timestamp_type: A str value, which represents the types of timestamps that should be calculated.
+            ctc_timestamp_type:
+                A str value, which represents the types of timestamps that should be calculated.
                 Can take the following values - "char" for character/subword time stamps, "word" for word level
                 time stamps and "all" (default), for both character level and word level time stamps.
 
-            word_seperator: Str token representing the seperator between words.
+            word_seperator:
+                Str token representing the seperator between words.
 
-            preserve_alignments: Bool flag which preserves the history of logprobs generated during
+            preserve_alignments:
+                Bool flag which preserves the history of logprobs generated during
                 decoding (sample / batched). When set to true, the Hypothesis will contain
                 the non-null value for `logprobs` in it. Here, `logprobs` is a torch.Tensors.
 
-            confidence_cfg: A dict-like object which contains the following key-value pairs related to confidence
+            confidence_cfg:
+                A dict-like object which contains the following key-value pairs related to confidence
                 scores. In order to obtain hypotheses with confidence scores, please utilize
                 `ctc_decoder_predictions_tensor` function with the `preserve_frame_confidence` flag set to True.
 
-                preserve_frame_confidence: Bool flag which preserves the history of per-frame confidence scores
+                preserve_frame_confidence:
+                    Bool flag which preserves the history of per-frame confidence scores
                     generated during decoding. When set to true, the Hypothesis will contain
                     the non-null value for `frame_confidence` in it. Here, `frame_confidence` is a List of floats.
-                preserve_token_confidence: Bool flag which preserves the history of per-token confidence scores
+
+                preserve_token_confidence:
+                    Bool flag which preserves the history of per-token confidence scores
                     generated during greedy decoding (sample / batched). When set to true, the Hypothesis will contain
                     the non-null value for `token_confidence` in it. Here, `token_confidence` is a List of floats.
 
                     The length of the list corresponds to the number of recognized tokens.
-                preserve_word_confidence: Bool flag which preserves the history of per-word confidence scores
+
+                preserve_word_confidence:
+                    Bool flag which preserves the history of per-word confidence scores
                     generated during greedy decoding (sample / batched). When set to true, the Hypothesis will contain
                     the non-null value for `word_confidence` in it. Here, `word_confidence` is a List of floats.
 
                     The length of the list corresponds to the number of recognized words.
-                exclude_blank: Bool flag indicating that blank token confidence scores are to be excluded
+
+                exclude_blank:
+                    Bool flag indicating that blank token confidence scores are to be excluded
                     from the `token_confidence`.
-                aggregation: Which aggregation type to use for collapsing per-token confidence into per-word confidence.
+
+                aggregation:
+                    Which aggregation type to use for collapsing per-token confidence into per-word confidence.
                     Valid options are `mean`, `min`, `max`, `prod`.
-                method_cfg: A dict-like object which contains the method name and settings to compute per-frame
+
+                tdt_include_duration: Bool flag indicating that the duration confidence scores are to be calculated and
+                    attached to the regular frame confidence,
+                    making TDT frame confidence element a pair: (`prediction_confidence`, `duration_confidence`).
+
+                method_cfg:
+                    A dict-like object which contains the method name and settings to compute per-frame
                     confidence scores.
 
-                    name: The method name (str).
+                    name:
+                        The method name (str).
                         Supported values:
+
                             - 'max_prob' for using the maximum token probability as a confidence.
+
                             - 'entropy' for using a normalized entropy of a log-likelihood vector.
 
-                    entropy_type: Which type of entropy to use (str).
+                    entropy_type:
+                        Which type of entropy to use (str).
                         Used if confidence_method_cfg.name is set to `entropy`.
                         Supported values:
+
                             - 'gibbs' for the (standard) Gibbs entropy. If the alpha (α) is provided,
                                 the formula is the following: H_α = -sum_i((p^α_i)*log(p^α_i)).
                                 Note that for this entropy, the alpha should comply the following inequality:
                                 (log(V)+2-sqrt(log^2(V)+4))/(2*log(V)) <= α <= (1+log(V-1))/log(V-1)
                                 where V is the model vocabulary size.
+
                             - 'tsallis' for the Tsallis entropy with the Boltzmann constant one.
                                 Tsallis entropy formula is the following: H_α = 1/(α-1)*(1-sum_i(p^α_i)),
                                 where α is a parameter. When α == 1, it works like the Gibbs entropy.
                                 More: https://en.wikipedia.org/wiki/Tsallis_entropy
+
                             - 'renyi' for the Rényi entropy.
                                 Rényi entropy formula is the following: H_α = 1/(1-α)*log_2(sum_i(p^α_i)),
                                 where α is a parameter. When α == 1, it works like the Gibbs entropy.
                                 More: https://en.wikipedia.org/wiki/R%C3%A9nyi_entropy
 
-                    alpha: Power scale for logsoftmax (α for entropies). Here we restrict it to be > 0.
+                    alpha:
+                        Power scale for logsoftmax (α for entropies). Here we restrict it to be > 0.
                         When the alpha equals one, scaling is not applied to 'max_prob',
                         and any entropy type behaves like the Shannon entropy: H = -sum_i(p_i*log(p_i))
 
-                    entropy_norm: A mapping of the entropy value to the interval [0,1].
+                    entropy_norm:
+                        A mapping of the entropy value to the interval [0,1].
                         Supported values:
+
                             - 'lin' for using the linear mapping.
+
                             - 'exp' for using exponential mapping with linear shift.
 
-            batch_dim_index: Index of the batch dimension of ``targets`` and ``predictions`` parameters of
+            batch_dim_index:
+                Index of the batch dimension of ``targets`` and ``predictions`` parameters of
                 ``ctc_decoder_predictions_tensor`` methods. Can be either 0 or 1.
 
             The config may further contain the following sub-dictionaries:
-            "greedy":
-                preserve_alignments: Same as above, overrides above value.
-                compute_timestamps: Same as above, overrides above value.
-                preserve_frame_confidence: Same as above, overrides above value.
-                confidence_method_cfg: Same as above, overrides confidence_cfg.method_cfg.
 
-            "beam":
-                beam_size: int, defining the beam size for beam search. Must be >= 1.
-                    If beam_size == 1, will perform cached greedy search. This might be slightly different
-                    results compared to the greedy search above.
+                "greedy":
+                    preserve_alignments: Same as above, overrides above value.
+                    compute_timestamps: Same as above, overrides above value.
+                    preserve_frame_confidence: Same as above, overrides above value.
+                    confidence_method_cfg: Same as above, overrides confidence_cfg.method_cfg.
 
-                return_best_hypothesis: optional bool, whether to return just the best hypothesis or all of the
-                    hypotheses after beam search has concluded. This flag is set by default.
+                "beam":
+                    beam_size:
+                        int, defining the beam size for beam search. Must be >= 1.
+                        If beam_size == 1, will perform cached greedy search. This might be slightly different
+                        results compared to the greedy search above.
 
-                beam_alpha: float, the strength of the Language model on the final score of a token.
-                    final_score = acoustic_score + beam_alpha * lm_score + beam_beta * seq_length.
+                    return_best_hypothesis:
+                        optional bool, whether to return just the best hypothesis or all of the
+                        hypotheses after beam search has concluded. This flag is set by default.
 
-                beam_beta: float, the strength of the sequence length penalty on the final score of a token.
-                    final_score = acoustic_score + beam_alpha * lm_score + beam_beta * seq_length.
+                    beam_alpha:
+                        float, the strength of the Language model on the final score of a token.
+                        final_score = acoustic_score + beam_alpha * lm_score + beam_beta * seq_length.
 
-                kenlm_path: str, path to a KenLM ARPA or .binary file (depending on the strategy chosen).
-                    If the path is invalid (file is not found at path), will raise a deferred error at the moment
-                    of calculation of beam search, so that users may update / change the decoding strategy
-                    to point to the correct file.
+                    beam_beta:
+                        float, the strength of the sequence length penalty on the final score of a token.
+                        final_score = acoustic_score + beam_alpha * lm_score + beam_beta * seq_length.
+
+                    kenlm_path:
+                        str, path to a KenLM ARPA or .binary file (depending on the strategy chosen).
+                        If the path is invalid (file is not found at path), will raise a deferred error at the moment
+                        of calculation of beam search, so that users may update / change the decoding strategy
+                        to point to the correct file.
 
         tokenizer: NeMo tokenizer object, which inherits from TokenizerSpec.
     """
@@ -1161,7 +1327,7 @@ class CTCBPEDecoding(AbstractCTCDecoding):
 
 @dataclass
 class CTCDecodingConfig:
-    strategy: str = "greedy"
+    strategy: str = "greedy_batch"
 
     # preserve decoding alignments
     preserve_alignments: Optional[bool] = None
@@ -1186,6 +1352,11 @@ class CTCDecodingConfig:
     # beam decoding config
     beam: ctc_beam_decoding.BeamCTCInferConfig = field(
         default_factory=lambda: ctc_beam_decoding.BeamCTCInferConfig(beam_size=4)
+    )
+
+    # wfst decoding config
+    wfst: ctc_beam_decoding.WfstCTCInferConfig = field(
+        default_factory=lambda: ctc_beam_decoding.WfstCTCInferConfig(beam_size=4)
     )
 
     # confidence config

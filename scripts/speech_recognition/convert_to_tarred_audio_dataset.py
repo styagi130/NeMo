@@ -124,7 +124,11 @@ parser.add_argument(
 )
 
 parser.add_argument(
-    "--metadata_path", required=False, default=None, type=str, help="Path to metadata file for the dataset.",
+    "--metadata_path",
+    required=False,
+    default=None,
+    type=str,
+    help="Path to metadata file for the dataset.",
 )
 
 parser.add_argument(
@@ -165,7 +169,10 @@ parser.add_argument(
 )
 
 parser.add_argument(
-    "--buckets_num", type=int, default=1, help="Number of buckets to create based on duration.",
+    "--buckets_num",
+    type=int,
+    default=1,
+    help="Number of buckets to create based on duration.",
 )
 
 parser.add_argument(
@@ -364,7 +371,7 @@ class ASRTarredDatasetBuilder:
                 new_manifest_shard_path = os.path.join(sharded_manifests_dir, f'manifest_{shard_id}.json')
                 with open(new_manifest_shard_path, 'w', encoding='utf-8') as m2:
                     for entry in manifest:
-                        json.dump(entry, m2)
+                        json.dump(entry, m2, ensure_ascii=False)
                         m2.write('\n')
 
         # Flatten the list of list of entries to a list of entries
@@ -377,7 +384,7 @@ class ASRTarredDatasetBuilder:
         new_manifest_path = os.path.join(target_dir, 'tarred_audio_manifest.json')
         with open(new_manifest_path, 'w', encoding='utf-8') as m2:
             for entry in new_entries:
-                json.dump(entry, m2)
+                json.dump(entry, m2, ensure_ascii=False)
                 m2.write('\n')
 
         # Write metadata (default metadata for new datasets)
@@ -405,7 +412,7 @@ class ASRTarredDatasetBuilder:
         from lhotse.dataset.sampling.dynamic_bucketing import estimate_duration_buckets
         from nemo.collections.common.data.lhotse.nemo_adapters import LazyNeMoIterator
 
-        cuts = CutSet(LazyNeMoIterator(manifest_path, missing_sampling_rate_ok=True))
+        cuts = CutSet(LazyNeMoIterator(manifest_path, metadata_only=True))
         bins = estimate_duration_buckets(cuts, num_buckets=num_buckets)
         print(
             f"Note: we estimated the optimal bucketing duration bins for {num_buckets} buckets. "
@@ -555,7 +562,7 @@ class ASRTarredDatasetBuilder:
                 new_manifest_shard_path = os.path.join(sharded_manifests_dir, f'manifest_{shard_id}.json')
                 with open(new_manifest_shard_path, 'w', encoding='utf-8') as m2:
                     for entry in manifest:
-                        json.dump(entry, m2)
+                        json.dump(entry, m2, ensure_ascii=False)
                         m2.write('\n')
 
         # Flatten the list of list of entries to a list of entries
@@ -574,12 +581,12 @@ class ASRTarredDatasetBuilder:
         with open(new_manifest_path, 'w', encoding='utf-8') as m2:
             # First write all the entries of base manifest
             for entry in base_entries:
-                json.dump(entry, m2)
+                json.dump(entry, m2, ensure_ascii=False)
                 m2.write('\n')
 
             # Finally write the new entries
             for entry in new_entries:
-                json.dump(entry, m2)
+                json.dump(entry, m2, ensure_ascii=False)
                 m2.write('\n')
 
         # Preserve historical metadata
@@ -617,6 +624,15 @@ class ASRTarredDatasetBuilder:
         with open(manifest_path, 'r', encoding='utf-8') as m:
             for line in m:
                 entry = json.loads(line)
+                audio_key = "audio_filepath" if "audio_filepath" in entry else "audio_file"
+                if audio_key not in entry:
+                    raise KeyError(f"Manifest entry does not contain 'audio_filepath' or  'audio_file' key: {entry}")
+                audio_filepath = entry[audio_key]
+                if not os.path.isfile(audio_filepath) and not os.path.isabs(audio_filepath):
+                    audio_filepath_abs = os.path.join(os.path.dirname(manifest_path), audio_filepath)
+                    if not os.path.isfile(audio_filepath_abs):
+                        raise FileNotFoundError(f"Could not find {audio_filepath} or {audio_filepath_abs}!")
+                    entry[audio_key] = audio_filepath_abs
                 if (config.max_duration is None or entry['duration'] < config.max_duration) and (
                     config.min_duration is None or entry['duration'] >= config.min_duration
                 ):
@@ -648,8 +664,7 @@ class ASRTarredDatasetBuilder:
             tar.addfile(ti, encoded_audio)
 
     def _create_shard(self, entries, target_dir, shard_id, manifest_folder):
-        """Creates a tarball containing the audio files from `entries`.
-        """
+        """Creates a tarball containing the audio files from `entries`."""
         if self.config.sort_in_shards:
             entries.sort(key=lambda x: x["duration"], reverse=False)
 
@@ -679,24 +694,12 @@ class ASRTarredDatasetBuilder:
                 to_write = base + "-sub" + str(count[squashed_filename]) + ext
                 count[squashed_filename] += 1
 
+            # Carry over every key in the entry, override audio_filepath and shard_id
             new_entry = {
+                **entry,
                 'audio_filepath': to_write,
-                'duration': entry['duration'],
                 'shard_id': shard_id,  # Keep shard ID for recordkeeping
             }
-
-            if 'label' in entry:
-                new_entry['label'] = entry['label']
-
-            if 'text' in entry:
-                new_entry['text'] = entry['text']
-
-            if 'offset' in entry:
-                new_entry['offset'] = entry['offset']
-
-            if 'lang' in entry:
-                new_entry['lang'] = entry['lang']
-
             new_entries.append(new_entry)
 
         tar.close()

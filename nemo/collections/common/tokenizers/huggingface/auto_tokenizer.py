@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections import OrderedDict
 from typing import Optional
 
 from transformers import AutoTokenizer as AUTOTOKENIZER
@@ -25,9 +26,10 @@ __all__ = [
 
 
 class AutoTokenizer(TokenizerSpec):
-    '''
-        Wrapper of HuggingFace AutoTokenizer https://huggingface.co/transformers/model_doc/auto.html#autotokenizer.
-    '''
+    """
+    Wrapper of HuggingFace AutoTokenizer https://huggingface.co/transformers/model_doc/auto.html#autotokenizer.
+
+    """
 
     def __init__(
         self,
@@ -42,16 +44,16 @@ class AutoTokenizer(TokenizerSpec):
         cls_token: Optional[str] = None,
         unk_token: Optional[str] = None,
         use_fast: Optional[bool] = False,
+        trust_remote_code: Optional[bool] = False,
     ):
-
         """
         Args:
-            pretrained_model_name: corresponds to HuggingFace-AutoTokenizer's 'pretrained_model_name_or_path' input argument. 
-                For more details please refer to https://huggingface.co/transformers/_modules/transformers/tokenization_auto.html#AutoTokenizer.from_pretrained. 
+            pretrained_model_name: corresponds to HuggingFace-AutoTokenizer's 'pretrained_model_name_or_path' input argument.
+                For more details please refer to https://huggingface.co/transformers/_modules/transformers/tokenization_auto.html#AutoTokenizer.from_pretrained.
                 The list of all supported models can be found here: ALL_PRETRAINED_CONFIG_ARCHIVE_MAP
             vocab_file: path to file with vocabulary which consists
-                of characters separated by '\n'.
-            mask_token: mask token 
+                of characters separated by newlines.
+            mask_token: mask token
             bos_token: the beginning of sequence token
             eos_token: the end of sequence token. Usually equal to sep_token
             pad_token: token to use for padding
@@ -64,11 +66,16 @@ class AutoTokenizer(TokenizerSpec):
             # this logic deals with different huggingface tokenizers having different positional args
             if vocab_file is None:
                 self.tokenizer = AUTOTOKENIZER.from_pretrained(
-                    pretrained_model_name_or_path=pretrained_model_name, use_fast=use_fast,
+                    pretrained_model_name_or_path=pretrained_model_name,
+                    use_fast=use_fast,
+                    trust_remote_code=trust_remote_code,
                 )
             elif merges_file is None:
                 self.tokenizer = AUTOTOKENIZER.from_pretrained(
-                    pretrained_model_name_or_path=pretrained_model_name, vocab_file=vocab_file, use_fast=use_fast,
+                    pretrained_model_name_or_path=pretrained_model_name,
+                    vocab_file=vocab_file,
+                    use_fast=use_fast,
+                    trust_remote_code=trust_remote_code,
                 )
             else:
                 self.tokenizer = AUTOTOKENIZER.from_pretrained(
@@ -76,6 +83,7 @@ class AutoTokenizer(TokenizerSpec):
                     vocab_file=vocab_file,
                     merges_file=merges_file,
                     use_fast=use_fast,
+                    trust_remote_code=trust_remote_code,
                 )
         except Exception as e:
             raise ValueError(
@@ -123,24 +131,24 @@ class AutoTokenizer(TokenizerSpec):
 
         if len(new_tokens_in_vocab) > 0:
             """
-            Special tokens that were not previously included in the tokenizer's vocabulary file will be added to 
+            Special tokens that were not previously included in the tokenizer's vocabulary file will be added to
             the vocabulary and, as a result, the model should be resized, for example:
-            
+
             # define your model
             pretrained_model_name = 'roberta-base'
             model = nemo_nlp.modules.get_lm_model(pretrained_model_name=pretrained_model_name)
-            
+
             # define pretrained tokenizer
             tokenizer_default = nemo_nlp.modules.get_tokenizer(tokenizer_name=pretrained_model_name)
-            
+
             special_tokens = {'bos_token': '<BOS>',
                               'cls_token': '<CSL>',
                               'additional_special_tokens': ['<MY_NER_TOKEN>', '<ANOTHER_TOKEN>']}
             tokenizer_default.add_special_tokens(special_tokens_dict=special_tokens)
-            
+
             # resize your model so that the embeddings for newly added tokens are updated during training/finetuning
             model.resize_token_embeddings(tokenizer_default.vocab_size)
-            
+
             See NLP_Tokenizers.ipynb for more details.
             """
             logging.warning(
@@ -150,6 +158,7 @@ class AutoTokenizer(TokenizerSpec):
             )
         self.add_special_tokens(special_tokens_dict)
         self.space_sensitive = self.text_to_tokens('x y') != self.text_to_tokens('x') + self.text_to_tokens('y')
+        self._inv_vocab_dict = {}
 
     @property
     def vocab_size(self):
@@ -159,11 +168,13 @@ class AutoTokenizer(TokenizerSpec):
         """
         Adds a dictionary of special tokens (eos, pad, cls...). If special tokens are NOT in the vocabulary, they are added
         to it (indexed starting from the last index of the current vocabulary).
+
         Args:
             special_tokens_dict: dict of string. Keys should be in the list of predefined special attributes:
                 [``bos_token``, ``eos_token``, ``unk_token``, ``sep_token``, ``pad_token``, ``cls_token``, ``mask_token``,
                 ``additional_special_tokens``].
-            Tokens are only added if they are not already in the vocabulary.
+                Tokens are only added if they are not already in the vocabulary.
+
         Returns:
             Number of tokens added to the vocabulary.
         """
@@ -216,31 +227,56 @@ class AutoTokenizer(TokenizerSpec):
         return [id2vocab[i] for i in range(len(id2vocab))]
 
     @property
+    def inv_vocab(self):
+        if self._inv_vocab_dict == {}:
+            self._inv_vocab_dict = {v: k for k, v in self.tokenizer.vocab.items()}
+        return self._inv_vocab_dict
+
+    @property
     def pad_id(self):
+        if getattr(self, 'pad_token') is None:
+            return None
         return self.tokens_to_ids([getattr(self, 'pad_token')])[0]
 
     @property
     def bos_id(self):
+        if getattr(self, 'bos_token') is None:
+            return None
         return self.tokens_to_ids([getattr(self, 'bos_token')])[0]
 
     @property
     def eos_id(self):
+        if getattr(self, 'eos_token') is None:
+            return None
+        return self.tokens_to_ids([getattr(self, 'eos_token')])[0]
+
+    @property
+    def eod(self):
+        """Returns EOS token id. Exact copy of the eos_id function. Required for megatron-core."""
         return self.tokens_to_ids([getattr(self, 'eos_token')])[0]
 
     @property
     def sep_id(self):
+        if getattr(self, 'sep_token') is None:
+            return None
         return self.tokens_to_ids([getattr(self, 'sep_token')])[0]
 
     @property
     def cls_id(self):
+        if getattr(self, 'cls_token') is None:
+            return None
         return self.tokens_to_ids([getattr(self, 'cls_token')])[0]
 
     @property
     def unk_id(self):
+        if getattr(self, 'unk_token') is None:
+            return None
         return self.tokens_to_ids([getattr(self, 'unk_token')])[0]
 
     @property
     def mask_id(self):
+        if getattr(self, 'mask_token') is None:
+            return None
         return self.tokens_to_ids([getattr(self, 'mask_token')])[0]
 
     @property

@@ -14,22 +14,34 @@
 
 import torch
 import torch.nn.functional as F
-from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
+from megatron.core import InferenceParams
+from megatron.core.extensions.transformer_engine import SplitAlongDim
+from megatron.core.fusions.fused_bias_geglu import bias_geglu_impl
 from megatron.core.fusions.fused_bias_gelu import bias_gelu_impl
+from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl
 from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
+from megatron.core.models.common.embeddings.rotary_pos_embedding import apply_rotary_pos_emb
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer.attention import SelfAttention
-from megatron.core.transformer.custom_layers.transformer_engine import (
-    TEColumnParallelLinear,
-    TELayerNormColumnParallelLinear,
-)
 from megatron.core.transformer.mlp import MLP
+from megatron.core.transformer.moe.experts import SequentialMLP
+from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.utils import make_viewless_tensor
+from torch import Tensor
 
 from nemo.collections.nlp.modules.common.megatron.adapters.parallel_adapters import (
     AdapterName,
     InfusedAdapterConfig,
+    Lora4HtoHAdapterConfig,
+    LoraDenseAttentionAdapterConfig,
+    LoraHto4HAdapterConfig,
     LoraKQVAdapterConfig,
+    LoraMoe4HtoHAdapterConfig,
+    LoraMoeHto4HAdapterConfig,
+    LoraUnfusedHto4HAdapterConfig,
+    LoraUnfusedKQVAdapterConfig,
+    MLPHeadAdapterConfig,
     MLPInfusedAdapterConfig,
     ParallelLinearAdapterConfig,
     PromptEncoderAdapterConfig,
@@ -54,13 +66,57 @@ class MCoreAdapterModuleMixin(adapter_mixins.AdapterModuleMixin):
         raise NotImplementedError("Mcore mixins should implement setup_adapters on a subclass of MyBase")
 
 
+class MCoreTransformerBlockMixin(TransformerBlock, MCoreAdapterModuleMixin):
+    def mcore_register_adapters(self):
+        """
+        Setup NeMo (canonical) Adapter to this MCore layer.
+        """
+        self.set_accepted_adapter_types([MLPHeadAdapterConfig._target_])
+
+    def forward(
+        self,
+        hidden_states: Tensor,
+        attention_mask: Tensor,
+        context: Tensor = None,
+        context_mask: Tensor = None,
+        rotary_pos_emb: Tensor = None,
+        inference_params: InferenceParams = None,
+        packed_seq_params: PackedSeqParams = None,
+    ):
+        hidden_states = super().forward(
+            hidden_states, attention_mask, context, context_mask, rotary_pos_emb, inference_params, packed_seq_params
+        )
+
+        mlp_head_adapter = self.get_adapter_module(AdapterName.MLP_HEAD_ADAPTER)
+        if mlp_head_adapter and self.adapter_cfg[AdapterName.MLP_HEAD_ADAPTER]['enabled']:
+            hidden_states = mlp_head_adapter(hidden_states)
+
+        return hidden_states
+
+
 class MCoreSelfAttentionMixin(SelfAttention, MCoreAdapterModuleMixin):
     def mcore_register_adapters(self):
         """
         Setup NeMo LoRA or IA3 adapter to this MCore layer.
         """
-        self.set_accepted_adapter_types([LoraKQVAdapterConfig._target_, InfusedAdapterConfig._target_])
+        self.set_accepted_adapter_types(
+            [
+                LoraUnfusedKQVAdapterConfig._target_,
+                LoraKQVAdapterConfig._target_,
+                LoraDenseAttentionAdapterConfig._target_,
+                InfusedAdapterConfig._target_,
+            ]
+        )
         self.linear_qkv.return_layernorm_output = True  # need layernorm output for lora mlp
+        if (
+            self.config.sequence_parallel
+            and hasattr(self.linear_qkv, "return_layernorm_output_gathered")
+            and not self.linear_qkv.ub_overlap_ag
+        ):
+            # for LoRA SP, TE v1.5 can return layernorm output gathered so there is no need
+            # to perform the redundant gather in the adapter module, unless TP communication
+            # overlap is used.
+            self.linear_qkv.return_layernorm_output_gathered = True
 
     def get_query_key_value_tensors(self, hidden_states, key_value_states=None):
         """
@@ -70,29 +126,27 @@ class MCoreSelfAttentionMixin(SelfAttention, MCoreAdapterModuleMixin):
         linear_qkv_output, _ = self.linear_qkv(hidden_states)
         layernorm_output = None
 
-        # In megatron/core/models/gpt/gpt_layer_specs.py TELayerNormColumnParallelLinear is used for linear_qkv.
-        # TELayerNormColumnParallelLinear fused LN and linear, both will be returned.
-        # In nemo/collections/nlp/models/language_modeling/megatron/falcon/falcon_spec.py TEColumnParallelLinear is used for linear_qkv,
+        # In megatron/core/models/gpt/gpt_layer_specs.py when fused module is used(e.g. TELayerNormColumnParallelLinear)
+        # both LN and qkv will be returned.
+        # In nemo/collections/nlp/models/language_modeling/megatron/falcon/falcon_spec.py TEColumnParallelLinear(non-fused) is used for linear_qkv,
         # which only returns linear.
-        if isinstance(self.linear_qkv, TELayerNormColumnParallelLinear):
-            mixed_qkv, layernorm_output = linear_qkv_output
-        elif isinstance(self.linear_qkv, TEColumnParallelLinear):  # only mixed_qkv
+        if isinstance(linear_qkv_output, tuple):
+            if len(linear_qkv_output) == 2:  # fused module, qkv&LN
+                mixed_qkv, layernorm_output = linear_qkv_output
+            else:
+                raise ValueError(f"Unexpected number of outputs from linear_qkv output: {len(linear_qkv_output)}")
+        else:  # for qkv&LN not fused only mixed_qkv
             mixed_qkv = linear_qkv_output
-        else:
-            raise ValueError(
-                f"Unrecognized module type '{type(self.linear_qkv)}' when getting query, key, value tensors for mcore mixins. "
-            )
 
         # LoRA logic
         if self.is_adapter_available():
             lora_kqv_adapter = self.get_adapter_module(AdapterName.LORA_KQV_ADAPTER)
-            if lora_kqv_adapter:
-                if isinstance(self.linear_qkv, TELayerNormColumnParallelLinear):
+            if lora_kqv_adapter and self.adapter_cfg[AdapterName.LORA_KQV_ADAPTER]['enabled']:
+                if layernorm_output is not None:
                     lora_mixed_qkv = lora_kqv_adapter(layernorm_output)
-                elif isinstance(self.linear_qkv, TEColumnParallelLinear):
-                    lora_mixed_qkv = lora_kqv_adapter(hidden_states)
                 else:
-                    raise ValueError(f"Unrecognized module type '{type(self.linear_qkv)}' when applying lora.")
+                    lora_mixed_qkv = lora_kqv_adapter(hidden_states)
+
                 mixed_qkv = mixed_qkv + lora_mixed_qkv
 
         # [sq, b, hp] --> [sq, b, ng, (np/ng + 2) * hn]
@@ -106,56 +160,241 @@ class MCoreSelfAttentionMixin(SelfAttention, MCoreAdapterModuleMixin):
         mixed_qkv = mixed_qkv.view(*new_tensor_shape)
 
         # [sq, b, ng, (np/ng + 2) * hn] --> [sq, b, ng, np/ng * hn], [sq, b, ng, hn], [sq, b, ng, hn]
-        (query, key, value) = torch.split(
-            mixed_qkv,
-            [
-                (
-                    self.num_attention_heads_per_partition
-                    // self.num_query_groups_per_partition
-                    * self.hidden_size_per_attention_head
-                ),
-                self.hidden_size_per_attention_head,
-                self.hidden_size_per_attention_head,
-            ],
-            dim=3,
-        )
+        split_arg_list = [
+            (
+                self.num_attention_heads_per_partition
+                // self.num_query_groups_per_partition
+                * self.hidden_size_per_attention_head
+            ),
+            self.hidden_size_per_attention_head,
+            self.hidden_size_per_attention_head,
+        ]
+
+        if SplitAlongDim is not None:
+
+            # [sq, b, ng, (np/ng + 2) * hn] --> [sq, b, ng, np/ng * hn], [sq, b, ng, hn], [sq, b, ng, hn]
+            (query, key, value) = SplitAlongDim(
+                mixed_qkv,
+                3,
+                split_arg_list,
+            )
+        else:
+
+            # [sq, b, ng, (np/ng + 2) * hn] --> [sq, b, ng, np/ng * hn], [sq, b, ng, hn], [sq, b, ng, hn]
+            (query, key, value) = torch.split(
+                mixed_qkv,
+                split_arg_list,
+                dim=3,
+            )
+
         # [sq, b, ng, np/ng * hn] -> [sq, b, np, hn]
         query = query.reshape(query.size(0), query.size(1), -1, self.hidden_size_per_attention_head)
 
         if self.is_adapter_available():
             key_infused_adapter = self.get_adapter_module(AdapterName.KEY_INFUSED)
             value_infused_adapter = self.get_adapter_module(AdapterName.VALUE_INFUSED)
-            if key_infused_adapter:
+            if key_infused_adapter and self.adapter_cfg[AdapterName.KEY_INFUSED]['enabled']:
                 assert value_infused_adapter is not None, "Expected value_infused_adapter not found!"
                 kls = key.shape
                 key = key_infused_adapter(key.reshape(kls[0], kls[1], -1)).reshape(kls).to(query.dtype)
-            if value_infused_adapter:
+            if value_infused_adapter and self.adapter_cfg[AdapterName.VALUE_INFUSED]['enabled']:
                 assert key_infused_adapter is not None, "Expected key_infused_adapter not found!"
                 vls = value.shape
                 value = value_infused_adapter(value.reshape(vls[0], vls[1], -1)).reshape(vls).to(query.dtype)
 
+            lora_unfused_kqv_adapter = self.get_adapter_module(AdapterName.LORA_UNFUSED_KQV_ADAPTER)
+            if lora_unfused_kqv_adapter and self.adapter_cfg[AdapterName.LORA_UNFUSED_KQV_ADAPTER]['enabled']:
+                assert lora_kqv_adapter is None
+                if layernorm_output is not None:
+                    lq, lk, lv = lora_unfused_kqv_adapter(layernorm_output)
+                else:
+                    lq, lk, lv = lora_unfused_kqv_adapter(hidden_states)
+                query, key, value = query + lq, key + lk, value + lv
         return query, key, value
+
+    def forward(
+        self,
+        hidden_states,
+        attention_mask,
+        key_value_states=None,
+        inference_params=None,
+        rotary_pos_emb=None,
+        packed_seq_params=None,
+    ):
+        # hidden_states: [sq, b, h]
+
+        # For self attention we just duplicate the rotary_pos_emb if it isn't already
+        if rotary_pos_emb is not None and not isinstance(rotary_pos_emb, tuple):
+            rotary_pos_emb = (rotary_pos_emb,) * 2
+
+        # =====================
+        # Query, Key, and Value
+        # =====================
+        # Get the query, key and value tensors based on the type of attention -
+        # self or cross attn.
+        query, key, value = self.get_query_key_value_tensors(hidden_states, key_value_states)
+
+        # ===================================================
+        # Adjust key, value, and rotary_pos_emb for inference
+        # ===================================================
+        key, value, rotary_pos_emb, attn_mask_type = self._adjust_key_value_for_inference(
+            inference_params, key, value, rotary_pos_emb
+        )
+
+        if packed_seq_params is not None:
+            query = query.squeeze(1)
+            key = key.squeeze(1)
+            value = value.squeeze(1)
+
+        # ================================================
+        # relative positional embedding (rotary embedding)
+        # ================================================
+        if rotary_pos_emb is not None:
+            q_pos_emb, k_pos_emb = rotary_pos_emb
+
+            if packed_seq_params is not None:
+                cu_seqlens_q = packed_seq_params.cu_seqlens_q
+                cu_seqlens_kv = packed_seq_params.cu_seqlens_kv
+            else:
+                cu_seqlens_q = cu_seqlens_kv = None
+            query = apply_rotary_pos_emb(query, q_pos_emb, config=self.config, cu_seqlens=cu_seqlens_q)
+            key = apply_rotary_pos_emb(key, k_pos_emb, config=self.config, cu_seqlens=cu_seqlens_kv)
+            # TODO, can apply positional embedding to value_layer so it has
+            # absolute positional embedding.
+            # otherwise, only relative positional embedding takes effect
+            # value_layer = apply_rotary_pos_emb(value_layer, k_pos_emb)
+
+        # ==================================
+        # core attention computation
+        # ==================================
+
+        if self.checkpoint_core_attention:
+            core_attn_out = self._checkpointed_attention_forward(
+                query,
+                key,
+                value,
+                attention_mask,
+                attn_mask_type=attn_mask_type,
+                packed_seq_params=packed_seq_params,
+            )
+        else:
+            core_attn_out = self.core_attention(
+                query,
+                key,
+                value,
+                attention_mask,
+                attn_mask_type=attn_mask_type,
+                packed_seq_params=packed_seq_params,
+            )
+
+        if packed_seq_params is not None:
+            # reshape to same output shape as unpacked case
+            # (t, np, hn) -> (t, b=1, h=np*hn)
+            # t is the pack size = sum (sq_i)
+            # note that batch is a dummy dimension in the packed case
+            core_attn_out = core_attn_out.reshape(core_attn_out.size(0), 1, -1)
+
+        # =================
+        # Output. [sq, b, h]
+        # =================
+
+        output, bias = self.linear_proj(core_attn_out)
+        # LoRA logic
+        if self.is_adapter_available():
+            lora_linear_proj_adapter = self.get_adapter_module(AdapterName.LORA_DENSE_ATTENTION_ADAPTER)
+            if lora_linear_proj_adapter and self.adapter_cfg[AdapterName.LORA_DENSE_ATTENTION_ADAPTER]['enabled']:
+                lora_output = lora_linear_proj_adapter(core_attn_out)
+                output = output + lora_output
+
+        return output, bias
 
 
 class MCoreMLPMixin(MLP, MCoreAdapterModuleMixin):
     def mcore_register_adapters(self):
         """
-        Setup NeMo IA3 adapter to this MCore layer.
+        Setup NeMo IA3 and LoRA adapter to this MCore layer.
         """
-        self.set_accepted_adapter_types([MLPInfusedAdapterConfig._target_])  # only self attn (packed qkv) for now
+        self.set_accepted_adapter_types(
+            [
+                LoraUnfusedHto4HAdapterConfig._target_,
+                LoraHto4HAdapterConfig._target_,
+                Lora4HtoHAdapterConfig._target_,
+                LoraMoeHto4HAdapterConfig._target_,
+                LoraMoe4HtoHAdapterConfig._target_,
+                MLPInfusedAdapterConfig._target_,
+            ]
+        )  # only self attn (packed qkv) for now
+        self.linear_fc1.return_layernorm_output = True  # need layernorm output for lora mlp
+        if (
+            self.config.sequence_parallel
+            and hasattr(self.linear_fc1, "return_layernorm_output_gathered")
+            and not self.config.tp_comm_overlap
+        ):
+            # for LoRA SP, TE v1.5 can return layernorm output gathered so there is no need
+            # to perform the redundant gather in the adapter module, unless TP communication
+            # overlap is used.
+            self.linear_fc1.return_layernorm_output_gathered = True
 
-    def forward(self, hidden_states):
+    def forward(self, hidden_states, expert_idx=None):
         # [s, b, 4 * h/p]
-        intermediate_parallel, bias_parallel = self.linear_fc1(hidden_states)
+        output = self.linear_fc1(hidden_states)
+        if isinstance(output, tuple) and len(output) == 2:
+            intermediate_parallel, bias_parallel = output
+            if isinstance(intermediate_parallel, tuple) and len(intermediate_parallel) == 2:
+                intermediate_parallel, layernorm_output = intermediate_parallel
+            else:
+                layernorm_output = hidden_states
+        else:
+            # self.linear_fc1.te_return_bias == True
+            intermediate_parallel, bias_parallel, layernorm_output = output
 
-        if self.config.bias_gelu_fusion:
-            assert self.config.add_bias_linear is True
-            assert self.activation_func == F.gelu
-            intermediate_parallel = bias_gelu_impl(intermediate_parallel, bias_parallel)
+        # LoRA logic
+        if self.is_adapter_available():
+            lora_adapter = None
+            lora_fc1_adapter = self.get_adapter_module(AdapterName.LORA_Hto4H_ADAPTER)
+            lora_unfused_fc1_adapter = self.get_adapter_module(AdapterName.LORA_UNFUSED_Hto4H_ADAPTER)
+            lora_moe_fc1_adapter = self.get_adapter_module(AdapterName.LORA_MOE_Hto4H_ADAPTER)
+            if lora_fc1_adapter and self.adapter_cfg[AdapterName.LORA_Hto4H_ADAPTER]['enabled']:
+                lora_adapter = lora_fc1_adapter
+            if lora_unfused_fc1_adapter and self.adapter_cfg[AdapterName.LORA_UNFUSED_Hto4H_ADAPTER]['enabled']:
+                assert lora_adapter is None, "Expected only one of LORA_Hto4H_ADAPTER or LORA_UNFUSED_Hto4H_ADAPTER"
+                lora_adapter = lora_unfused_fc1_adapter
+
+            lora_output = 0
+            if lora_adapter:
+                lora_output = lora_adapter(layernorm_output)
+            elif lora_moe_fc1_adapter and self.adapter_cfg[AdapterName.LORA_MOE_Hto4H_ADAPTER]['enabled']:
+                lora_output = lora_moe_fc1_adapter(layernorm_output, expert_idx)
+            intermediate_parallel = intermediate_parallel + lora_output
+
+        if self.config.bias_activation_fusion:
+            if self.activation_func == F.gelu:
+                if self.config.gated_linear_unit:
+                    intermediate_parallel = bias_geglu_impl(intermediate_parallel, bias_parallel)
+                else:
+                    assert self.config.add_bias_linear is True
+                    intermediate_parallel = bias_gelu_impl(intermediate_parallel, bias_parallel)
+            elif self.activation_func == F.silu and self.config.gated_linear_unit:
+                intermediate_parallel = bias_swiglu_impl(
+                    intermediate_parallel,
+                    bias_parallel,
+                    self.config.activation_func_fp8_input_store,
+                )
+
+            else:
+                raise ValueError("Only support fusion of gelu and swiglu")
         else:
             if bias_parallel is not None:
                 intermediate_parallel = intermediate_parallel + bias_parallel
-            intermediate_parallel = self.activation_func(intermediate_parallel)
+            if self.config.gated_linear_unit:
+
+                def glu(x):
+                    x = torch.chunk(x, 2, dim=-1)
+                    return self.config.activation_func(x[0]) * x[1]
+
+                intermediate_parallel = glu(intermediate_parallel)
+            else:
+                intermediate_parallel = self.activation_func(intermediate_parallel)
 
         infused_adapter = self.get_adapter_module(AdapterName.MLP_INFUSED)
         if infused_adapter:
@@ -163,7 +402,52 @@ class MCoreMLPMixin(MLP, MCoreAdapterModuleMixin):
 
         # [s, b, h]
         output, output_bias = self.linear_fc2(intermediate_parallel)
+
+        # LoRA logic
+        if self.is_adapter_available():
+            lora_fc2_adapter = self.get_adapter_module(AdapterName.LORA_4HtoH_ADAPTER)
+            lora_moe_fc2_adapter = self.get_adapter_module(AdapterName.LORA_MOE_4HtoH_ADAPTER)
+
+            lora_output = 0
+            if lora_fc2_adapter and self.adapter_cfg[AdapterName.LORA_4HtoH_ADAPTER]['enabled']:
+                lora_output = lora_fc2_adapter(intermediate_parallel)
+            elif lora_moe_fc2_adapter and self.adapter_cfg[AdapterName.LORA_MOE_4HtoH_ADAPTER]['enabled']:
+                lora_output = lora_moe_fc2_adapter(intermediate_parallel, expert_idx)
+
+            output = output + lora_output
+
         return output, output_bias
+
+
+class MCoreSequentialMLPMixin(SequentialMLP, MCoreAdapterModuleMixin):
+    def mcore_register_adapters(self):
+        """
+        We don't want the SequentialMLP layer to take any adapters. We only want to override the forward() behavior
+        """
+        pass
+
+    def forward(self, permuted_local_hidden_states, tokens_per_expert):
+        output_local = torch.zeros_like(permuted_local_hidden_states)
+        output_bias_local = None
+        if self.add_bias:
+            output_bias_local = torch.zeros_like(permuted_local_hidden_states)
+
+        cumsum_num_tokens = torch.cumsum(tokens_per_expert, dim=0)
+        # Insert zero at the begining for offset index's convenience
+        zero_tensor = torch.zeros(1, dtype=torch.long, device=cumsum_num_tokens.device)
+        cumsum_num_tokens = torch.cat((zero_tensor, cumsum_num_tokens))
+        for expert_num, expert in enumerate(self.local_experts):
+            start = cumsum_num_tokens[expert_num]
+            end = cumsum_num_tokens[expert_num + 1]
+            hidden = permuted_local_hidden_states[start:end]
+            output, output_bias = expert(hidden, expert_num)  # expert: MLP
+
+            output_local[start:end] = output
+            if self.add_bias:
+                output_bias = output_bias.expand_as(output)
+                output_bias_local[start:end, :] = output_bias
+
+        return output_local, output_bias_local
 
 
 class MCoreGPTEmbeddingMixin(LanguageModelEmbedding, MCoreAdapterModuleMixin):
@@ -180,7 +464,9 @@ class MCoreGPTEmbeddingMixin(LanguageModelEmbedding, MCoreAdapterModuleMixin):
             _sq, _bs, _hs = encoder_input.size()
             ptuning_adapter = self.get_adapter_module(AdapterName.PTUNING_ADAPTER)
             v = ptuning_adapter.virtual_tokens
-            if ptuning_adapter and _sq >= v:  # The sequence should be longer the v to insert virtual embeddings.
+            if (
+                ptuning_adapter and self.adapter_cfg[AdapterName.PTUNING_ADAPTER]['enabled'] and _sq >= v
+            ):  # The sequence should be longer the v to insert virtual embeddings.
                 virtual_embeddings = ptuning_adapter(_bs)
                 encoder_input = encoder_input[
                     v:, :, :
@@ -204,6 +490,7 @@ class MCoreTransformerLayerMixin(TransformerLayer, MCoreAdapterModuleMixin):
         context_mask=None,
         rotary_pos_emb=None,
         inference_params=None,
+        packed_seq_params=None,
     ):
         # hidden_states: [s, b, h]
 
@@ -219,12 +506,13 @@ class MCoreTransformerLayerMixin(TransformerLayer, MCoreAdapterModuleMixin):
             attention_mask=attention_mask,
             inference_params=inference_params,
             rotary_pos_emb=rotary_pos_emb,
+            packed_seq_params=packed_seq_params,
         )
 
         # adapter logic
         if self.is_adapter_available():
             adapter_1 = self.get_adapter_module(AdapterName.PRE_ATTN_ADAPTER)
-            if adapter_1:
+            if adapter_1 and self.adapter_cfg[AdapterName.PRE_ATTN_ADAPTER]['enabled']:
                 attention_output, bias = attention_output_with_bias
                 attention_output = (
                     adapter_1(attention_output) + attention_output
@@ -274,7 +562,7 @@ class MCoreTransformerLayerMixin(TransformerLayer, MCoreAdapterModuleMixin):
         # adapter logic
         if self.is_adapter_available():
             adapter_2 = self.get_adapter_module(AdapterName.POST_ATTN_ADAPTER)
-            if adapter_2:
+            if adapter_2 and self.adapter_cfg[AdapterName.POST_ATTN_ADAPTER]['enabled']:
                 mlp_output, bias = mlp_output_with_bias
                 mlp_output = adapter_2(mlp_output) + mlp_output  # simple adapter call with residual connection
                 mlp_output_with_bias = (mlp_output, bias)
