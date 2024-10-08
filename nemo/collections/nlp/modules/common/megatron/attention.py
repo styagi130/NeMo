@@ -441,7 +441,6 @@ class ParallelAttention(MegatronModule, adapter_mixins.AdapterModuleMixin):
             )
         else:  # Else in cross_attention
             # Attention heads [sk, b, h] --> [sk, b, (np * 2 * hn)]
-<<<<<<< HEAD
             if (
                 inference_max_sequence_len is None
             ) or self.inference_current_sequence_len < inference_max_sequence_len:
@@ -451,17 +450,15 @@ class ParallelAttention(MegatronModule, adapter_mixins.AdapterModuleMixin):
                 mixed_kv_layer, _ = self.key_value(encoder_output)
                 if self.is_adapter_available():
                     lora_kv_adapter = self.get_adapter_module(AdapterName.LORA_KV_ADAPTER)
-                    if lora_kv_adapter:
+                    if lora_kv_adapter and self.adapter_cfg[AdapterName.LORA_KV_ADAPTER]['enabled']:
                         lora_mixed_kv_layer = lora_kv_adapter(encoder_output)
                         mixed_kv_layer = mixed_kv_layer + lora_mixed_kv_layer
-=======
             mixed_kv_layer, _ = self.key_value(encoder_output)
             if self.is_adapter_available():
                 lora_kv_adapter = self.get_adapter_module(AdapterName.LORA_KV_ADAPTER)
                 if lora_kv_adapter and self.adapter_cfg[AdapterName.LORA_KV_ADAPTER]['enabled']:
                     lora_mixed_kv_layer = lora_kv_adapter(encoder_output)
                     mixed_kv_layer = mixed_kv_layer + lora_mixed_kv_layer
->>>>>>> nvidia/main
 
                 # [sk, b, (np * 2 * hn)] --> [sk, b, np, 2 * hn]
                 new_tensor_shape = mixed_kv_layer.size()[:-1] + (
