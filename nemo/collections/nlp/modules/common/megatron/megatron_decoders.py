@@ -101,6 +101,7 @@ def get_decoder_model(
     version=1,
     position_embedding_type='learned_absolute',
     use_flash_attention=False,
+    is_inference=False
 ):
     """Build language model and return along with the key to save."""
 
@@ -160,6 +161,7 @@ def get_decoder_model(
             position_embedding_type=position_embedding_type,
             use_flash_attention=use_flash_attention,
             layer_type=layer_type,
+            is_inference=is_inference
         )
     elif arch == "retro":
         decoder = MegatronRetrievalTransformerDecoderModule(

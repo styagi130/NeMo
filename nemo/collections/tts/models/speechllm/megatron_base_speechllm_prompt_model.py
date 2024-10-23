@@ -74,8 +74,9 @@ class MegatronBaseSpeechLM(MegatronBaseModel, TextGeneration):
     tasks. This gives p-tuning the same task flexiblity as prompt-tuning.
     """
 
-    def __init__(self, cfg: DictConfig, trainer: Trainer):
+    def __init__(self, cfg: DictConfig, trainer: Trainer, is_inference=False):
         super().__init__(cfg, trainer)
+        self.is_inference = is_inference
         self.init_model(cfg, trainer)
         self.config = self.model_parallel_config
 

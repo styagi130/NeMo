@@ -132,6 +132,7 @@ class MegatronTokenLevelEncoderDecoderModule(MegatronModule, adapter_mixins.Adap
         share_decoder_tokens_head_embeddings=True,
         tokens_head_bias=True,
         hiddens_cfg: DictConfig = None,  # allows for hidden state transformations before the decoder
+        is_inference=False
     ):
         super(MegatronTokenLevelEncoderDecoderModule, self).__init__(config=config)
 
@@ -391,6 +392,7 @@ class MegatronTokenLevelEncoderDecoderModule(MegatronModule, adapter_mixins.Adap
                 position_embedding_type=decoder_cfg.get('position_embedding_type', 'learned_absolute'),
                 use_flash_attention=decoder_cfg.get('use_flash_attention', False),
                 layer_type=decoder_cfg.get('layer_type', LayerType.decoder),
+                is_inference=is_inference
             )
 
         hiddens_module = get_hiddens_module(hiddens_cfg, model_parallel_cfg=config)
