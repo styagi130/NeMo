@@ -15,6 +15,8 @@
 import enum
 import math
 
+from torch import is_inference
+
 from omegaconf.dictconfig import DictConfig
 from pytorch_lightning.trainer.trainer import Trainer
 
@@ -37,8 +39,9 @@ class MegatronT5Model(MegatronLMEncoderDecoderModel):
     Megatron T5 pretraining
     """
 
-    def __init__(self, cfg: DictConfig, trainer: Trainer):
-        super().__init__(cfg, trainer=trainer)
+    def __init__(self, cfg: DictConfig, trainer: Trainer, is_inference=False):
+        super().__init__(cfg, trainer=trainer, is_inference=is_inference)
+        self.is_inference = is_inference
 
         # validate cfg
         self._validate_cfg()
