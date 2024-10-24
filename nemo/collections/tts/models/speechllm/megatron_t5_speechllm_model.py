@@ -2487,7 +2487,7 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
 
     def infer_gen(self, encoded_text,
                   taskname_ids,
-                  virtual_tokens_embeddings, speaker_context_embeddings,
+                  virtual_tokens_embeddings, speaker_context_output,
                   n_codes_to_regenerate=10, extra_codes_for_final_phone=2, dtype=torch.float32):
         with torch.no_grad():
             reset = True
@@ -2560,23 +2560,8 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
 
             # full_alibi = self.alibi(0,text_enc_output.shape[0])
             # Embed speaker
-            speaker_context_mask = torch.ones([1, speaker_context_embeddings.shape[1]]).to(self.device)
-            speaker_context_embeddings = speaker_context_embeddings.transpose(0, 1)
-            speaker_context_mask_3d = attn_mask_postprocess(
-                build_attention_mask_3d(
-                    source_mask=speaker_context_mask, target_mask=speaker_context_mask, attn_mask_type=mask_type,
-                )
-            )
-            speaker_context_output = self.frozen_model.enc_dec_model.enc_dec_model.encoder.model[0](
-                speaker_context_embeddings,
-                speaker_context_mask_3d,
-                layer_past=None,
-                get_key_value=False,
-                self_attention_relative_position_bias=None,
-                return_all_crossattention_probs=torch.tensor(False),
-                return_all_selfattention_probs=torch.tensor(False),
-                set_inference_key_value_memory=False,
-            )
+            speaker_context_mask = torch.ones([1, speaker_context_output.shape[0]],
+                                              dtype=speaker_context_output.dtype).to(self.device)
 
             input_mask = torch.ones([1, self.max_inference_timesteps]).to(self.device)
             input_mask = build_attention_mask_3d(
@@ -2602,18 +2587,17 @@ class MegatronT5SpeechLMModel(MegatronBaseSpeechLM):
             
             speaker_inference_kv_tensor = torch.zeros(
                     [speaker_context_output.shape[0], batch_size, n_head, hidden_size_per_head],
-                    dtype=dtype,
+                    dtype=speaker_context_output.dtype,
                     device=self.device
                     )
             text_inference_kv_tensor = torch.zeros(
                     [text_enc_output.shape[0], batch_size, n_head, hidden_size_per_head],
-                    dtype=dtype,
+                    dtype=speaker_context_output.dtype,
                     device=self.device
-
                     )
             decoder_inference_kv_tensor = torch.zeros(
                     [self.max_inference_timesteps, batch_size, n_head, hidden_size_per_head],
-                    dtype=dtype,
+                    dtype=speaker_context_output.dtype,
                     device=self.device
                     )
             for i in range(len(self.frozen_model.enc_dec_model.enc_dec_model.decoder.model.layers)):
