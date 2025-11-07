@@ -7,8 +7,10 @@ gdown
 h5py
 ijson
 jieba
+#mamba-ssm==2.2.2; sys_platform == 'linux'
 markdown2
 matplotlib>=3.3.2
+<<<<<<< Updated upstream
 megatron_core
 multi-storage-client>=0.21.0
 nltk>=3.6.5
@@ -17,12 +19,25 @@ nvidia-modelopt[torch]>=0.27.0,<=0.33.0; platform_system != 'Darwin'
 nvidia-resiliency-ext>=0.3.0,<1.0.0; platform_system != 'Darwin'
 nvtx
 opencc
+=======
+#megatron_core>0.6.0 # add back once mcore on pypi is compatible again
+nltk>=3.6.5
+numpy<2  # tensorstore has an implicit compiled dependency on numpy<2
+opencc<1.1.7
+>>>>>>> Stashed changes
 pangu
 prettytable
 rapidfuzz
 rouge_score
 sacrebleu  # manually install sacrebleu[ja] for Japanese support; MeCab is unsupported in Python 3.11+
+<<<<<<< Updated upstream
 sentence_transformers
 tensorstore<0.1.72; platform_system != 'Darwin'
 tiktoken==0.7.0
 zarr>=2.18.2,<3.0.0
+=======
+#sentence_transformers
+#tensorstore<0.1.46
+#tiktoken==0.7.0
+zarr
+>>>>>>> Stashed changes

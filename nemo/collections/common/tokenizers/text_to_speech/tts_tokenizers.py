@@ -930,6 +930,9 @@ class ChinesePhonemesTokenizer(BaseTokenizer):
         self.punct = punct
         self.pad_with_space = pad_with_space
         self.g2p = g2p
+        with open("mapping.txt", "w") as f:
+            for token in self._token2id:
+                f.write(f"{self._token2id[token]} {token}\n")
 
     def encode(self, text: str) -> List[int]:
         """See base class for more information."""
@@ -950,10 +953,12 @@ class ChinesePhonemesTokenizer(BaseTokenizer):
         for p in g2p_text:  # noqa
             # Add space if last one isn't one
             if p == space and len(ps) > 0 and ps[-1] != space:
+                print(p)
                 ps.append(p)
             # Add next phoneme or tone or ascii letter or apostrophe.
             elif ((p.isalnum() or p == "'" or p in self.phoneme_list + self.tone_list + self.ascii_letter_list) and
                    p in tokens):
+                print(p)
                 ps.append(p)
             # Add punctuation
             elif (p in self.PUNCT_LIST) and self.punct:
@@ -972,7 +977,7 @@ class ChinesePhonemesTokenizer(BaseTokenizer):
 
         if self.pad_with_space:
             ps = [space] + ps + [space]
-
+            
         return [self._token2id[p] for p in ps]
 
 
@@ -1139,6 +1144,10 @@ class AggregatedTTSTokenizer:
     def encode(self, text: str, tokenizer_name: str = None) -> List[int]:
         tokenizer = self.tokenizers[tokenizer_name]
         tokens = tokenizer.encode(text)
+        print("tokens:", tokens)
+        print("tokenizer_name:", tokenizer_name)
+        print("toknizer_offsets:", self.tokenizer_offsets[tokenizer_name])
+        print("toknizer_offsets:", type(tokenizer))
         return [self.tokenizer_offsets[tokenizer_name] + token for token in tokens]
 
     def decode(self, tokens: List[int], tokenizer_name: str = None) -> str:

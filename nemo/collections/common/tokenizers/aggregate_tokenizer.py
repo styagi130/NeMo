@@ -114,7 +114,9 @@ class AggregateTokenizer(TokenizerSpec):
         tokenizer = self.tokenizers_dict[lang_id]
         token_ids = tokenizer.text_to_ids(text)
         token_ids[:] = [t + self.token_id_offset[lang_id] for t in token_ids]
-
+        print("token_ids:", token_ids)
+        print("token_id_offset:", self.token_id_offset[lang_id])
+        import sys; sys.exit(0)
         return token_ids
 
     def tokens_to_text(self, tokens, lang_id):
@@ -139,6 +141,8 @@ class AggregateTokenizer(TokenizerSpec):
 
     def token_to_id(self, token, lang_id):
         tokenizer = self.tokenizers_dict[lang_id]
+        print("token_offset:", self.token_id_offset[lang_id])
+        import sys; sys.exit(0)
         return tokenizer.token_to_id(token) + self.token_id_offset[lang_id]
 
     def ids_to_tokens(self, ids):

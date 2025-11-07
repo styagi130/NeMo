@@ -144,6 +144,9 @@ class TextToSpeechDataset(Dataset):
             )
             self.data_samples += samples
             self.sample_weights += weights
+        print(self.data_samples)
+        print(self.sample_weights)
+        print(len(self.data_samples))
 
     def get_sampler(self, batch_size: int, world_size: int) -> Optional[torch.utils.data.Sampler]:
         if not self.weighted_sampling_steps_per_epoch:
@@ -212,7 +215,8 @@ class TextToSpeechDataset(Dataset):
 
     def __getitem__(self, index):
         data = self.data_samples[index]
-
+        
+        print("Coming to load audio.")
         audio_array, _, audio_filepath_rel = load_audio(
             manifest_entry=data.manifest_entry,
             audio_dir=data.audio_dir,
@@ -234,6 +238,7 @@ class TextToSpeechDataset(Dataset):
             "tokens": tokens,
             "text_len": text_len,
         }
+        print("COMING TO speaker")
 
         if data.speaker is not None:
             example["speaker"] = data.speaker
@@ -244,7 +249,7 @@ class TextToSpeechDataset(Dataset):
             align_prior = beta_binomial_prior_distribution(phoneme_count=text_len, mel_count=spec_len)
             align_prior = torch.tensor(align_prior, dtype=torch.float32)
             example["align_prior"] = align_prior
-
+        print("COMING TO featurizer")
         for featurizer in self.featurizers:
             feature_dict = featurizer.load(
                 manifest_entry=data.manifest_entry, audio_dir=data.audio_dir, feature_dir=data.feature_dir
@@ -253,7 +258,8 @@ class TextToSpeechDataset(Dataset):
 
         for processor in self.feature_processors:
             processor.process(example)
-
+        
+        print("RETURNING from laoder:", example)
         return example
 
     def collate_fn(self, batch: List[dict]):
@@ -462,6 +468,7 @@ class MagpieTTSDataset(TextToSpeechDataset):
                 example['audio_filepath'] = data.manifest_entry['audio_filepath']
         else:
             # Only load audio if codes are not available
+            print(data.manifest_entry)
             audio_array, _, audio_filepath_rel = load_audio(
                 manifest_entry=data.manifest_entry,
                 audio_dir=data.audio_dir,
@@ -583,7 +590,6 @@ class MagpieTTSDataset(TextToSpeechDataset):
             audio_len_16khz = audio_16khz.shape[0]
             example['audio_16khz'] = audio_16khz
             example['audio_len_16khz'] = audio_len_16khz
-
         if self.use_text_conditioning_tokenizer:
             if 'context_text' in data.manifest_entry:
                 context_text = data.manifest_entry['context_text']
@@ -597,6 +603,7 @@ class MagpieTTSDataset(TextToSpeechDataset):
                 context_tokens = self.text_tokenizer.encode("[NO TEXT CONTEXT]", self.text_conditioning_tokenizer_name)
                 example['has_text_context'] = False
             if self.pad_context_text_to_max_duration:
+                print("COMING HERE TO PAD")
                 _required_len = (
                     int(self.context_duration_max * self.sample_rate / self.codec_model_samples_per_frame) + 2
                 )  # +2 for BOS and EOS
@@ -605,7 +612,8 @@ class MagpieTTSDataset(TextToSpeechDataset):
                     context_tokens += [_pad_id] * (_required_len - len(context_tokens))
                 else:
                     context_tokens = context_tokens[:_required_len]
-
+                print(f"{_required_len=} {_pad_id=}")
+            
             context_tokens = torch.tensor(context_tokens, dtype=torch.int32)
             context_text_len = context_tokens.shape[0]
             example['context_text_tokens'] = context_tokens

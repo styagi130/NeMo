@@ -3,8 +3,11 @@ huggingface_hub>=0.24
 numba
 numpy>=1.22
 onnx>=1.7.0
+<<<<<<< Updated upstream
 # Align with upstream PyTorch requirements
 protobuf~=5.29.5
+=======
+>>>>>>> Stashed changes
 python-dateutil
 ruamel.yaml
 scikit-learn

@@ -261,7 +261,7 @@ class Attention(torch.nn.Module):
         if mask is not None:
             attn_prob = attn_prob.masked_fill(mask == 0, 0.0)
         attn_prob = self.dropout(attn_prob)
-
+        
         y = torch.matmul(attn_prob, v)
         y = y.transpose(1, 2).contiguous().view(B, T, -1)
 

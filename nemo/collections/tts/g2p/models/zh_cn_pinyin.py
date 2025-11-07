@@ -199,6 +199,7 @@ class ChineseG2p(BaseG2p):
                 errors=lambda en_words: [letter for letter in en_words],
             )
         phoneme_seq = []
+        print("Before phoneme_dict", pinyin_seq)
         for pinyin in pinyin_seq:
             # only pinyin has tones while non-pinyin doesn't.
             tone_hyp = pinyin[-1]
@@ -224,4 +225,5 @@ class ChineseG2p(BaseG2p):
                 phoneme_seq.append(pinyin)
         if err:
             logging.error(f"|{text}| contained unknown syllables")
+        print("After phoneme dict", phoneme_seq)
         return phoneme_seq

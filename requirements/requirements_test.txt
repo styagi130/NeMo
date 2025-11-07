@@ -1,10 +1,12 @@
 black~=24.3
 click>=8.1
-coverage
 isort>5.1.0,<6.0.0
 parameterized
 pytest
+<<<<<<< Updated upstream
 pytest-httpserver
+=======
+>>>>>>> Stashed changes
 pytest-mock
 pytest-runner
 ruamel.yaml

@@ -52,6 +52,34 @@ from nemo.collections.tts.parts.utils.helpers import (
 from nemo.core.classes import ModelPT
 from nemo.core.classes.common import PretrainedModelInfo
 from nemo.utils import logging
+from .trt_engine import TRTModelSession
+import onnxruntime as ort
+import onnx
+
+
+class CategoricalSamplingFn(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x: torch.Tensor):
+        # Forward is not used during ONNX parsing. So you can put a dummy implementation here.
+        # We return a 1D INT32 tensor to match plugin output type.
+        return torch.zeros(x.shape[0], dtype=torch.int32, device=x.device)
+
+    @staticmethod
+    def symbolic(g, x):
+        # Emit ONNX node whose (domain, op_type) matches the TRT plugin creator.
+        output = g.op("CategoricalSampling", x)
+        # Set the output type to INT32 with 1D shape (dynamic size)
+        output.setType(x.type().with_dtype(torch.int32).with_sizes([None]))
+        return output
+
+# IMPORTANT: The following function is what you call in your model. See `linear_lt_autoregressive.ipynb` for an example.
+def categorical_sampling(x: torch.Tensor) -> torch.Tensor:
+    return CategoricalSamplingFn.apply(x)
+
+
+local_transformer_model = TRTModelSession("/home/siddhartht/tts/speechLM/NeMo_2503/models/magpie_multi/jul_2025_grpo/engine_fp16/local_transformer/local_transformer.plan")
+lt_onnx = ort.InferenceSession("/home/siddhartht/tts/speechLM/NeMo_2503/models/magpie_multi/jul_2025_grpo/tllm_checkpoint/local_transformer/local_transformer_multi.onnx",
+                               providers=["CUDAExecutionProvider"])
 
 
 def worker_init_fn(worker_id):
@@ -503,8 +531,7 @@ class MagpieTTSModel(ModelPT):
         # codes: (B, C, T')
         # codes_len: (B,)
         self._codec_model.eval()
-        with torch.no_grad(), torch.autocast(device_type=codes.device.type, dtype=torch.float32):
-            # Make a copy to avoid modifying the original tensor if it's used elsewhere
+        with torch.no_grad(), torch.autocast(device_type=codes.device.type, dtype=torch.float32): # Make a copy to avoid modifying the original tensor if it's used elsewhere
             codes_copy = codes.clone()
             # Replace eos and bos tokens with padding in the copied tensor
             codes_copy[codes == self.audio_bos_id] = 0  # zero is the padding token
@@ -2149,7 +2176,6 @@ class MagpieTTSModel(ModelPT):
                 # This means we have been within the text EOS window for at least 5 timesteps
                 # We should allow EOS to be predicted now.
                 unfinished_texts[bidx] = False
-
         return _attn_prior, unfinished_texts, finished_texts_counter
 
     def get_inference_attention_plots(
@@ -2198,6 +2224,10 @@ class MagpieTTSModel(ModelPT):
                 headwise_cross_attention_maps.append(item_all_head_cross_attn_maps)
 
         return cross_attention_maps, headwise_cross_attention_maps
+    
+    
+    def load_trt_session(self, trt_session_path="models/magpie_multi/jul_2025_grpo/engine_fp16/local_transformer/local_transformer.plan"):
+        pass
 
     def find_eos_frame_index(self, codes, eos_detection_method) -> Union[int, float]:
         """
@@ -2283,9 +2313,12 @@ class MagpieTTSModel(ModelPT):
         eos_detection_method = EOSDetectionMethod(eos_detection_method)
         with torch.no_grad():
             start_time = time.time()
+            torch.save(batch, "b1.pt")
             self.decoder.reset_cache(use_cache=self.use_kv_cache_for_inference)
 
             context_tensors = self.prepare_context_tensors(batch)
+
+            torch.save(context_tensors, "batch.pt")
             text = context_tensors['text']
             audio_codes_bos = torch.full(
                 (text.size(0), self.num_audio_codebooks, self.frame_stacking_factor),
@@ -2465,6 +2498,18 @@ class MagpieTTSModel(ModelPT):
                             use_kv_cache=use_LT_kv_cache,
                             forbid_audio_eos=forbid_audio_eos,
                         )
+                        lt_ip = {
+                                "hidden_states": dec_out[:, -1,:].half()
+                                }
+                        audio_codes_next_lt = local_transformer_model.infer(lt_ip, None)
+                        audio_codes_next_lt_ox = lt_onnx.run(None, {"hidden_states": dec_out[:,-1, :].half().detach().cpu().numpy()})
+                        print("")
+                        print(list(zip(audio_codes_next[0].cpu().numpy(), audio_codes_next_lt["logits"][0].cpu().numpy(), audio_codes_next_lt_ox[0][0])))
+
+                        #print(list(zip(audio_codes_next[0].cpu().numpy(), audio_codes_next_lt["logits"][0].cpu().numpy())))
+                        print("")
+                        audio_codes_next = audio_codes_next_lt["logits"]
+                        #audio_codes_next = torch.tensor(audio_codes_next_lt_ox[0]).cuda()
                     elif self.local_transformer_type == LocalTransformerType.MASKGIT:
                         audio_codes_next = self.local_transformer_sample_maskgit(
                             dec_output=dec_out[:, -1, :],
