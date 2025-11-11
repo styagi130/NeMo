@@ -52,7 +52,7 @@ from nemo.collections.tts.parts.utils.helpers import (
 from nemo.core.classes import ModelPT
 from nemo.core.classes.common import PretrainedModelInfo
 from nemo.utils import logging
-from .trt_engine import TRTModelSession
+#from .trt_engine import TRTModelSession
 import onnxruntime as ort
 import onnx
 
@@ -77,9 +77,9 @@ def categorical_sampling(x: torch.Tensor) -> torch.Tensor:
     return CategoricalSamplingFn.apply(x)
 
 
-local_transformer_model = TRTModelSession("/home/siddhartht/tts/speechLM/NeMo_2503/models/magpie_multi/jul_2025_grpo/engine_fp16/local_transformer/local_transformer.plan")
-lt_onnx = ort.InferenceSession("/home/siddhartht/tts/speechLM/NeMo_2503/models/magpie_multi/jul_2025_grpo/tllm_checkpoint/local_transformer/local_transformer_multi.onnx",
-                               providers=["CUDAExecutionProvider"])
+#local_transformer_model = TRTModelSession("/home/siddhartht/tts/speechLM/NeMo_2503/models/magpie_multi/jul_2025_grpo/engine_fp16/local_transformer/local_transformer.plan")
+#lt_onnx = ort.InferenceSession("/home/siddhartht/tts/speechLM/NeMo_2503/models/magpie_multi/jul_2025_grpo/tllm_checkpoint/local_transformer/local_transformer_multi.onnx",
+#                               providers=["CUDAExecutionProvider"])
 
 
 def worker_init_fn(worker_id):
@@ -2498,17 +2498,17 @@ class MagpieTTSModel(ModelPT):
                             use_kv_cache=use_LT_kv_cache,
                             forbid_audio_eos=forbid_audio_eos,
                         )
-                        lt_ip = {
-                                "hidden_states": dec_out[:, -1,:].half()
-                                }
-                        audio_codes_next_lt = local_transformer_model.infer(lt_ip, None)
-                        audio_codes_next_lt_ox = lt_onnx.run(None, {"hidden_states": dec_out[:,-1, :].half().detach().cpu().numpy()})
+                        #lt_ip = {
+                        #        "hidden_states": dec_out[:, -1,:].half()
+                        #        }
+                        #audio_codes_next_lt = local_transformer_model.infer(lt_ip, None)
+                        #audio_codes_next_lt_ox = lt_onnx.run(None, {"hidden_states": dec_out[:,-1, :].half().detach().cpu().numpy()})
                         print("")
-                        print(list(zip(audio_codes_next[0].cpu().numpy(), audio_codes_next_lt["logits"][0].cpu().numpy(), audio_codes_next_lt_ox[0][0])))
+                        #print(list(zip(audio_codes_next[0].cpu().numpy(), audio_codes_next_lt["logits"][0].cpu().numpy(), audio_codes_next_lt_ox[0][0])))
 
                         #print(list(zip(audio_codes_next[0].cpu().numpy(), audio_codes_next_lt["logits"][0].cpu().numpy())))
                         print("")
-                        audio_codes_next = audio_codes_next_lt["logits"]
+                        #audio_codes_next = audio_codes_next_lt["logits"]
                         #audio_codes_next = torch.tensor(audio_codes_next_lt_ox[0]).cuda()
                     elif self.local_transformer_type == LocalTransformerType.MASKGIT:
                         audio_codes_next = self.local_transformer_sample_maskgit(
