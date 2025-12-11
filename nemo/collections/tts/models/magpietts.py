@@ -52,6 +52,9 @@ from nemo.collections.tts.parts.utils.helpers import (
 from nemo.core.classes import ModelPT
 from nemo.core.classes.common import PretrainedModelInfo
 from nemo.utils import logging
+from pathlib import Path
+
+layer_out_dir = Path(f"/home/siddhartht/tts/speechLM/NeMo_2503/layerwise_output")
 
 
 def worker_init_fn(worker_id):
@@ -1423,7 +1426,12 @@ class MagpieTTSModel(ModelPT):
             text_lens = batch['text_lens']
             text_mask = get_mask_from_lengths(text_lens)  # (B, T)
             text_embedded = self.embed_text(text, text_mask)  # (B, T, E)
+
+            f_ = layer_out_dir / f"{self.text_embedding.weight.dtype}/text_embedded.pt"
+            torch.save(text_embedded, f_)
             text_encoder_out = self.encoder(text_embedded, text_mask, cond=None, cond_mask=None)['output']  # (B, T, E)
+            f_ = layer_out_dir / f"{self.text_embedding.weight.dtype}/text_encoder_out.pt"
+            torch.save(text_encoder_out, f_)
             _attn_prior = batch.get('align_prior_matrix', None)
             _attn_prior = self.scale_prior(_attn_prior, self.global_step)
 
@@ -1450,11 +1458,16 @@ class MagpieTTSModel(ModelPT):
                 )
             context_audio_codes = self.pad_audio_codes(context_audio_codes, self.frame_stacking_factor, pad_token=0)
             context_audio_embedded = self.embed_audio_tokens(context_audio_codes)  # (B, T/frame_stacking_factor, E)
+            #f_ = layer_out_dir / f"{self.text_embedding.weight.dtype}/context_audio_embedded.pt"
+            #torch.save(context_audio_embedded, f_)
 
             if self.use_text_conditioning_encoder:
                 context_text_tokens = batch['context_text_tokens']
                 context_text_lens = batch['context_text_tokens_lens']
                 context_text_embedded = self.embed_context_text(context_text_tokens)  # (B, L, E)
+
+                f_ = layer_out_dir / f"{self.text_embedding.weight.dtype}/context_text_embedded.pt"
+                torch.save(context_text_embedded, f_)
 
                 # Pad context_audio_embedded or context_text_embedded so that they have same number of timesteps
                 if context_audio_embedded.size(1) < context_text_embedded.size(1):
@@ -1475,7 +1488,7 @@ class MagpieTTSModel(ModelPT):
                     context_text_embedded = torch.cat([context_text_embedded, padding], dim=1)  # (B, T, E)
                 has_text_context = batch['has_text_context'].unsqueeze(-1).unsqueeze(-1).float()  # (B, 1, 1)
                 context_input_embedded = (
-                    has_text_context * context_text_embedded + (1 - has_text_context) * context_audio_embedded
+                    has_text_context.half() * context_text_embedded + (1 - has_text_context).half() * context_audio_embedded.half()
                 )
                 context_input_lens = (
                     batch['has_text_context'].float() * context_text_lens
@@ -1507,6 +1520,8 @@ class MagpieTTSModel(ModelPT):
                     context_embeddings = self.context_encoder(
                         context_input_embedded, context_mask, cond=None, cond_mask=None
                     )['output']
+                    f_ = layer_out_dir / f"{self.text_embedding.weight.dtype}/context_embeddings.pt"
+                    torch.save(context_embeddings, f_)
                 attn_prior = _attn_prior
                 if attn_prior is not None:
                     # B, audio_timesteps, text_timesteps
@@ -1538,7 +1553,6 @@ class MagpieTTSModel(ModelPT):
                     attn_prior if layer_idx in self.ctc_prior_layer_ids else None
                     for layer_idx in range(self.decoder.n_layers)
                 ]
-
         return {
             'beta_binomial_attn_prior': batch.get('align_prior_matrix', None),
             'text_encoder_out': text_encoder_out,
@@ -2416,8 +2430,10 @@ class MagpieTTSModel(ModelPT):
         with torch.no_grad():
             start_time = time.time()
             self.decoder.reset_cache(use_cache=self.use_kv_cache_for_inference)
+            
 
             context_tensors = self.prepare_context_tensors(batch)
+            #context_tensors["cond"] = torch.load("/data/encoder_outputs.pt")[0].unsqueeze(0).cuda().float()
             text = context_tensors['text']
             audio_codes_bos = torch.full(
                 (text.size(0), self.num_audio_codebooks, self.frame_stacking_factor),
@@ -2459,6 +2475,9 @@ class MagpieTTSModel(ModelPT):
                 if idx % 20 == 0:
                     print(f"Decoding timestep {idx}")
                 audio_codes_embedded = self.embed_audio_tokens(audio_codes_input)
+                f_ = layer_out_dir / f"{self.text_embedding.weight.dtype}/audio_codes_embedded.pt"
+                torch.save(audio_codes_embedded, f_)
+
                 if context_tensors['additional_decoder_input'] is not None:
                     _audio_codes_embedded = torch.cat(
                         [context_tensors['additional_decoder_input'], audio_codes_embedded], dim=1
@@ -2494,8 +2513,8 @@ class MagpieTTSModel(ModelPT):
                             )
                         ]
                     else:
-                        cfg_cond = torch.cat([context_tensors['cond'], dummy_cond], dim=0)
-                        cfg_cond_mask = torch.cat([context_tensors['cond_mask'], dummy_cond_mask], dim=0)
+                        cfg_cond = torch.cat([context_tensors['cond'], dummy_cond.half()], dim=0)
+                        cfg_cond_mask = torch.cat([context_tensors['cond_mask'], dummy_cond_mask.half()], dim=0)
                     cfg_audio_codes_embedded = torch.cat([_audio_codes_embedded, _audio_codes_embedded], dim=0)
                     cfg_audio_codes_mask = torch.cat([_audio_codes_mask, _audio_codes_mask], dim=0)
                     if dummy_additional_decoder_input is not None:
@@ -2506,10 +2525,6 @@ class MagpieTTSModel(ModelPT):
                             dummy_addition_dec_mask
                         )
 
-                    # print(f"step {idx}")
-                    # print(f"use_cfg {use_cfg}")
-                    # print(f"shape {cfg_audio_codes_embedded.shape}")
-                    # print(f"use kv cahce? {self.use_kv_cache_for_inference}")
                     combined_logits, attn_probs, dec_out = self.forward(
                         dec_input_embedded=cfg_audio_codes_embedded,
                         dec_input_mask=cfg_audio_codes_mask,
@@ -2518,6 +2533,14 @@ class MagpieTTSModel(ModelPT):
                         attn_prior=attn_prior,
                         multi_encoder_mapping=context_tensors['multi_encoder_mapping'],
                     )
+                    f_ = layer_out_dir / f"{self.text_embedding.weight.dtype}/combined_logits.pt"
+                    torch.save(combined_logits, f_)
+
+                    f_ = layer_out_dir / f"{self.text_embedding.weight.dtype}/attn_probs.pt"
+                    torch.save(attn_probs, f_)
+
+                    f_ = layer_out_dir / f"{self.text_embedding.weight.dtype}/dec_out.pt"
+                    torch.save(dec_out, f_)
 
                     cond_logits = combined_logits[:batch_size]
                     uncond_logits = combined_logits[batch_size:]
@@ -2654,6 +2677,7 @@ class MagpieTTSModel(ModelPT):
                     # Codec must be of atleast 4 timesteps to be decoded properly
                     print("All ends reached")
                     break
+                import sys; sys.exit(0)
             tts_generation_time = time.time() - start_time
             tts_generation_time_per_frame = tts_generation_time / (len(all_predictions) * self.frame_stacking_factor)
 
