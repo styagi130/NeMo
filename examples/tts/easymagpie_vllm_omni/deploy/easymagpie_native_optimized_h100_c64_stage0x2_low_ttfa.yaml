@@ -1,0 +1,73 @@
+# Experimental low-TTFA H100 C64 profile. Two same-GPU B32 Stage-0
+# replicas feed a C64 codec using 10-, 14-, and 16-frame startup packets.
+# This restores the locked profile's 40,52,64... steady launch boundaries
+# while keeping every codec cohort within the proven 16-frame token budget.
+pipeline: easymagpie
+async_chunk: true
+trust_remote_code: true
+dtype: float16
+
+connectors:
+  connector_of_shared_memory:
+    name: EasyMagpieCudaIpcConnector
+    extra:
+      shm_threshold_bytes: 65536
+      connector_get_sleep_s: 0.01
+      connector_get_max_wait_first_chunk: 3000
+      connector_get_max_wait: 300
+      cuda_ipc_lease_seconds: 30
+      cuda_ipc_clone_payload: false
+      cuda_ipc_notify_fallback_ms: 20
+      codec_startup_chunk_frames: [10, 14, 16]
+      codec_chunk_frames: 12
+      codec_dynamic_chunking: true
+      codec_dynamic_chunk_wait_us: 5000
+      codec_dynamic_wait_only_underfilled: true
+      codec_fixed_chunk_frames: 12
+      codec_microbatch_wait_us: 1500
+      codec_microbatch_parallelism: 64
+      codec_microbatch_max_batch_size: 64
+
+stages:
+  - stage_id: 0
+    num_replicas: 2
+    max_num_seqs: 32
+    gpu_memory_utilization: 0.25
+    enforce_eager: false
+    async_scheduling: true
+    enable_prefix_caching: false
+    enable_chunked_prefill: true
+    max_num_batched_tokens: 4096
+    max_model_len: 4096
+    devices: "0,0"
+    output_connectors:
+      to_stage_1: connector_of_shared_memory
+    mamba_ssm_cache_dtype: float32
+    skip_tokenizer_init: true
+    engine_extras:
+      worker_cls: easymagpie_vllm_omni.runner.EasyMagpieGPUARWorker
+    default_sampling_params:
+      temperature: 0.0
+      detokenize: false
+      max_tokens: 2048
+
+  - stage_id: 1
+    max_num_seqs: 64
+    gpu_memory_utilization: 0.25
+    dtype: float32
+    enforce_eager: true
+    async_scheduling: false
+    enable_prefix_caching: false
+    enable_chunked_prefill: false
+    # Budget one complete 64-request, 16-frame startup cohort so the startup
+    # ramp cannot reintroduce a narrower global scheduling gate.
+    max_num_batched_tokens: 1024
+    max_model_len: 512
+    devices: "0"
+    input_connectors:
+      from_stage_0: connector_of_shared_memory
+    engine_extras:
+      worker_cls: easymagpie_vllm_omni.runner.EasyMagpieCodecGPUWorker
+    default_sampling_params:
+      temperature: 0.0
+      max_tokens: 65536

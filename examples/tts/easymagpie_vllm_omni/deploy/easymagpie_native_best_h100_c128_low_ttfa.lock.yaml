@@ -1,0 +1,199 @@
+# Reproducibility lock for the zero-underrun H100 C128 low-TTFA profile.
+profile: easymagpie_native_best_h100_c128_stage0x4_low_ttfa
+saved_at: "2026-07-29"
+repository_commit: 09a9e5ae33a84502403301b16dce2e9da88ee1cc
+service_port: 8091
+
+hardware:
+  gpu: NVIDIA H100 NVL
+  gpu_uuid: GPU-f0f6dca4-b913-1454-856d-74a4331fdbb3
+  compute_capability: "9.0"
+  memory_mib: 95830
+  mig_mode: Disabled
+  driver: 580.173.02
+  power_limit_w: 400.00
+
+runtime:
+  image: easymp-vllm-omni:0.24-native
+  image_id: sha256:3e37980f33d692f172f8f1997d8f14ce87c4be7bd93b325f2f7e054295c09d0e
+  vllm_build_commit: ee0da84ab9e04ac7610e28580af62c365e898389
+  python: 3.12.13
+  pytorch: 2.11.0+cu130
+  cuda_runtime: "13.0"
+  triton: 3.6.0
+  vllm: 0.24.0
+  vllm_omni: 0.24.0
+  model_path: /workspace/examples/tts/easymagpie_vllm_omni/easymp_vllm_model
+
+cache:
+  root: /workspace/.cache/easymp_h100
+  source_before_server_benchmark_test_and_evaluation: ../scripts/setenv.sh
+  tmpdir_before_source: unset
+  tmpdir_after_source: unset
+  tmpdir_must_not_be_redirected: true
+
+capacity:
+  requests: 128
+  stage0_replicas: 4
+  stage0_max_num_seqs_per_replica: 32
+  stage0_aggregate_capacity: 128
+  stage0_gpu_memory_utilization_per_replica: 0.15
+  stage1_max_num_seqs: 128
+  stage1_gpu_memory_utilization: 0.20
+  stage1_max_num_batched_tokens: 2048
+  full_startup_token_requirement: 2048
+  admission_serialization: false
+  transfer_serialization: false
+
+required_runtime:
+  PYTHONPATH_first_entry: /workspace/examples/tts/easymagpie_vllm_omni
+  EASYMAGPIE_NATIVE_OPTIMIZATIONS: 1
+  EASYMAGPIE_STAGE0_CUDA_PAYLOAD: 1
+  EASYMAGPIE_LOCAL_TRANSFORMER_KV_CACHE: 1
+  EASYMAGPIE_CODEC_TRANSFER_PARALLEL: 1
+  EASYMAGPIE_CODEC_COHORT_MAX_BATCH_SIZE: 128
+  EASYMAGPIE_CODEC_MPS_ACTIVE_THREAD_PERCENTAGE: 75
+  EASYMAGPIE_CODEC_PACKED_CONV_TF32: 1
+  EASYMAGPIE_CODEC_FUSED_CONV_TRANSPOSE: 1
+  EASYMAGPIE_CUDA_IPC_DIRECT_CONTROL: 1
+  VLLM_DISABLE_SHARED_EXPERTS_STREAM: 0
+  VLLM_TUNED_CONFIG_FOLDER: /workspace/examples/tts/easymagpie_vllm_omni/moe_configs_h100
+
+serialization_guard:
+  reason: "The runtime image contains an older site-packages plugin that does not install transfer-only parallelism."
+  fix: "Prepend the transferred workspace package to PYTHONPATH; the launcher does this automatically."
+  expected_startup_lines: 4
+  expected_line: "EasyMagpie codec transfer microbatching enabled: wait=1.50ms parallelism=32"
+  observed_parallelism_per_stage0_replica: [32, 32, 32, 32]
+
+packet_schedule:
+  codec_startup_chunk_frames: [10, 14, 16]
+  startup_audio_ms: 800
+  subsequent_startup_audio_ms: [1120, 1280]
+  codec_chunk_frames: 12
+  steady_audio_ms: 960
+  codec_fixed_chunk_frames: 12
+  launch_boundaries_frames: [10, 24, 40, 52]
+  rejoins_locked_steady_boundary_at_frame: 40
+
+artifacts:
+  deploy_config:
+    path: easymagpie_native_optimized_h100_c128_stage0x4_low_ttfa.yaml
+    sha256: fd55cd67ea61803452b7bc1eeb486c251c59a5e7bd68ee9e743db3946a51bcab
+  launcher:
+    path: ../scripts/run_server_native_optimized_h100_c128_low_ttfa.sh
+    sha256: 9ca94802294ea92bc97d1092d852033690cef4180ca075fc47cd3963b5ce5ad9
+  scaling_launcher:
+    path: ../scripts/run_server_native_scaling_h100.sh
+    sha256: f1a149e70f0295d826afbf4b6f9c6c8748da77d1d06b72d0622803c27d8fc8d1
+  cache_environment:
+    path: ../scripts/setenv.sh
+    sha256: 7e74b20b715f02fd3680306dc3b47162c22629e67b86975cfdc0388ae466683b
+  moe_config:
+    path: ../moe_configs_h100/E=24,N=768,device_name=NVIDIA_H100_NVL.json
+    sha256: 4aebaa4790ba3f8bb75e8874e0521000c27fb2e6feb8a9b19c332976b8c2463b
+  mamba_ssu_config:
+    path: ../moe_configs_h100/headdim=24,dstate=128,device_name=NVIDIA_H100_NVL,cache_dtype=float32.json
+    sha256: af8f9828990898362af7552241f6989b611348e81bbac95672899ef657771011
+  quality_results:
+    path: ../../../../nsys_traces/h100/codec_b128_low_ttfa/c128_low_ttfa_whisper_large_v3_wer_cer.json
+    sha256: 7672fb8398d606ad5d0730d1973bc249f3ab4302772e97f1b1251b35559934c5
+
+locked_baseline:
+  packet_schedule_frames: [16]
+  mps_active_thread_percentage: 100
+  successful_requests: 640
+  failed_requests: 0
+  generated_chunks: 4181
+  rtfx_mean: 214.917255
+  requests_per_second_mean: 34.905527
+  ttfa_ms_mean: 885.092830
+  itl_ms_mean: 311.721765
+  underruns: 0
+  deadline_misses: 0
+  result_glob: ../../../../nsys_traces/h100/codec_b128/results/b128_stage0x4_token2048_matched_seed*.json
+
+matched_measurements:
+  seeds: [20260729, 20260730, 20260731, 20260732, 20260733]
+  runs: 5
+  successful_requests: 640
+  failed_requests: 0
+  generated_chunks: 4207
+  rtfx: {mean: 214.760257, median: 216.072792, min: 204.852204, max: 222.588556}
+  requests_per_second: {mean: 35.040268, median: 35.016886, min: 33.409164, max: 36.132574}
+  ttfa_ms: {mean: 747.517100, median: 732.152089, min: 718.728918, max: 798.739314}
+  itl_ms: {mean: 338.467353, median: 336.046186, min: 329.464364, max: 350.123752}
+  playback_headroom_p05_ms_min: 322.022812
+  underruns: 0
+  deadline_misses: 0
+  result_glob: ../../../../nsys_traces/h100/codec_b128_low_ttfa/results/c128_startup10_14_16_mps75_parallel_matched_seed*.json
+
+matched_change_from_locked_baseline:
+  rtfx_percent: -0.073050
+  requests_per_second_percent: 0.386017
+  ttfa_ms: -137.575730
+  ttfa_percent: -15.5436
+  itl_ms: 26.745589
+  itl_percent: 8.57996
+
+separated_process_cold_run:
+  seed: 20260728
+  successful_requests: 128
+  failed_requests: 0
+  rtfx: 132.443081
+  requests_per_second: 20.680095
+  ttfa_ms: 3268.649847
+  itl_ms: 318.310916
+  underruns: 0
+  deadline_misses: 0
+  note: "Process-cold with persistent redirected compile caches; codec shapes had been exercised by earlier experiments."
+  result: ../../../../nsys_traces/h100/codec_b128_low_ttfa/results/c128_startup10_14_16_mps75_parallel_cold_seed20260728.json
+
+separated_transition_warmup:
+  seed: 20260728
+  successful_requests: 128
+  failed_requests: 0
+  rtfx: 224.968289
+  requests_per_second: 35.656192
+  ttfa_ms: 686.512131
+  itl_ms: 322.116425
+  underruns: 0
+  deadline_misses: 0
+  result: ../../../../nsys_traces/h100/codec_b128_low_ttfa/results/c128_startup10_14_16_mps75_parallel_transition_warmup_seed20260728.json
+
+separated_rejected_diagnostics:
+  aggressive_startup_ramp:
+    packet_schedule_frames: [1, 1, 2, 4, 8, 12]
+    process_cold: {rtfx: 97.41, ttfa_ms: 3655, underruns: 419}
+    warmed: {rtfx: 135.62, ttfa_ms: 552, underruns: 425}
+    status: rejected
+    reason: "TTFA improved only by emitting packets too short to cover the following codec gap."
+  stale_plugin_runs:
+    status: invalid_environment
+    observed_rtfx_range: [154, 163]
+    reason: "The image-installed package omitted transfer-only parallelism; these are not matched measurements."
+  locked_gpu_clock_ab:
+    clock_mhz: 1785
+    status: rejected
+    reason: "No material improvement; clocks were reset with nvidia-smi -rgc."
+  matched_outliers: none
+
+validation:
+  scaling_profile_tests: {passed: 19, failed: 0}
+  focused_tests: {passed: 46, failed: 0}
+  matched_requests: 640
+  matched_underruns: 0
+  matched_deadline_misses: 0
+  quality_generation: {samples: 10, successful: 10, failed: 0, underruns: 0, deadline_misses: 0}
+  asr_model: openai/whisper-large-v3
+  quality_samples: 10
+  wer_percent: 4.21
+  cer_percent: 2.30
+
+preservation:
+  a4500_moe_config_sha256: ebea4cb146da1c19f3eddb1e361255d5949e4ad8b69b1509ffa2c09626e6b2fa
+  a4500_lock_sha256: cf2e84eb8a00b8ca0e712339bd8fc75439bf1a58736ecdf89072f134a1ad2a41
+  prior_h100_c64_lock_sha256: f43fce99633cd6a34f4c314286b93f92824646001a07e9d74fb25ecd87e56112
+  prior_h100_c128_lock_sha256: 6af1b0400a8bbd1062e1787d097b1fa080d34b6fba8fad89bfdd957bc50a4971
+  prior_h100_c192_lock_sha256: febf9645d7ff986837f2e954954fb470a859bcc2065c7e881f6908e2cd85e805
+  prior_h100_c256_lock_sha256: 0b393f3abdaacb4685399aed6cf190df5966fc3b1f89e91b2f14ff221e72f1ce

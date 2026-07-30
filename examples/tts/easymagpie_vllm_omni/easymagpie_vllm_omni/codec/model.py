@@ -23,9 +23,12 @@ import torch.nn as nn
 from easymagpie_vllm_omni.codec.config import EasyMagpieCodecConfig
 from easymagpie_vllm_omni.codec.packed import PackedEasyMagpieCodec
 from vllm.config import VllmConfig
+from vllm.logger import init_logger
 from vllm.model_executor.layers.mamba.mamba_utils import MambaStateCopyFuncCalculator
 from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+
+logger = init_logger(__name__)
 
 
 class EasyMagpieCodecForConditionalGeneration(nn.Module):
@@ -73,6 +76,7 @@ class EasyMagpieCodecForConditionalGeneration(nn.Module):
         self.has_preprocess = False
         self.has_postprocess = False
         self.requires_raw_input_tokens = True
+        self._observed_codec_batch_max = 0
 
     def embed_input_ids(self, input_ids: torch.Tensor, **_: Any) -> torch.Tensor:
         return torch.zeros((input_ids.shape[0], 1), dtype=torch.float32, device=input_ids.device)
@@ -159,6 +163,11 @@ class EasyMagpieCodecForConditionalGeneration(nn.Module):
                 device=input_ids.device,
             )
             frame_counts = [frames]
+
+        codec_batch = len(frame_counts)
+        if codec_batch > self._observed_codec_batch_max:
+            self._observed_codec_batch_max = codec_batch
+            logger.warning("EasyMagpie observed native codec batch maximum: B%d.", codec_batch)
 
         if codes.shape[0] != input_ids.numel():
             raise ValueError(

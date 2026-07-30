@@ -25,13 +25,18 @@ from typing import Any
 import torch
 from vllm.logger import init_logger
 from vllm_omni.data_entry_keys import CodesStruct, MetaStruct, OmniPayload, OmniPayloadStruct
-from vllm_omni.engine.serialization import deserialize_additional_information
 
 logger = init_logger(__name__)
 
 
 # Base codebook size, excluding control tokens.
 _CODEBOOK_SIZE = 1024
+
+
+def _uses_cuda_ipc(transfer_manager: Any) -> bool:
+    """Whether this transfer callback can safely retain codec rows on CUDA."""
+    connector = getattr(transfer_manager, "connector", None)
+    return connector.__class__.__name__ == "EasyMagpieCudaIpcConnector"
 
 
 def _empty_finished_payload() -> dict[str, Any]:
@@ -288,39 +293,28 @@ def talker2code2wav_async_chunk(
 
     if isinstance(multimodal_output, Mapping):
         frame = _extract_last_frame(multimodal_output)
-        # EOS and other control rows intentionally become ``None`` here: they
-        # stop Stage 0 and flush pending audio, but never enter the codec stream.
-        delay_state = _persistent_state(transfer_manager, "_emp_request_speech_delay")
-        if request_id not in delay_state:
-            base_speech_delay = _resolve_speech_delay(transfer_manager)
-            info = deserialize_additional_information(getattr(request, "additional_information", None))
-            text_prefill_num = int(info.get("text_prefill_num", 0) or 0)
-            if not 0 <= text_prefill_num <= base_speech_delay:
-                raise ValueError(
-                    f"Invalid EasyMagpie text_prefill_num={text_prefill_num} for speech delay {base_speech_delay}"
-                )
-            delay_state[request_id] = base_speech_delay - text_prefill_num
-        speech_delay = delay_state[request_id]
-
-        # Count actual predicted code frames across segment stops. The prefill
-        # callback has no frame and must not consume one of the remaining warm-up
-        # positions.
+        speech_delay = _resolve_speech_delay(transfer_manager)
+        # Persistent per-request frame index: one decode step == one frame,
+        # counted across segment stops (unlike ``output_token_ids``, which the
+        # scheduler zeroes at each stop). Warm-up drops the first ``speech_delay``
+        # frames of the *whole* utterance exactly once.
         seen_state = _persistent_state(transfer_manager, "_emp_seen_frames")
-        _ = seen_state[request_id]
-        is_warmup = False
-        if frame is not None:
-            seen_state[request_id] += 1
-            frame_index = seen_state[request_id]
-            is_warmup = speech_delay > 0 and frame_index <= speech_delay
+        seen_state[request_id] += 1
+        frame_index = seen_state[request_id]
+        is_warmup = speech_delay > 0 and frame_index <= speech_delay
         # Accumulate real frames into a request-persistent buffer. The framework's
-        # per-segment buffer can reset; this one keeps the acoustic stream
-        # continuous regardless of how the text was chunked.
+        # ``code_prompt_token_ids`` is popped per segment (it hands back a fresh
+        # list at every segment stop), which desynchronizes the
+        # emission counter; our own buffer never resets, so the codec sees one
+        # continuous acoustic stream regardless of how the text was chunked.
         frame_buffer = _persistent_list_state(transfer_manager, "_emp_frame_buffer")
         if frame is not None and not is_warmup:
-            # ``multimodal_output`` is already a CPU snapshot. Keep it as a
-            # tensor so codec chunks can be assembled with a single stack
-            # instead of a Python list round-trip.
-            frame_row = frame.detach().to(device="cpu", dtype=torch.long).reshape(-1).contiguous()
+            # CUDA IPC owns the contiguous stacked packet until Stage 1 has
+            # imported it, so keep individual rows on device in that mode.
+            # The stock shared-memory connector retains the established CPU
+            # serialization behaviour as a compatibility fallback.
+            device = frame.device if _uses_cuda_ipc(transfer_manager) else torch.device("cpu")
+            frame_row = frame.detach().to(device=device, dtype=torch.long).reshape(-1).contiguous()
             frame_buffer[request_id].append(frame_row)
             # Keep the framework buffer populated too (some connector bookkeeping
             # counts active requests by its non-empty per-request lists).
@@ -363,7 +357,6 @@ def talker2code2wav_async_chunk(
         emitted_state.pop(request_id, None)
         emitted_chunks_state.pop(request_id, None)
         _persistent_state(transfer_manager, "_emp_seen_frames").pop(request_id, None)
-        _persistent_state(transfer_manager, "_emp_request_speech_delay").pop(request_id, None)
         base_state.pop(request_id, None)
         frame_buffer.pop(request_id, None)
 
@@ -428,6 +421,12 @@ def _extract_audio_codes(mm: Mapping | dict[str, Any] | None) -> torch.Tensor | 
         if isinstance(audio, torch.Tensor):
             return audio
     audio = mm.get("audio_codes")
+    if isinstance(audio, torch.Tensor):
+        return audio
+    # GPUARModelRunner flattens nested Omni payloads before the asynchronous
+    # transfer callback.  CUDA IPC preserves this dotted leaf verbatim, so
+    # accept it alongside the structured and legacy aliases above.
+    audio = mm.get("codes.audio")
     if isinstance(audio, torch.Tensor):
         return audio
     return None

@@ -1,0 +1,57 @@
+# Best validated zero-underrun native EasyMagpie configuration on RTX A4500.
+# This file is a reproducibility manifest; the referenced deploy YAML remains
+# the configuration consumed by vLLM-Omni.
+profile: easymagpie_native_best_zero_underrun_bs16
+saved_at: "2026-07-28"
+hardware: NVIDIA RTX A4500
+image: easymp-vllm-omni:0.24-native
+service_port: 8091
+
+launcher: ../scripts/run_server_native_optimized_bs16.sh
+cache_environment: ../scripts/setenv.sh
+deploy_config: easymagpie_native_optimized_bs16.yaml
+moe_config: ../moe_configs_a4500/E=24,N=768,device_name=NVIDIA_RTX_A4500.json
+
+required_runtime_defaults:
+  CACHE_ROOT: /tmp/easymp_cache  # Local container; override with Lustre on cluster.
+  EASYMAGPIE_NATIVE_OPTIMIZATIONS: 1
+  EASYMAGPIE_STAGE0_CUDA_PAYLOAD: 1
+  EASYMAGPIE_LOCAL_TRANSFORMER_KV_CACHE: 1
+  EASYMAGPIE_CODEC_MPS_ACTIVE_THREAD_PERCENTAGE: 50
+  VLLM_DISABLE_SHARED_EXPERTS_STREAM: 1
+  VLLM_TUNED_CONFIG_FOLDER: ../moe_configs_a4500
+
+validated_c16:
+  seeds: [20260729, 20260730, 20260731, 20260732, 20260733]
+  runs: 5
+  startup_chunk_frames: [2]
+  startup_audio_ms: 160
+  steady_chunk_frames: 6
+  steady_audio_ms: 480
+  successful_requests: 80
+  total_chunks: 1130
+  rtfx_mean: 43.424
+  rtfx_median: 43.69
+  rtfx_min: 38.76
+  rtfx_max: 47.01
+  requests_per_second_mean: 6.926
+  ttfa_ms_mean: 209.62
+  itl_ms_mean: 120.72
+  underrun_percent_mean: 0.00
+  startup_packet_underruns: 0
+  steady_packet_underruns: 0
+
+quality_validation:
+  asr_model: openai/whisper-large-v3
+  samples: 10
+  reference_words: 190
+  wer_percent: 5.26
+  cer_percent: 1.74
+  word_substitutions: 6
+  word_deletions: 2
+  word_insertions: 2
+  results: ../../../../nsys_traces/rerun_20260728/quality_wer_cer.json
+
+profiling:
+  report: ../../../../nsys_traces/easymagpie_native_optimized_rerun_c16.nsys-rep
+  instrumented_rtfx: 41.24

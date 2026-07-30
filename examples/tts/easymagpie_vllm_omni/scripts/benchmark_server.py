@@ -24,11 +24,12 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import random
 import time
 import wave
 from concurrent.futures import ProcessPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 import numpy as np
@@ -339,9 +340,17 @@ def main() -> None:
     parser.add_argument("--max-new-tokens", type=int, default=1024)
     parser.add_argument("--sample-rate", type=int, default=22050, help="Raw PCM sample rate (default: %(default)s)")
     parser.add_argument("--timeout", type=float, default=300, help="Per-request timeout, s (default: 300)")
+    parser.add_argument("--seed", type=int, default=None, help="Deterministic corpus sampling seed")
     parser.add_argument("--no-warmup", action="store_true", help="Skip warmup phase (concurrency requests)")
     parser.add_argument("--output-dir", default=None, help="If set, write each waveform to <output-dir>/<uttid>.wav")
+    parser.add_argument(
+        "--json-output",
+        default=None,
+        help="If set, write summaries and per-request timing/chunk data to this JSON file",
+    )
     args = parser.parse_args()
+    if args.seed is not None:
+        random.seed(args.seed)
 
     items = _load_items(args.text_file)
     if not items:
@@ -358,6 +367,7 @@ def main() -> None:
     )
 
     summaries = []
+    json_levels = []
     for concurrency in args.concurrency:
         if not args.no_warmup:
             warmup = _make_tasks(
@@ -385,11 +395,21 @@ def main() -> None:
         results, wall = _run_level(tasks, concurrency, output_dir)
         summary = _summarize(results, wall, concurrency)
         summaries.append(summary)
+        json_levels.append(
+            {
+                "summary": summary,
+                "requests": [asdict(result) for result in results],
+            }
+        )
         _print_detailed(summary)
 
     print("\n=== Summary ===")
     for s in summaries:
         _print_summary(s)
+    if args.json_output is not None:
+        output_path = Path(args.json_output)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(json.dumps({"levels": json_levels}, indent=2) + "\n")
 
 
 if __name__ == "__main__":

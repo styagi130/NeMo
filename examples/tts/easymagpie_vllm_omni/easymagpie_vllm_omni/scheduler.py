@@ -19,14 +19,32 @@ Configure it on a single-stage deployment with::
 """
 from __future__ import annotations
 
+import os
 import threading
+import time
 from types import MethodType
 
 import torch
+from vllm.logger import init_logger
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm_omni.core.sched.omni_ar_scheduler import OmniARAsyncScheduler
 from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler
 from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import OmniChunkTransferAdapter
+
+logger = init_logger(__name__)
+
+
+def _codec_cohort_target(extra: dict, max_num_running_reqs: int) -> int:
+    """Return the steady Stage-1 cohort target, with an experiment override."""
+    raw_target = os.getenv(
+        "EASYMAGPIE_CODEC_COHORT_MAX_BATCH_SIZE",
+        str(extra.get("codec_microbatch_max_batch_size", max_num_running_reqs)),
+    )
+    try:
+        target = int(raw_target)
+    except (TypeError, ValueError):
+        target = max_num_running_reqs
+    return max(1, min(target, max_num_running_reqs))
 
 
 class EasyMagpieARAsyncScheduler(OmniARAsyncScheduler):
@@ -179,6 +197,93 @@ def _poll_native_codec_chunk(adapter: OmniChunkTransferAdapter, request: Request
         return _poll_native_codec_chunk_unlocked(adapter, request)
 
 
+def _native_codec_audio(request: Request, num_quantizers: int) -> torch.Tensor | None:
+    """Return one time-major CUDA codec window from request metadata."""
+    info = getattr(request, "additional_information", None)
+    codes = info.get("codes") if isinstance(info, dict) else None
+    audio = codes.get("audio") if isinstance(codes, dict) else None
+    if not isinstance(audio, torch.Tensor) or not audio.is_cuda or audio.numel() == 0:
+        return None
+    if audio.ndim == 1:
+        if audio.numel() % num_quantizers:
+            return None
+        audio = audio.reshape(num_quantizers, -1).transpose(0, 1)
+    if audio.ndim != 2 or int(audio.shape[1]) != num_quantizers:
+        return None
+    return audio.detach()
+
+
+def _drain_native_codec_request_unlocked(
+    adapter: OmniChunkTransferAdapter,
+    request: Request,
+    *,
+    num_quantizers: int,
+    hop_frames: int,
+    max_frames: int,
+) -> int:
+    """Merge already-published successors without re-entering the adapter lock.
+
+    The scheduler holds ``_easymagpie_chunk_lock`` while this runs, so the
+    background receiver cannot race the same connector key.  Unlike the legacy
+    generic drain, this preserves EasyMagpieCodecScheduler's append-only prompt
+    and recurrent-cache position.
+    """
+    current = _native_codec_audio(request, num_quantizers)
+    if current is None:
+        return 0
+
+    base_computed = int(request.num_computed_tokens)
+    base_prompt = list(request.prompt_token_ids or [])[:base_computed]
+    base_all_token_ids = list(request._all_token_ids)[:base_computed]
+    current_info = request.additional_information
+    merged_count = 0
+
+    while int(current.shape[0]) + hop_frames <= max_frames:
+        if adapter.is_done_receiving_chunks(request.request_id):
+            break
+
+        # Prevent a metadata-only terminal marker from inheriting the current
+        # audio leaf through the adapter's incremental metadata merge.
+        sanitized = dict(current_info) if isinstance(current_info, dict) else {}
+        sanitized.pop("codes", None)
+        request.additional_information = sanitized
+        if not _poll_native_codec_chunk_unlocked(adapter, request):
+            request.additional_information = current_info
+            break
+
+        following = _native_codec_audio(request, num_quantizers)
+        if following is None:
+            # The connector state retains the consumed finish marker. Feed the
+            # accumulated real audio before the normal completion path runs.
+            request.additional_information = current_info
+            break
+        if int(following.shape[0]) > hop_frames:
+            # The producer contract caps every successor at one source hop.
+            # Do not consume beyond the exported fixed codec capacity.
+            request.additional_information = current_info
+            break
+
+        next_info = request.additional_information
+        current = torch.cat((current, following), dim=0).contiguous()
+        merged_info = dict(next_info) if isinstance(next_info, dict) else {}
+        merged_codes = dict(merged_info.get("codes") or {})
+        merged_codes["audio"] = current
+        merged_info["codes"] = merged_codes
+        current_info = merged_info
+        request.additional_information = current_info
+        merged_count += 1
+
+    merged_frames = int(current.shape[0])
+    placeholders = [0] * merged_frames
+    request.prompt_token_ids = base_prompt + placeholders
+    request._all_token_ids[:] = base_all_token_ids + placeholders
+    request.num_prompt_tokens = len(request.prompt_token_ids)
+    request.num_computed_tokens = base_computed
+    request.update_block_hashes()
+    request.additional_information = current_info
+    return merged_count
+
+
 class EasyMagpieCodecScheduler(OmniGenerationScheduler):
     """Keep each Stage-1 stream on one append-only native vLLM request."""
 
@@ -194,6 +299,8 @@ class EasyMagpieCodecScheduler(OmniGenerationScheduler):
         adapter._easymagpie_chunk_lock = threading.Lock()
         adapter._easymagpie_num_quantizers = num_quantizers
         adapter._poll_single_request = MethodType(_poll_native_codec_chunk, adapter)
+        self._easymagpie_started_codec_ids: set[str] = set()
+        self._easymagpie_drain_successors = 0
 
     def _update_request_as_session(self, session: Request, update: StreamingUpdate) -> None:
         """Resume connector polling without resetting the stateful codec.
@@ -261,4 +368,100 @@ class EasyMagpieCodecScheduler(OmniGenerationScheduler):
 
     def schedule(self, *args, **kwargs):
         with self.chunk_transfer_adapter._easymagpie_chunk_lock:
-            return super().schedule(*args, **kwargs)
+            adapter = self.chunk_transfer_adapter
+            tracked = set(self.requests)
+            self._easymagpie_started_codec_ids.intersection_update(tracked)
+            ready = set(adapter._finished_load_reqs).intersection(tracked)
+            initial_ready = ready - self._easymagpie_started_codec_ids
+            dynamic_ready = ready & self._easymagpie_started_codec_ids
+            steady_token_budget: int | None = None
+            target = self.max_num_running_reqs
+
+            # Keep first audio immediate. Once every ready request is past its
+            # startup packet, allow one bounded collection interval and drain
+            # only contiguous audio windows already published under the next
+            # connector keys.
+            if dynamic_ready and not initial_ready:
+                raw_config = getattr(adapter.connector, "config", {}) or {}
+                extra = raw_config.get("extra", raw_config) if isinstance(raw_config, dict) else {}
+                enabled = extra.get("codec_dynamic_chunking", False)
+                if isinstance(enabled, str):
+                    enabled = enabled.strip().lower() in {"1", "true", "yes", "on"}
+                if enabled:
+                    wait_us = max(0, int(extra.get("codec_dynamic_chunk_wait_us", 0) or 0))
+                    target = _codec_cohort_target(extra, self.max_num_running_reqs)
+                    wait_only_underfilled = extra.get("codec_dynamic_wait_only_underfilled", False)
+                    if isinstance(wait_only_underfilled, str):
+                        wait_only_underfilled = wait_only_underfilled.strip().lower() in {"1", "true", "yes", "on"}
+                    if wait_us and (not wait_only_underfilled or len(dynamic_ready) < target):
+                        time.sleep(min(wait_us, 5_000) / 1_000_000.0)
+
+                    hop = max(1, int(extra.get("codec_chunk_frames", 1) or 1))
+                    if target < self.max_num_running_reqs:
+                        # Keep all first packets eligible for immediate
+                        # admission, then bound only steady codec work. Every
+                        # normal successor contributes ``hop`` frame tokens;
+                        # reducing the per-step token budget partitions the
+                        # eager FP32 codec without narrowing either stage's
+                        # request capacity or Stage-0 transfer parallelism. Do
+                        # not merge successor windows in this mode: a merged
+                        # 96-frame request would consume an entire B16 token
+                        # budget by itself and silently turn the experiment
+                        # into B1.
+                        steady_token_budget = target * hop
+                    else:
+                        capacity = max(hop, int(extra.get("codec_fixed_chunk_frames", hop) or hop))
+                        drained = 0
+                        for request_id in dynamic_ready:
+                            request = self.requests.get(request_id)
+                            if request is not None:
+                                drained += _drain_native_codec_request_unlocked(
+                                    adapter,
+                                    request,
+                                    num_quantizers=adapter._easymagpie_num_quantizers,
+                                    hop_frames=hop,
+                                    max_frames=capacity,
+                                )
+                        self._easymagpie_drain_successors += drained
+                        if drained and not getattr(self, "_easymagpie_native_drain_logged", False):
+                            logger.warning(
+                                "EasyMagpie native codec queue drain active: merged %d successor windows in one pass.",
+                                drained,
+                            )
+                            self._easymagpie_native_drain_logged = True
+
+            original_token_budget = self.max_num_scheduled_tokens
+            if steady_token_budget is not None:
+                self.max_num_scheduled_tokens = min(original_token_budget, steady_token_budget)
+            try:
+                result = super().schedule(*args, **kwargs)
+            finally:
+                self.max_num_scheduled_tokens = original_token_budget
+
+            if steady_token_budget is not None:
+                scheduled_cached = getattr(result, "scheduled_cached_reqs", None)
+                scheduled_count = len(getattr(result, "scheduled_new_reqs", ()) or ())
+                scheduled_count += len(getattr(scheduled_cached, "req_ids", ()) or ())
+                previous_max = int(getattr(self, "_easymagpie_codec_observed_cohort_max", 0) or 0)
+                self._easymagpie_codec_observed_cohort_max = max(previous_max, scheduled_count)
+                if not getattr(self, "_easymagpie_codec_cohort_cap_logged", False):
+                    logger.warning(
+                        "EasyMagpie steady codec cohort cap active: target=B%d token_budget=%d observed_first=B%d.",
+                        target,
+                        steady_token_budget,
+                        scheduled_count,
+                    )
+                    self._easymagpie_codec_cohort_cap_logged = True
+                elif scheduled_count > previous_max:
+                    logger.warning(
+                        "EasyMagpie steady codec observed cohort maximum increased: B%d (target=B%d).",
+                        scheduled_count,
+                        target,
+                    )
+            # ``schedule`` advances computed tokens synchronously. Mark only
+            # startup requests that were actually admitted in this pass.
+            for request_id in initial_ready:
+                request = self.requests.get(request_id)
+                if request is not None and request.num_computed_tokens > 0:
+                    self._easymagpie_started_codec_ids.add(request_id)
+            return result

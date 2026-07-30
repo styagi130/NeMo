@@ -1,0 +1,166 @@
+# Reproducibility lock for the H100 C128 four-replica profile.
+profile: easymagpie_native_best_h100_c128_stage0x4
+saved_at: "2026-07-29"
+repository_commit: 09a9e5ae33a84502403301b16dce2e9da88ee1cc
+service_port: 8091
+
+hardware:
+  gpu: NVIDIA H100 NVL
+  gpu_uuid: GPU-f0f6dca4-b913-1454-856d-74a4331fdbb3
+  compute_capability: "9.0"
+  memory_mib: 95830
+  mig_mode: Disabled
+  driver: 580.173.02
+  power_limit_w: 400.00
+
+runtime:
+  image: easymp-vllm-omni:0.24-native
+  image_id: sha256:3e37980f33d692f172f8f1997d8f14ce87c4be7bd93b325f2f7e054295c09d0e
+  profiling_image: easymp-vllm-omni:0.24-native-nsys
+  profiler: NVIDIA Nsight Systems 2025.6.3.541
+  vllm_build_commit: ee0da84ab9e04ac7610e28580af62c365e898389
+  python: 3.12.13
+  pytorch: 2.11.0+cu130
+  cuda_runtime: "13.0"
+  triton: 3.6.0
+  vllm: 0.24.0
+  vllm_omni: 0.24.0
+
+cache:
+  root: /workspace/.cache/easymp_h100
+  source_before_server_and_benchmark: ../scripts/setenv.sh
+  tmpdir_before_source: unset
+  tmpdir_after_source: unset
+
+capacity:
+  requests: 128
+  stage0_replicas: 4
+  stage0_max_num_seqs_per_replica: 32
+  stage0_aggregate_capacity: 128
+  stage0_gpu_memory_utilization_per_replica: 0.15
+  stage1_max_num_seqs: 128
+  stage1_gpu_memory_utilization: 0.20
+  stage1_max_num_batched_tokens: 2048
+  full_startup_token_requirement: 2048
+  observed_stage1_codec_batch_max: 127
+  admission_distribution_cold_plus_matched: [192, 192, 192, 192]
+  admission_serialization: false
+  transfer_serialization: false
+
+required_runtime:
+  EASYMAGPIE_NATIVE_OPTIMIZATIONS: 1
+  EASYMAGPIE_STAGE0_CUDA_PAYLOAD: 1
+  EASYMAGPIE_LOCAL_TRANSFORMER_KV_CACHE: 1
+  EASYMAGPIE_CODEC_TRANSFER_PARALLEL: 1
+  EASYMAGPIE_CODEC_COHORT_MAX_BATCH_SIZE: 128
+  EASYMAGPIE_CODEC_MPS_ACTIVE_THREAD_PERCENTAGE: 100
+  EASYMAGPIE_CODEC_PACKED_CONV_TF32: 1
+  EASYMAGPIE_CODEC_FUSED_CONV_TRANSPOSE: 1
+  EASYMAGPIE_CUDA_IPC_DIRECT_CONTROL: 1
+  VLLM_DISABLE_SHARED_EXPERTS_STREAM: 0
+  VLLM_TUNED_CONFIG_FOLDER: /workspace/examples/tts/easymagpie_vllm_omni/moe_configs_h100
+
+packet_schedule:
+  codec_startup_chunk_frames: [16]
+  startup_audio_ms: 1280
+  codec_chunk_frames: 12
+  steady_audio_ms: 960
+  codec_fixed_chunk_frames: 12
+
+artifacts:
+  deploy_config:
+    path: easymagpie_native_optimized_h100_c128_stage0x4.yaml
+    sha256: b8386c33d2e7eee499c1ca568913e08c23eee92de7fc1763f44a75dabe206f1c
+  launcher:
+    path: ../scripts/run_server_native_optimized_h100_c128.sh
+    sha256: fc9fe5b8f733c6d6ccd58bea40a5426a9231751383c30b4970b24d4751d57c18
+  scaling_launcher:
+    path: ../scripts/run_server_native_scaling_h100.sh
+    sha256: f1a149e70f0295d826afbf4b6f9c6c8748da77d1d06b72d0622803c27d8fc8d1
+  cache_environment:
+    path: ../scripts/setenv.sh
+    sha256: 7e74b20b715f02fd3680306dc3b47162c22629e67b86975cfdc0388ae466683b
+  moe_config:
+    path: ../moe_configs_h100/E=24,N=768,device_name=NVIDIA_H100_NVL.json
+    sha256: 4aebaa4790ba3f8bb75e8874e0521000c27fb2e6feb8a9b19c332976b8c2463b
+  mamba_ssu_config:
+    path: ../moe_configs_h100/headdim=24,dstate=128,device_name=NVIDIA_H100_NVL,cache_dtype=float32.json
+    sha256: af8f9828990898362af7552241f6989b611348e81bbac95672899ef657771011
+  final_server_log:
+    path: ../../../../nsys_traces/h100/codec_b128/logs/b128_stage0x4_final_server.log
+    sha256: 16cb2e753030958a2af6cb4e99fa2080a0d08f66fa006095d581cf1a37397174
+
+matched_measurements:
+  seeds: [20260729, 20260730, 20260731, 20260732, 20260733]
+  runs: 5
+  successful_requests: 640
+  failed_requests: 0
+  generated_chunks: 4181
+  rtfx: {mean: 214.917, median: 213.754, min: 205.109, max: 226.550}
+  requests_per_second: {mean: 34.906, min: 33.785, max: 35.816}
+  ttfa_ms: {mean: 885.09, min: 857.86, max: 917.02}
+  itl_ms: {mean: 311.72, min: 304.31, max: 323.04}
+  underruns: 0
+  deadline_misses: 0
+  result_glob: ../../../../nsys_traces/h100/codec_b128/results/b128_stage0x4_token2048_matched_seed*.json
+
+separated_cold_runs:
+  initial_fixed_profile:
+    seed: 20260728
+    rtfx: 128.969
+    requests_per_second: 20.161
+    ttfa_ms: 3592.56
+    itl_ms: 295.61
+    successful_requests: 128
+    failed_requests: 0
+    underruns: 0
+    deadline_misses: 0
+    result: ../../../../nsys_traces/h100/codec_b128/results/b128_stage0x4_token2048_cold_seed20260728.json
+  post_restart_reproduction:
+    seed: 20260729
+    rtfx: 135.040
+    requests_per_second: 20.25
+    ttfa_ms: 3485.2
+    itl_ms: 310.0
+    successful_requests: 128
+    failed_requests: 0
+    underruns: 0
+    deadline_misses: 0
+    result: ../../../../nsys_traces/h100/codec_b128/results/b128_stage0x4_final_repro_seed20260729.json
+
+stage1_mps_ab:
+  mps100_exact_seed_mean_rtfx: 223.129
+  mps75_exact_seed_mean_rtfx: 220.280
+  mps75_change_percent: -1.277
+  selected: 100
+  note: "The MPS75 cold run was 130.98x and is excluded from the warmed A/B."
+
+profiling:
+  capture_mode: warmed request-triggered cudaProfilerApi
+  report: ../../../../nsys_traces/h100/codec_b128/profile/codec_b128_stage0x4_token2048_warm_20260729.nsys-rep
+  report_sha256: dd092113c29d8d315a1f403f1d889b0378f37aaaecfa7ce81b326339ccd0e4f9
+  stats: ../../../../nsys_traces/h100/codec_b128/profile/codec_b128_stage0x4_token2048_warm_20260729_stats.log
+  stats_sha256: 80072fd7962d0b3ba3b238f08117151bdc0f813aeb6356fa90599b68d11585e7
+  total_gpu_kernel_time_ms: 739.09
+  packed_causal_conv1d: {total_gpu_time_ms: 314.854, gpu_kernel_time_percent: 42.6}
+  fused_conv_transpose1d: {total_gpu_time_ms: 11.972, gpu_kernel_time_percent: 1.6}
+  cuda_api_percent: {memcpy_async: 63.7, stream_synchronize: 21.3, kernel_launch: 8.4}
+  instrumented_rtfx: 170.89
+  instrumented_underruns: 0
+  exclude_from_performance_aggregate: true
+
+separated_rejected_diagnostics:
+  stage1_512_token_budget:
+    status: rejected
+    reason: "The 512-token Stage-1 budget could slice a 16-frame startup payload under profiler jitter (12 scheduled versus 16 payload frames)."
+    fix: "Raise Stage-1 max_num_batched_tokens to 128 * 16 = 2048."
+    trace: ../../../../nsys_traces/h100/codec_b128/profile/codec_b128_stage0x4_rejected_512token_20260729.nsys-rep
+  matched_outliers: none
+
+validation:
+  focused_tests: {passed: 53, failed: 0}
+  common_quality_layout: c256_stage0x8_same_model_and_codec_path
+  quality_samples: 10
+  wer_percent: 4.21
+  cer_percent: 1.19
+  quality_results: ../../../../nsys_traces/h100/codec_b256/quality_stage0x8_wer_cer.json

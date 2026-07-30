@@ -1,0 +1,115 @@
+# Reproducibility lock for the H100 C256 eight-replica maximum-throughput profile.
+profile: easymagpie_native_best_h100_c256_stage0x8
+saved_at: "2026-07-29"
+repository_commit: 09a9e5ae33a84502403301b16dce2e9da88ee1cc
+service_port: 8091
+
+hardware:
+  gpu: NVIDIA H100 NVL
+  gpu_uuid: GPU-f0f6dca4-b913-1454-856d-74a4331fdbb3
+  compute_capability: "9.0"
+  memory_mib: 95830
+  mig_mode: Disabled
+  driver: 580.173.02
+  power_limit_w: 400.00
+
+runtime:
+  image: easymp-vllm-omni:0.24-native
+  image_id: sha256:3e37980f33d692f172f8f1997d8f14ce87c4be7bd93b325f2f7e054295c09d0e
+  vllm: 0.24.0
+  vllm_omni: 0.24.0
+  pytorch: 2.11.0+cu130
+  triton: 3.6.0
+
+cache:
+  root: /workspace/.cache/easymp_h100
+  source_before_server_and_benchmark: ../scripts/setenv.sh
+  tmpdir_before_source: unset
+  tmpdir_after_source: unset
+
+capacity:
+  requests: 256
+  stage0_replicas: 8
+  stage0_max_num_seqs_per_replica: 32
+  stage0_aggregate_capacity: 256
+  stage0_gpu_memory_utilization_per_replica: 0.09
+  stage0_available_kv_cache_gib_per_replica: 2.17
+  stage1_max_num_seqs: 256
+  stage1_gpu_memory_utilization: 0.15
+  stage1_max_num_batched_tokens: 4096
+  full_startup_token_requirement: 4096
+  observed_stage1_codec_batch_max: 159
+  admission_distribution_cold_plus_matched: [192, 192, 192, 192, 192, 192, 192, 192]
+  admission_serialization: false
+  transfer_serialization: false
+
+required_runtime:
+  EASYMAGPIE_CODEC_COHORT_MAX_BATCH_SIZE: 256
+  EASYMAGPIE_CODEC_MPS_ACTIVE_THREAD_PERCENTAGE: 100
+  EASYMAGPIE_CODEC_PACKED_CONV_TF32: 1
+  EASYMAGPIE_CODEC_FUSED_CONV_TRANSPOSE: 1
+  EASYMAGPIE_CUDA_IPC_DIRECT_CONTROL: 1
+  VLLM_DISABLE_SHARED_EXPERTS_STREAM: 0
+
+artifacts:
+  deploy_config:
+    path: easymagpie_native_optimized_h100_c256_stage0x8.yaml
+    sha256: 983536643725e002cccabd5b5a039753abe84e57464ec7d97fc51c6a8471b953
+  launcher:
+    path: ../scripts/run_server_native_optimized_h100_c256_stage0x8.sh
+    sha256: 9312411c3d9a9a71eaf15ff3dd4dfa6341a1c68c42d898d19647f56e16d3ee7a
+  scaling_launcher:
+    path: ../scripts/run_server_native_scaling_h100.sh
+    sha256: f1a149e70f0295d826afbf4b6f9c6c8748da77d1d06b72d0622803c27d8fc8d1
+  cache_environment:
+    path: ../scripts/setenv.sh
+    sha256: 7e74b20b715f02fd3680306dc3b47162c22629e67b86975cfdc0388ae466683b
+  moe_config:
+    path: ../moe_configs_h100/E=24,N=768,device_name=NVIDIA_H100_NVL.json
+    sha256: 4aebaa4790ba3f8bb75e8874e0521000c27fb2e6feb8a9b19c332976b8c2463b
+  final_server_log:
+    path: ../../../../nsys_traces/h100/codec_b256/logs/b256_stage0x8_final_server.log
+    sha256: 3856c6852063a9deaea6f250c5c23ea7748f7dc560e40895942ff0ad3f41b365
+
+matched_measurements:
+  seeds: [20260729, 20260730, 20260731, 20260732, 20260733]
+  runs: 5
+  successful_requests: 1280
+  failed_requests: 0
+  generated_chunks: 8318
+  rtfx: {mean: 270.711, median: 271.228, min: 263.440, max: 279.057}
+  requests_per_second: {mean: 44.310, min: 43.016, max: 44.764}
+  ttfa_ms: {mean: 1321.28, min: 1271.70, max: 1356.60}
+  itl_ms: {mean: 491.31, min: 485.97, max: 500.61}
+  underruns: 0
+  deadline_misses: 0
+  result_glob: ../../../../nsys_traces/h100/codec_b256/results/b256_stage0x8_matched_seed*.json
+
+separated_cold_run:
+  seed: 20260728
+  rtfx: 180.348
+  requests_per_second: 29.052
+  ttfa_ms: 4401.55
+  itl_ms: 482.38
+  successful_requests: 256
+  failed_requests: 0
+  underruns: 0
+  deadline_misses: 0
+  result: ../../../../nsys_traces/h100/codec_b256/results/b256_stage0x8_cold_seed20260728.json
+
+saturation_diagnostic:
+  sample_result: ../../../../nsys_traces/h100/codec_b256/results/b256_stage0x8_gpu_sample_seed20260734.json
+  gpu_samples: ../../../../nsys_traces/h100/codec_b256/results/b256_stage0x8_gpu_samples.csv
+  active_gpu_utilization_percent: "99-100"
+  active_memory_controller_utilization_percent: "16-50"
+  active_power_w: "391-400"
+  conclusion: compute_and_power_limited
+
+separated_outliers: none
+validation:
+  focused_tests: {passed: 53, failed: 0}
+  quality_samples: 10
+  wer_percent: 4.21
+  cer_percent: 1.19
+  quality_results: ../../../../nsys_traces/h100/codec_b256/quality_stage0x8_wer_cer.json
+  quality_results_sha256: 3db925e53dab07bc20affd045b6dbc51e65dddda637d35b5dd8a9b4fc8c7c9e2

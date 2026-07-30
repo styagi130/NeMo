@@ -20,8 +20,21 @@ tile sizes and fusing HalfSnake are separate performance work.
 
 from __future__ import annotations
 
+import os
+
 import torch
 from vllm.triton_utils import tl, triton
+
+
+def _env_tile(name: str, default: int) -> int:
+    """Read an experimental power-of-two Triton tile from the environment."""
+    try:
+        value = int(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        value = default
+    if value < 16 or value & (value - 1):
+        raise ValueError(f"{name} must be a power of two >= 16, got {value}")
+    return value
 
 
 @triton.jit
@@ -159,6 +172,7 @@ def _packed_causal_conv1d_kernel(
     time_factor: tl.constexpr,
     IS_DECODE: tl.constexpr,
     HAS_BIAS: tl.constexpr,
+    USE_TF32: tl.constexpr,
     BLOCK_T: tl.constexpr,
     BLOCK_I: tl.constexpr,
     BLOCK_O: tl.constexpr,
@@ -216,7 +230,10 @@ def _packed_causal_conv1d_kernel(
                 mask=(channels[:, None] < input_channels) & (output_offsets[None, :] < output_channels),
                 other=0.0,
             )
-            accumulator += tl.dot(values, weights, input_precision="ieee")
+            if USE_TF32:
+                accumulator += tl.dot(values, weights, input_precision="tf32")
+            else:
+                accumulator += tl.dot(values, weights, input_precision="ieee")
 
     if HAS_BIAS:
         bias = tl.load(bias_ptr + output_offsets, mask=output_offsets < output_channels, other=0.0)
@@ -461,7 +478,19 @@ def packed_causal_conv1d(
     metadata_placeholder = cache_indices
     query_start_loc_ptr = metadata_placeholder if is_decode else query_start_loc
     has_initial_ptr = metadata_placeholder if is_decode else has_initial
-    block_t, block_i, block_o = 16, 32, 32
+    # The original correctness-first kernel forced IEEE FP32 dot products.
+    # H100 can instead execute this fallback path on TF32 tensor cores. Keep
+    # the change opt-in so existing A4500 locks and bitwise expectations are
+    # unaffected.
+    use_tf32 = os.environ.get("EASYMAGPIE_CODEC_PACKED_CONV_TF32", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    block_t = _env_tile("EASYMAGPIE_CODEC_CONV_BLOCK_T", 16)
+    block_i = _env_tile("EASYMAGPIE_CODEC_CONV_BLOCK_I", 32)
+    block_o = _env_tile("EASYMAGPIE_CODEC_CONV_BLOCK_O", 32)
     grid = (
         num_sequences,
         triton.cdiv(max_length, block_t),
@@ -483,6 +512,7 @@ def packed_causal_conv1d(
         time_factor,
         IS_DECODE=is_decode,
         HAS_BIAS=bias is not None,
+        USE_TF32=use_tf32,
         BLOCK_T=block_t,
         BLOCK_I=block_i,
         BLOCK_O=block_o,

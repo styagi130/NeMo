@@ -14,6 +14,8 @@
 """Autoregressive intra-frame codebook predictor for EasyMagpieTTS."""
 from __future__ import annotations
 
+import os
+
 import torch
 from easymagpie_vllm_omni.config import EasyMagpieOmniArch
 from torch import nn
@@ -29,7 +31,7 @@ _MIN_SAMPLING_TEMPERATURE = 1e-4
 
 
 class EasyMagpieLTSelfAttention(nn.Module):
-    """Bias-free causal self-attention without a KV cache."""
+    """Bias-free causal self-attention with an optional frame-local KV cache."""
 
     def __init__(self, d_model: int, n_heads: int) -> None:
         super().__init__()
@@ -51,6 +53,29 @@ class EasyMagpieLTSelfAttention(nn.Module):
         attn = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True, scale=self.scale)
         attn = attn.transpose(1, 2).contiguous().view(b, t, -1)
         return self.o_net(attn)
+
+    def forward_cached(
+        self,
+        x: torch.Tensor,
+        cached_k: torch.Tensor | None,
+        cached_v: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Attend one new position to the K/V prefix from this local AR run."""
+        b, _, _ = x.shape
+        qkv = self.qkv_net(x).reshape(b, 1, 3, self.n_heads, self.d_head)
+        q, k, v = qkv.unbind(dim=2)
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+        if cached_k is not None:
+            k = torch.cat((cached_k, k), dim=2)
+            v = torch.cat((cached_v, v), dim=2)
+
+        # The query is the newest (last) position and every cached key precedes
+        # it, so the complete prefix is visible without an additional mask.
+        attn = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=False, scale=self.scale)
+        attn = attn.transpose(1, 2).contiguous().view(b, 1, -1)
+        return self.o_net(attn), k, v
 
 
 class EasyMagpieLTFeedForward(nn.Module):
@@ -105,6 +130,28 @@ class EasyMagpieLTLayer(nn.Module):
         x = x + self.pos_ff(self.norm_pos_ff(x))
         return x
 
+    def forward_nemo_cached(
+        self,
+        x: torch.Tensor,
+        cache: tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None],
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        """Run NeMo's frame-local cache algorithm for one growing prefix.
+
+        NeMo caches the projected K/V tensors and the self-attention outputs,
+        while retaining the growing full prefix for the residual and FFN.  The
+        cache exists only inside one ``C * S`` codebook autoregressive run.
+        """
+        cached_k, cached_v, cached_attn = cache
+        attn_new, k, v = self.self_attention.forward_cached(
+            self.norm_self(x[:, -1:, :]),
+            cached_k,
+            cached_v,
+        )
+        attn = attn_new if cached_attn is None else torch.cat((cached_attn, attn_new), dim=1)
+        x = x + attn
+        x = x + self.pos_ff(self.norm_pos_ff(x))
+        return x, (k, v, attn)
+
 
 class EasyMagpieLocalTransformer(nn.Module):
     """Causal transformer stack with learnable positional embeddings.
@@ -139,13 +186,32 @@ class EasyMagpieLocalTransformer(nn.Module):
             x = layer(x)
         return self.norm_out(x)
 
+    def forward_nemo_cached(
+        self,
+        inputs_embeds: torch.Tensor,
+        caches: list[tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]],
+    ) -> tuple[
+        torch.Tensor,
+        list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+    ]:
+        """Run one growing prefix with NeMo-compatible per-layer caches."""
+        seq_len = inputs_embeds.shape[1]
+        pos_emb = self.position_embeddings(self._positions[:seq_len])
+        x = inputs_embeds + pos_emb.unsqueeze(0)
+        next_caches: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+        for layer, cache in zip(self.layers, caches):
+            x, next_cache = layer.forward_nemo_cached(x, cache)
+            next_caches.append(next_cache)
+        return self.norm_out(x), next_caches
+
 
 # NOTE: ``dynamic_arg_dims`` is passed explicitly rather than relying on vLLM's
 # annotation-based inference. This file uses ``from __future__ import
 # annotations`` (PEP 563), so ``forward``'s annotations are stored as strings
 # (``"torch.Tensor"``) and vLLM's ``v.annotation in [torch.Tensor, ...]`` check
 # would never match, raising "No dynamic dimensions found...". Both ``dec_hidden``
-# and ``gumbel_noise`` are ``[num_tokens, ...]`` -> dim 0 (num_tokens) is dynamic.
+# and ``gumbel_noise`` are ``[num_tokens, ...]`` -> dim 0 (num_tokens) is
+# dynamic.
 @support_torch_compile(dynamic_arg_dims={"dec_hidden": 0, "gumbel_noise": 0})
 class EasyMagpieCodeLoop(nn.Module):
     """Compiled per-frame codebook loop.
@@ -179,7 +245,7 @@ class EasyMagpieCodeLoop(nn.Module):
         Args:
             dec_hidden: ``[num_tokens, embedding_dim]`` backbone hidden state.
             gumbel_noise: ``[num_tokens, num_codebooks, top_k]`` pre-drawn
-                Gumbel noise (``-log(-log(u))``), one slice per codebook.
+                Gumbel noise, one slice per codebook.
             temperature: ``[1]`` sampling temperature (already clamped > 0).
 
         Returns:
@@ -194,9 +260,17 @@ class EasyMagpieCodeLoop(nn.Module):
 
         forbidden = cp.forbidden_mask
         codes: list[torch.Tensor] = []
+        caches: list[tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]] = [
+            (None, None, None) for _ in cp.local_transformer.layers
+        ]
         for k in range(n):
-            hidden = cp.local_transformer(buf)
-            row = cp.local_transformer_audio_out_projection(hidden[:, k, :])
+            if cp.local_transformer_use_kv_cache:
+                hidden, caches = cp.local_transformer.forward_nemo_cached(buf[:, : k + 1, :], caches)
+                hidden_row = hidden[:, -1, :]
+            else:
+                hidden = cp.local_transformer(buf)
+                hidden_row = hidden[:, k, :]
+            row = cp.local_transformer_audio_out_projection(hidden_row)
             logits = cp.local_transformer_out_projections[k](row)
             logits = logits.masked_fill(forbidden, float("-inf")) / temperature
             vals, idxs = torch.topk(logits, self.top_k, dim=-1)
@@ -270,6 +344,7 @@ class EasyMagpieCodePredictor(nn.Module):
         self.top_k: int = _DEFAULT_TOP_K
         self.lt_hidden = lt_hidden
         self._sample_top_k = min(self.top_k, self.num_tokens_per_codebook)
+        self.local_transformer_use_kv_cache = os.environ.get("EASYMAGPIE_LOCAL_TRANSFORMER_KV_CACHE", "0") == "1"
 
         # Compiled single-graph autoregressive loop (owns no params; reaches the
         # projection heads / embeddings / mask on ``self`` via a bound reference).
@@ -282,8 +357,8 @@ class EasyMagpieCodePredictor(nn.Module):
         dtype = vllm_config.model_config.dtype
         # Stable-address input for the captured loop graph.
         self._dec_hidden_buf = torch.zeros(max_num_tokens, self.embedding_dim, dtype=dtype)
-        # Gumbel noise drawn eagerly each frame and injected into the graph; fp32
-        # so the small ``-log(-log(u))`` values don't underflow in fp16.
+        # Gumbel noise drawn eagerly each frame and injected into the graph;
+        # fp32 avoids underflow.
         self._gumbel_buf = torch.zeros(max_num_tokens, self.num_codebooks, self._sample_top_k, dtype=torch.float32)
         self._temperature_buf = torch.zeros(1, dtype=torch.float32)
 
@@ -345,10 +420,12 @@ class EasyMagpieCodePredictor(nn.Module):
         in_buf = self._dec_hidden_buf[:num_tokens]
         in_buf.copy_(dec_hidden)
 
-        # ``-log(-log(u))`` Gumbel noise, computed in place in fp32.
+        # If E ~ Exp(1), then -log(E) is standard Gumbel noise.  Drawing the
+        # exponential directly is distribution-equivalent to
+        # ``-log(-log(U))`` and saves two pointwise CUDA passes per frame.
         noise = self._gumbel_buf[:num_tokens]
-        noise.uniform_(1e-20, 1.0 - 1e-20)
-        noise.log_().neg_().log_().neg_()
+        noise.exponential_()
+        noise.log_().neg_()
 
         self._temperature_buf.fill_(max(float(self.temperature), _MIN_SAMPLING_TEMPERATURE))
         return self._code_loop(in_buf, noise, self._temperature_buf)

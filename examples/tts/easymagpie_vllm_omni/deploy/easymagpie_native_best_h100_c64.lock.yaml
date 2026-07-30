@@ -1,0 +1,313 @@
+# Reproducibility lock for the zero-underrun, >=120 RTFX H100 C64 service.
+profile: easymagpie_native_best_h100_c64_stage0x2_fused_conv_transpose
+saved_at: "2026-07-29"
+repository_commit: 09a9e5ae33a84502403301b16dce2e9da88ee1cc
+service_port: 8091
+
+hardware:
+  gpu: NVIDIA H100 NVL
+  gpu_uuid: GPU-f0f6dca4-b913-1454-856d-74a4331fdbb3
+  compute_capability: "9.0"
+  memory_mib: 95830
+  mig_mode: Disabled
+  driver: 580.173.02
+  power_limit_w: 400.00
+
+runtime:
+  image: easymp-vllm-omni:0.24-native
+  image_id: sha256:3e37980f33d692f172f8f1997d8f14ce87c4be7bd93b325f2f7e054295c09d0e
+  profiling_image: easymp-vllm-omni:0.24-native-nsys
+  profiler: NVIDIA Nsight Systems 2025.6.3.541
+  vllm_build_commit: ee0da84ab9e04ac7610e28580af62c365e898389
+  python: 3.12.13
+  pytorch: 2.11.0+cu130
+  cuda_runtime: "13.0"
+  triton: 3.6.0
+  vllm: 0.24.0
+  vllm_omni: 0.24.0
+
+cache:
+  root: /workspace/.cache/easymp_h100
+  source_before_server_and_benchmark: ../scripts/setenv.sh
+  tmpdir_before_source: unset
+  tmpdir_after_source: unset
+
+capacity:
+  requests: 64
+  stage0_replicas: 2
+  stage0_max_num_seqs_per_replica: 32
+  stage0_aggregate_capacity: 64
+  stage1_max_num_seqs: 64
+  stage0_transfer_parallelism_per_replica: 32
+  stage0_aggregate_transfer_parallelism: 64
+  stage1_codec_capacity: 64
+  observed_stage1_codec_batch_max: 42
+  admission_serialization: false
+  transfer_serialization: false
+  stage0_replica_partitioning: "two independent B32 CUDA-graph cohorts on the same H100"
+  successor_window_drain: false
+
+required_runtime:
+  EASYMAGPIE_NATIVE_OPTIMIZATIONS: 1
+  EASYMAGPIE_STAGE0_CUDA_PAYLOAD: 1
+  EASYMAGPIE_LOCAL_TRANSFORMER_KV_CACHE: 1
+  EASYMAGPIE_CODEC_TRANSFER_PARALLEL: 1
+  EASYMAGPIE_CODEC_COHORT_MAX_BATCH_SIZE: 64
+  EASYMAGPIE_CODEC_MPS_ACTIVE_THREAD_PERCENTAGE: 100
+  EASYMAGPIE_CODEC_PACKED_CONV_TF32: 1
+  EASYMAGPIE_CODEC_FUSED_CONV_TRANSPOSE: 1
+  EASYMAGPIE_CUDA_IPC_DIRECT_CONTROL: 1
+  VLLM_DISABLE_SHARED_EXPERTS_STREAM: 0
+  VLLM_TUNED_CONFIG_FOLDER: /workspace/examples/tts/easymagpie_vllm_omni/moe_configs_h100
+
+packet_schedule:
+  codec_startup_chunk_frames: [16]
+  startup_audio_ms: 1280
+  codec_chunk_frames: 12
+  steady_audio_ms: 960
+  codec_fixed_chunk_frames: 12
+
+artifacts:
+  deploy_config:
+    path: easymagpie_native_optimized_h100_c64_stage0x2.yaml
+    sha256: 11fbde92b28c967b7dba6919332f60e0c0bbc01a704c4c60a34e3cafe0e7a34b
+  launcher:
+    path: ../scripts/run_server_native_optimized_h100_c64.sh
+    sha256: 008331b3819735ab73909ba63ebe17c2a348823ca6b187cee3139b1480d7c210
+  scaling_launcher:
+    path: ../scripts/run_server_native_scaling_h100.sh
+    sha256: f1a149e70f0295d826afbf4b6f9c6c8748da77d1d06b72d0622803c27d8fc8d1
+  cache_environment:
+    path: ../scripts/setenv.sh
+    sha256: 7e74b20b715f02fd3680306dc3b47162c22629e67b86975cfdc0388ae466683b
+  codec_kernels:
+    path: ../easymagpie_vllm_omni/codec/kernels.py
+    sha256: 5261f4dfc21ac704d2fe5aa088412c2a56b3c6d18667f48bdf70cdf0b31565cb
+  codec_packed_layers:
+    path: ../easymagpie_vllm_omni/codec/packed.py
+    sha256: a1a4edd79b6e8dcc6ca03f906360185f761cb10802c9e56609792f9f7828cbd9
+  codec_model:
+    path: ../easymagpie_vllm_omni/codec/model.py
+    sha256: d51d328301e70a9e86d704393d87bd16180637319c8c8235f71740ba3d709a09
+  cuda_ipc_connector:
+    path: ../easymagpie_vllm_omni/cuda_ipc_connector.py
+    sha256: e793533bb3150a791e1152eecb427e408ba2c1c35ff2ca6624ac7b79ced674a7
+  scheduler:
+    path: ../easymagpie_vllm_omni/scheduler.py
+    sha256: b6d91badba3ad6d1db81eec231e36460f931e8b8341483e5ffd25b6bfe3e71de
+  transfer:
+    path: ../easymagpie_vllm_omni/codec_microbatch.py
+    sha256: 4f75a3f292aea77c9cb6826aea8763bf32e6315addeacf08d2579f06945a49ed
+  moe_config:
+    path: ../moe_configs_h100/E=24,N=768,device_name=NVIDIA_H100_NVL.json
+    sha256: 4aebaa4790ba3f8bb75e8874e0521000c27fb2e6feb8a9b19c332976b8c2463b
+  mamba_ssu_config:
+    path: ../moe_configs_h100/headdim=24,dstate=128,device_name=NVIDIA_H100_NVL,cache_dtype=float32.json
+    sha256: af8f9828990898362af7552241f6989b611348e81bbac95672899ef657771011
+  final_server_log:
+    path: ../../../../nsys_traces/h100/codec_b64/logs/b64_stage0x2_final_server.log
+    sha256: a377c7318bb18b63982244437f73a40fab57a8676c17b97a28880abc6af0b600
+
+codec_b64_baseline:
+  seeds: [20260729, 20260730, 20260731, 20260732, 20260733]
+  runs: 5
+  successful_requests: 320
+  failed_requests: 0
+  generated_chunks: 4126
+  rtfx: {mean: 67.407, median: 66.521, min: 66.034, max: 69.791}
+  requests_per_second: {mean: 11.003}
+  ttfa_ms: {mean: 846.53}
+  itl_ms: {mean: 306.57}
+  underruns: 0
+  deadline_misses: 124
+  result_glob: ../../../../nsys_traces/h100/codec_b64/results/codec_b64_baseline_matched_seed*.json
+
+validated_winner:
+  layout: "2 x same-GPU Stage-0 B32 replicas -> 1 x Stage-1 codec with B64 capacity"
+  seeds: [20260729, 20260730, 20260731, 20260732, 20260733]
+  runs: 5
+  successful_requests: 320
+  failed_requests: 0
+  generated_chunks: 2080
+  rtfx: {mean: 128.573, median: 129.338, min: 121.824, max: 136.494}
+  requests_per_second: {mean: 21.081, min: 20.348, max: 22.020}
+  ttfa_ms: {mean: 782.15, min: 750.95, max: 826.71}
+  itl_ms: {mean: 268.30, min: 244.11, max: 283.06}
+  underruns: 0
+  deadline_misses: 0
+  improvement_over_single_stage0_keyed_receiver_percent: 50.69
+  improvement_over_previous_locked_fused_profile_percent: 84.52
+  result_glob: ../../../../nsys_traces/h100/codec_b64/results/b64_stage0x2_matched_seed*.json
+  post_lock_validation:
+    seed: 20260729
+    rtfx: 134.390
+    requests_per_second: 20.24
+    ttfa_ms: 794.7
+    itl_ms: 282.0
+    successful_requests: 64
+    failed_requests: 0
+    underruns: 0
+    deadline_misses: 0
+    result: ../../../../nsys_traces/h100/codec_b64/results/b64_stage0x2_final_repro_seed20260729.json
+    result_sha256: 3bfc37b78b0a2412ff861228acd2ad838ffb35e8d8911cb1be6a0bfb60fc48a0
+
+historical_single_stage0_winner:
+  seeds: [20260729, 20260730, 20260731, 20260732, 20260733]
+  runs: 5
+  successful_requests: 320
+  failed_requests: 0
+  generated_chunks: 4117
+  rtfx: {mean: 69.678, median: 68.516, min: 67.825, max: 72.635}
+  requests_per_second: {mean: 11.370}
+  ttfa_ms: {mean: 842.46}
+  itl_ms: {mean: 303.19}
+  underruns: 0
+  deadline_misses: 3
+  strict_improvement_over_codec_b64_baseline_percent: 3.369
+  improvement_over_previous_b16_codec_profile_percent: 0.581
+  regression_vs_prior_cudnn_winner_percent: 2.824
+  result_glob: ../../../../nsys_traces/h100/codec_b64/results/codec_b64_fused_deconv_mps100_exact_seed*.json
+  server_log: ../../../../nsys_traces/h100/codec_b64/logs/codec_b64_fused_deconv_mps100_exact_server.log
+
+separated_cold_run:
+  seed: 20260728
+  successful_requests: 64
+  failed_requests: 0
+  rtfx: 75.323
+  requests_per_second: 11.308
+  ttfa_ms: 3319.95
+  itl_ms: 273.97
+  underruns: 0
+  deadline_misses: 0
+  result: ../../../../nsys_traces/h100/codec_b64/results/b64_stage0x2_final_cold_validation_seed20260728.json
+
+separated_diagnostics:
+  forced_codec_b64_aggregation:
+    status: rejected
+    reason: "20 ms forced cohort aggregation timed out 7 requests; real asynchronous two-replica arrivals must not be forced into every B64 launch"
+    cold_rtfx: 5.465
+    successful_requests: 57
+    failed_requests: 7
+    underruns: 0
+    result: ../../../../nsys_traces/h100/codec_b64/results/b64_stage0x2_codecwait20_cold_seed20260728.json
+  synthetic_moe_microtune:
+    status: rejected
+    reason: "random router traffic selected tiles that regressed the full service to 78.00 RTFX"
+    report: ../../../../nsys_traces/h100/codec_b64/profile/h100_moe_microtune_20260729.json
+  tf32_with_successor_drain:
+    status: rejected
+    reason: "drain merged six-frame successors into 960-3840 ms per-request windows and caused head-of-line stalls"
+    matched_rtfx: {mean: 69.129, median: 70.009, min: 61.350, max: 75.209}
+    matched_underruns: 12
+    matched_deadline_misses: 176
+    note: "The two pre-measurement warmups also had 64 and 119 underruns; this configuration was not accepted."
+  first_no_drain_set:
+    rtfx: {mean: 69.718, median: 69.996, min: 58.006, max: 77.654}
+    outlier:
+      seed: 20260732
+      rtfx: 58.006
+      underruns: 0
+      deadline_misses: 0
+      rerun_rtfx: 68.811
+      reason: "external wall-time outlier; per-request latency was normal and exact-seed rerun recovered"
+    result_glob: ../../../../nsys_traces/h100/codec_b64/results/codec_b64_tf32_nodrain_matched_seed*.json
+  fused_conv_transpose_mps:
+    mps_75_exact:
+      status: rejected
+      rtfx: {mean: 69.477, median: 69.588, min: 67.998, max: 70.603}
+      underruns: 0
+      deadline_misses: 2
+      result_glob: ../../../../nsys_traces/h100/codec_b64/results/codec_b64_fused_deconv_mps75_exact_seed*.json
+    mps_50_screen:
+      status: rejected_unmatched_tuning_screen
+      rtfx: {mean: 68.938, median: 68.205, min: 66.899, max: 70.922}
+      underruns: 0
+      deadline_misses: 0
+  profiler_runs:
+    status: instrumentation_only
+    note: "The fused profiler run had 245/860 underruns from tracing overhead and is excluded from performance aggregates."
+
+profiling:
+  stage0x2_winner:
+    capture_mode: warmed request-triggered cudaProfilerApi
+    report: ../../../../nsys_traces/h100/codec_b64/profile/codec_b64_stage0x2_warm_20260729.nsys-rep
+    report_sha256: 1903edbb31e117cfeb371ed545e662b89b7e01a6ad8e0537d6e77c9354605ff3
+    stats: ../../../../nsys_traces/h100/codec_b64/profile/codec_b64_stage0x2_warm_20260729_stats.log
+    stats_sha256: 3b4c3eaba54d1df5a8595adb97017fe5c724ab6dac584c9ac4e6a9c1c9a1194d
+    total_gpu_kernel_time_ms: 336.430
+    packed_causal_conv1d:
+      total_gpu_time_ms: 85.546
+      gpu_kernel_time_percent: 25.4
+    fused_conv_transpose1d:
+      total_gpu_time_ms: 5.602
+      gpu_kernel_time_percent: 1.7
+    cuda_api:
+      memcpy_async_percent: 67.4
+      kernel_launch_percent: 14.8
+      stream_synchronize_percent: 10.1
+    diagnosis: "host/API and launch orchestration bound; neither HBM bandwidth nor fused ConvTranspose1d compute is the limiter"
+  baseline:
+    capture_mode: warmed request-triggered cudaProfilerApi
+    report: ../../../../nsys_traces/h100/codec_b64/profile/codec_b64_warm_20260729.nsys-rep
+    report_sha256: e1dcff0127625f5887a5aaa9cf480a2c31aa6786b70a1834afb490afe81ee488
+    packed_causal_conv1d:
+      total_gpu_time_ms: 398.719
+      gpu_kernel_time_percent: 46.7
+    cuda_api:
+      memcpy_async_percent: 40.5
+      stream_synchronize_percent: 16.9
+      kernel_launch_percent: 14.6
+  optimized:
+    capture_mode: warmed request-triggered cudaProfilerApi
+    report: ../../../../nsys_traces/h100/codec_b64/profile/codec_b64_tf32_nodrain_warm_20260729.nsys-rep
+    report_sha256: beb1307fe8e11fe4893d99d17ca770bbd57b028a08892d3d6281d2af114ba6b9
+    packed_causal_conv1d:
+      total_gpu_time_ms: 79.530
+      gpu_kernel_time_percent: 14.6
+      total_time_reduction_percent: 80.054
+    next_gpu_bottleneck:
+      kernel: cuDNN dgrad2d for codec transposed convolution
+      gpu_kernel_time_percent: 31.4
+    cuda_api:
+      memcpy_async_percent: 40.0
+      stream_synchronize_percent: 12.1
+      kernel_launch_percent: 18.5
+  fused_conv_transpose:
+    capture_mode: warmed request-triggered cudaProfilerApi
+    report: ../../../../nsys_traces/h100/codec_b64/profile/codec_b64_fused_deconv_mps75_warm_20260729.nsys-rep
+    report_sha256: efe58c58cc4fbe7726ad39edbebeda25e6d5624b44e36172b8677c6940c33296
+    packed_causal_conv_transpose1d:
+      total_gpu_time_ms: 6.032
+      gpu_kernel_time_percent: 1.7
+      reduction_vs_cudnn_dgrad_percent: 96.466
+    next_gpu_bottleneck:
+      kernel: packed causal Conv1d
+      total_gpu_time_ms: 103.299
+      gpu_kernel_time_percent: 29.4
+    cuda_api:
+      memcpy_async_percent: 43.4
+      stream_synchronize_percent: 10.5
+      kernel_launch_percent: 15.3
+
+quality_validation:
+  asr_model: openai/whisper-large-v3
+  samples: 10
+  successful_generations: 10
+  wer_percent: 3.68
+  cer_percent: 2.85
+  results: ../../../../nsys_traces/h100/codec_b64/quality_stage0x2_wer_cer.json
+  results_sha256: 795650435ec499cf7d636a6adbb91ebed680413255f0aab4a8c9ce297b87a0ee
+  wav_dir: ../../../../nsys_traces/h100/codec_b64/quality_stage0x2_seed20260734
+
+tests:
+  final_focused: "47 passed, 16 warnings in 13.08s"
+  benchmark: "8 passed, 17 warnings in 17.33s"
+  benchmark_log: ../../../../nsys_traces/h100/codec_b64/logs/benchmark_pytest_final.log
+
+a4500_preservation:
+  lock:
+    path: easymagpie_native_best_bs16.lock.yaml
+    sha256: cf2e84eb8a00b8ca0e712339bd8fc75439bf1a58736ecdf89072f134a1ad2a41
+  tile:
+    path: ../moe_configs_a4500/E=24,N=768,device_name=NVIDIA_RTX_A4500.json
+    sha256: ebea4cb146da1c19f3eddb1e361255d5949e4ad8b69b1509ffa2c09626e6b2fa

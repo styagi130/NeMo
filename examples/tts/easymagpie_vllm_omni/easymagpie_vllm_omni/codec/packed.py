@@ -19,6 +19,7 @@ the model definition, weight names, or scheduler integration.
 """
 from __future__ import annotations
 
+import os
 from collections.abc import Iterable
 from dataclasses import dataclass, replace
 from typing import Any
@@ -337,8 +338,15 @@ class PackedCausalConv1d(CodecStateLayer):
             if getattr(metadata, "codec_uniform", False):
                 if metadata.num_decodes and metadata.num_prefills:
                     raise NotImplementedError("uniform codec batches cannot mix prefill and decode")
-                outputs = self._uniform_cuda(inputs, metadata, is_decode=bool(metadata.num_decodes))
-                return self.activation(outputs)
+                use_fused = os.environ.get("EASYMAGPIE_CODEC_FUSED_CONV1D", "").strip().lower() in {
+                    "1",
+                    "true",
+                    "yes",
+                    "on",
+                }
+                if not use_fused:
+                    outputs = self._uniform_cuda(inputs, metadata, is_decode=bool(metadata.num_decodes))
+                    return self.activation(outputs)
 
             parts = []
             decode_rows = metadata.num_decode_tokens * self.time_factor
@@ -468,6 +476,52 @@ class PackedCausalConvTranspose1d(CodecStateLayer):
         )
         return outputs.reshape(-1, self.conv.out_channels)
 
+    def _fused_cuda(
+        self,
+        inputs: torch.Tensor,
+        metadata: Mamba1AttentionMetadata,
+        *,
+        is_decode: bool,
+    ) -> torch.Tensor:
+        """Fuse state gathering, grouped deconvolution, and output layout."""
+        from easymagpie_vllm_omni.codec.kernels import packed_causal_conv_transpose1d
+
+        if is_decode:
+            state_indices = self._decode_state_indices(metadata)
+            return packed_causal_conv_transpose1d(
+                inputs,
+                self.conv.weight,
+                self.conv.bias,
+                self.kv_cache[0],
+                state_indices,
+                state_indices,
+                state_indices,
+                stride=self.stride,
+                time_factor=self.time_factor,
+                output_channels=self.conv.out_channels,
+                is_decode=True,
+            )
+
+        if (
+            metadata.query_start_loc_p is None
+            or metadata.state_indices_tensor_p is None
+            or metadata.has_initial_states_p is None
+        ):
+            raise RuntimeError("incomplete codec prefill metadata")
+        return packed_causal_conv_transpose1d(
+            inputs,
+            self.conv.weight,
+            self.conv.bias,
+            self.kv_cache[0],
+            metadata.query_start_loc_p,
+            metadata.state_indices_tensor_p,
+            metadata.has_initial_states_p,
+            stride=self.stride,
+            time_factor=self.time_factor,
+            output_channels=self.conv.out_channels,
+            max_query_len=self._prefill_max_query_len(metadata),
+        )
+
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         metadata = self._metadata()
         if metadata is None:
@@ -477,55 +531,28 @@ class PackedCausalConvTranspose1d(CodecStateLayer):
         if inputs.shape[0] != expected_rows:
             raise RuntimeError(f"codec metadata describes {expected_rows} rows, got {inputs.shape[0]}")
         if inputs.is_cuda:
-            from easymagpie_vllm_omni.codec.kernels import packed_causal_conv_transpose1d
-
             if getattr(metadata, "codec_uniform", False):
                 if metadata.num_decodes and metadata.num_prefills:
                     raise NotImplementedError("uniform codec batches cannot mix prefill and decode")
-                outputs = self._uniform_cuda(inputs, metadata, is_decode=bool(metadata.num_decodes))
+                is_decode = bool(metadata.num_decodes)
+                use_fused = os.environ.get("EASYMAGPIE_CODEC_FUSED_CONV_TRANSPOSE", "").strip().lower() in {
+                    "1",
+                    "true",
+                    "yes",
+                    "on",
+                }
+                if use_fused:
+                    outputs = self._fused_cuda(inputs, metadata, is_decode=is_decode)
+                else:
+                    outputs = self._uniform_cuda(inputs, metadata, is_decode=is_decode)
                 return self.activation(outputs)
 
             parts = []
             decode_rows = metadata.num_decode_tokens * self.time_factor
             if metadata.num_decodes:
-                state_indices_d = self._decode_state_indices(metadata)
-                parts.append(
-                    packed_causal_conv_transpose1d(
-                        inputs[:decode_rows],
-                        self.conv.weight,
-                        self.conv.bias,
-                        self.kv_cache[0],
-                        state_indices_d,
-                        state_indices_d,
-                        state_indices_d,
-                        stride=self.stride,
-                        time_factor=self.time_factor,
-                        output_channels=self.conv.out_channels,
-                        is_decode=True,
-                    )
-                )
+                parts.append(self._fused_cuda(inputs[:decode_rows], metadata, is_decode=True))
             if metadata.num_prefills:
-                if (
-                    metadata.query_start_loc_p is None
-                    or metadata.state_indices_tensor_p is None
-                    or metadata.has_initial_states_p is None
-                ):
-                    raise RuntimeError("incomplete codec prefill metadata")
-                parts.append(
-                    packed_causal_conv_transpose1d(
-                        inputs[decode_rows:],
-                        self.conv.weight,
-                        self.conv.bias,
-                        self.kv_cache[0],
-                        metadata.query_start_loc_p,
-                        metadata.state_indices_tensor_p,
-                        metadata.has_initial_states_p,
-                        stride=self.stride,
-                        time_factor=self.time_factor,
-                        output_channels=self.conv.out_channels,
-                        max_query_len=self._prefill_max_query_len(metadata),
-                    )
-                )
+                parts.append(self._fused_cuda(inputs[decode_rows:], metadata, is_decode=False))
             if len(parts) == 1:
                 outputs = parts[0]
             else:

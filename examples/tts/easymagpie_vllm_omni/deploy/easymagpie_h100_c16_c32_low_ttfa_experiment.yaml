@@ -1,0 +1,192 @@
+# Reproducibility manifest for rejected H100 C16/C32 low-TTFA experiments.
+experiment: easymagpie_h100_c16_c32_low_ttfa
+saved_at: "2026-07-30"
+repository_commit: 09a9e5ae33a84502403301b16dce2e9da88ee1cc
+status: rejected_no_promotion
+reason: "Safe candidates did not improve TTFA without a material RTFX/ITL regression; lower-TTFA candidates produced startup underruns."
+
+hardware:
+  gpu: NVIDIA H100 NVL
+  gpu_uuid: GPU-f0f6dca4-b913-1454-856d-74a4331fdbb3
+  memory_mib: 95830
+  driver: 580.173.02
+
+runtime:
+  image: easymp-vllm-omni:0.24-native
+  image_id: sha256:3e37980f33d692f172f8f1997d8f14ce87c4be7bd93b325f2f7e054295c09d0e
+  model_path: /workspace/examples/tts/easymagpie_vllm_omni/easymp_vllm_model
+  cache_root: /workspace/.cache/easymp_h100
+  tmpdir_before_source: unset
+  tmpdir_after_source: unset
+  workspace_plugin_first_on_pythonpath: true
+
+c32:
+  layout: "1 x Stage-0 B32 -> 1 x Stage-1 C32 codec"
+  transfer_parallelism: 32
+  active_winner:
+    status: retained
+    startup_frames: [2]
+    steady_frames: 6
+    matched_runs: 5
+    successful_requests: 160
+    failed_requests: 0
+    generated_chunks: 2208
+    rtfx: {mean: 76.086980, median: 75.787752, min: 73.322148, max: 79.224481}
+    requests_per_second: {mean: 12.387164}
+    ttfa_ms: {mean: 339.672621}
+    itl_ms: {mean: 129.986538}
+    underruns: 0
+    deadline_misses: 0
+    result_glob: ../../../../nsys_traces/h100/scaling_profiles/results/c32_matched_seed*.json
+  safe_candidate:
+    status: rejected
+    startup_frames: [3, 5]
+    startup_audio_ms: [240, 400]
+    steady_frames: 12
+    stage1_mps_percent: 75
+    fused_conv_transpose: true
+    matched_runs: 5
+    successful_requests: 160
+    failed_requests: 0
+    generated_chunks: 1319
+    rtfx: {mean: 72.666287, median: 73.057671, min: 69.177257, max: 77.267002}
+    requests_per_second: {mean: 11.731821, median: 11.980195, min: 10.977862, max: 12.303663}
+    ttfa_ms: {mean: 365.515566, median: 351.119282, min: 343.194246, max: 407.058735}
+    itl_ms: {mean: 242.392225, median: 242.092366, min: 229.183914, max: 255.605255}
+    playback_headroom_p05_ms_min: 47.665939
+    underruns: 0
+    deadline_misses: 0
+    change_from_active:
+      rtfx_percent: -4.495767
+      requests_per_second_percent: -5.290496
+      ttfa_ms: 25.842945
+      ttfa_percent: 7.608192
+      itl_percent: 86.474868
+    process_cold:
+      rtfx: 37.937330
+      requests_per_second: 5.832026
+      ttfa_ms: 2992.801044
+      itl_ms: 252.331137
+      underruns: 0
+      deadline_misses: 0
+      result: ../../../../nsys_traces/h100/codec_b32_low_ttfa/results/c32_startup3_5_chunk12_mps75_parallel_cold_seed20260728.json
+    transition:
+      rtfx: 71.102788
+      requests_per_second: 10.752785
+      ttfa_ms: 404.642511
+      itl_ms: 260.832373
+      underruns: 0
+      deadline_misses: 0
+      result: ../../../../nsys_traces/h100/codec_b32_low_ttfa/results/c32_startup3_5_chunk12_mps75_parallel_transition_seed20260728.json
+    result_glob: ../../../../nsys_traces/h100/codec_b32_low_ttfa/results/c32_startup3_5_chunk12_mps75_parallel_matched_seed*.json
+  rejected_candidates:
+    startup_2_fused:
+      matched_rtfx_mean: 67.504426
+      matched_ttfa_ms_mean: 355.002874
+      matched_underruns: 115
+      matched_deadline_misses: 115
+    startup_3_cudnn:
+      status: rejected
+      reason: "One warmed screen underrun remained and RTFX was about 65x."
+    startup_4_direct_to_12:
+      status: rejected
+      reason: "The 320 ms first packet did not cover the direct jump to the 12-frame codec gap."
+    startup_4_6:
+      matched_rtfx_mean_strict: 68.239203
+      matched_ttfa_ms_mean_strict: 398.345349
+      matched_underruns: 0
+      matched_deadline_misses: 0
+      outlier:
+        seed: 20260732
+        rtfx: 53.56
+        exact_seed_rerun_rtfx: 73.84
+        classification: client_wall_time_outlier
+
+c16:
+  layout: "1 x Stage-0 B16 -> 1 x Stage-1 C16 codec"
+  transfer_parallelism: 16
+  active_winner:
+    status: retained
+    startup_frames: [2]
+    steady_frames: 6
+    matched_runs: 5
+    successful_requests: 80
+    failed_requests: 0
+    generated_chunks: 1113
+    rtfx: {mean: 57.280, median: 57.19, min: 51.76, max: 62.39}
+    requests_per_second: {mean: 9.228}
+    ttfa_ms: {mean: 232.00, min: 212.6, max: 252.5}
+    itl_ms: {mean: 87.52}
+    underruns: 0
+    deadline_misses: 0
+    lock: easymagpie_native_best_h100_bs16.lock.yaml
+  safe_candidate:
+    status: rejected
+    startup_frames: [2]
+    steady_frames: 6
+    stage1_mps_percent: 75
+    fused_conv_transpose: false
+    matched_runs: 5
+    successful_requests: 80
+    failed_requests: 0
+    generated_chunks: 1129
+    rtfx: {mean: 53.134330, median: 53.949289, min: 49.224384, max: 55.622209}
+    requests_per_second: {mean: 8.538235, median: 8.764902, min: 7.723592, max: 9.235344}
+    ttfa_ms: {mean: 239.656537, median: 233.955405, min: 232.460818, max: 263.396355}
+    itl_ms: {mean: 96.071219, median: 92.640210, min: 92.377978, max: 101.980908}
+    playback_headroom_p05_ms_min: 41.196494
+    underruns: 0
+    deadline_misses: 0
+    change_from_active:
+      rtfx_percent: -7.237553
+      requests_per_second_percent: -7.474701
+      ttfa_ms: 7.656537
+      ttfa_percent: 3.300232
+      itl_percent: 9.770588
+    process_cold:
+      rtfx: 20.569299
+      requests_per_second: 3.679660
+      ttfa_ms: 2882.678340
+      itl_ms: 89.285332
+      underruns: 0
+      deadline_misses: 0
+      result: ../../../../nsys_traces/h100/codec_b16_low_ttfa/results/c16_startup2_mps75_cudnn_parallel_cold_seed20260728.json
+    transition:
+      rtfx: 49.383826
+      requests_per_second: 8.794982
+      ttfa_ms: 255.961151
+      itl_ms: 97.200897
+      underruns: 0
+      deadline_misses: 0
+      result: ../../../../nsys_traces/h100/codec_b16_low_ttfa/results/c16_startup2_mps75_cudnn_parallel_transition_seed20260728.json
+    result_glob: ../../../../nsys_traces/h100/codec_b16_low_ttfa/results/c16_startup2_mps75_cudnn_parallel_matched_seed*.json
+  rejected_one_frame_ramp:
+    startup_frames: [1, 1, 2]
+    process_cold: {rtfx: 19.916625, ttfa_ms: 3429.161835, underruns: 16, deadline_misses: 16}
+    transition: {rtfx: 48.405207, ttfa_ms: 286.767804, underruns: 2, deadline_misses: 2}
+    warmed_screen: {rtfx: 54.032006, ttfa_ms: 220.697002, underruns: 0, deadline_misses: 1}
+    reason: "The 80 ms first packet cannot consistently cover the next request/codec gap."
+
+artifacts:
+  c32_candidate_config:
+    path: easymagpie_native_optimized_h100_c32_low_ttfa.yaml
+    sha256: c5a18833142fd91db4e7b1b1e9519f2cc40f14d8d6bd76d20cdfb87f82061088
+  c32_candidate_launcher:
+    path: ../scripts/run_server_native_optimized_h100_c32_low_ttfa.sh
+    sha256: 875af44c70ba87cf867a5a5ea1d7383613b5b774c4e49198ea40cac1b4ebc499
+  c16_candidate_config:
+    path: easymagpie_native_optimized_h100_c16_low_ttfa.yaml
+    sha256: 1fc5bd8ca9525a6eb5b0a90cf549f5304b7a9f5eba652f6d4d5080d0f0f18c6e
+  c16_candidate_launcher:
+    path: ../scripts/run_server_native_optimized_h100_c16_low_ttfa.sh
+    sha256: 612633aecda731b536286fac4a6674032085187d6bbacd8b725cbcd5aff9cadb
+
+validation:
+  scaling_profile_tests: {passed: 22, failed: 0}
+  quality_rerun: false
+  quality_note: "No candidate was promoted; active model, weights, codec, and prior quality lock remain unchanged."
+
+preservation:
+  active_h100_b16_lock_sha256: e879d9c165d2f7783bd7ddef95034597577f925477b6eb658588df6844ac2f4c
+  active_h100_c64_low_ttfa_lock_sha256: 1b0f941658e758b2dfaa2a9deeee0266eabe02016916a836e4fdd9bd930826b3
+  a4500_moe_config_sha256: ebea4cb146da1c19f3eddb1e361255d5949e4ad8b69b1509ffa2c09626e6b2fa

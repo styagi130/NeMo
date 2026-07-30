@@ -1,0 +1,105 @@
+# Reproducibility lock for the H100 C192 six-replica scaling profile.
+profile: easymagpie_native_best_h100_c192_stage0x6
+saved_at: "2026-07-29"
+repository_commit: 09a9e5ae33a84502403301b16dce2e9da88ee1cc
+service_port: 8091
+
+hardware:
+  gpu: NVIDIA H100 NVL
+  gpu_uuid: GPU-f0f6dca4-b913-1454-856d-74a4331fdbb3
+  compute_capability: "9.0"
+  memory_mib: 95830
+  mig_mode: Disabled
+  driver: 580.173.02
+  power_limit_w: 400.00
+
+runtime:
+  image: easymp-vllm-omni:0.24-native
+  image_id: sha256:3e37980f33d692f172f8f1997d8f14ce87c4be7bd93b325f2f7e054295c09d0e
+  vllm: 0.24.0
+  vllm_omni: 0.24.0
+  pytorch: 2.11.0+cu130
+  triton: 3.6.0
+
+cache:
+  root: /workspace/.cache/easymp_h100
+  source_before_server_and_benchmark: ../scripts/setenv.sh
+  tmpdir_before_source: unset
+  tmpdir_after_source: unset
+
+capacity:
+  requests: 192
+  stage0_replicas: 6
+  stage0_max_num_seqs_per_replica: 32
+  stage0_aggregate_capacity: 192
+  stage0_gpu_memory_utilization_per_replica: 0.11
+  stage0_available_kv_cache_gib_per_replica: 4.03
+  stage1_max_num_seqs: 192
+  stage1_gpu_memory_utilization: 0.15
+  stage1_max_num_batched_tokens: 3072
+  full_startup_token_requirement: 3072
+  observed_stage1_codec_batch_max: 120
+  admission_distribution_cold_plus_matched: [192, 192, 192, 192, 192, 192]
+  admission_serialization: false
+  transfer_serialization: false
+
+required_runtime:
+  EASYMAGPIE_CODEC_COHORT_MAX_BATCH_SIZE: 192
+  EASYMAGPIE_CODEC_MPS_ACTIVE_THREAD_PERCENTAGE: 100
+  EASYMAGPIE_CODEC_PACKED_CONV_TF32: 1
+  EASYMAGPIE_CODEC_FUSED_CONV_TRANSPOSE: 1
+  EASYMAGPIE_CUDA_IPC_DIRECT_CONTROL: 1
+  VLLM_DISABLE_SHARED_EXPERTS_STREAM: 0
+
+artifacts:
+  deploy_config:
+    path: easymagpie_native_optimized_h100_c192_stage0x6.yaml
+    sha256: dd3f4bc5df758a332a5088ed62a4668cffbd8cf3e1a5e0c62b44e3df34c9edca
+  launcher:
+    path: ../scripts/run_server_native_optimized_h100_c192.sh
+    sha256: dd7b801399b8f54a2fc6755bab9b8e3d8cf8a66eda2e8546d05986d3d6866300
+  extended_scaling_launcher:
+    path: ../scripts/run_server_native_scaling_h100_extended.sh
+    sha256: e4d0a6f857116fd4a9fca21bd43f22ba84855aad534db53e207371eb0687502c
+  cache_environment:
+    path: ../scripts/setenv.sh
+    sha256: 7e74b20b715f02fd3680306dc3b47162c22629e67b86975cfdc0388ae466683b
+  moe_config:
+    path: ../moe_configs_h100/E=24,N=768,device_name=NVIDIA_H100_NVL.json
+    sha256: 4aebaa4790ba3f8bb75e8874e0521000c27fb2e6feb8a9b19c332976b8c2463b
+  final_server_log:
+    path: ../../../../nsys_traces/h100/codec_b192/logs/b192_stage0x6_server.log
+    sha256: 2dcc4c195914c2237d72f87149a8e314803716184313b411ec38569abd40666a
+
+matched_measurements:
+  seeds: [20260729, 20260730, 20260731, 20260732, 20260733]
+  runs: 5
+  successful_requests: 960
+  failed_requests: 0
+  generated_chunks: 6225
+  rtfx: {mean: 255.544, median: 256.001, min: 246.243, max: 260.770}
+  requests_per_second: {mean: 41.993, min: 40.729, max: 43.200}
+  ttfa_ms: {mean: 1067.10, min: 1022.93, max: 1102.20}
+  itl_ms: {mean: 388.36, min: 373.94, max: 401.79}
+  underruns: 0
+  deadline_misses: 0
+  result_glob: ../../../../nsys_traces/h100/codec_b192/results/b192_stage0x6_matched_seed*.json
+
+separated_cold_run:
+  seed: 20260728
+  rtfx: 157.279
+  requests_per_second: 25.327
+  ttfa_ms: 4107.25
+  itl_ms: 384.63
+  successful_requests: 192
+  failed_requests: 0
+  underruns: 0
+  deadline_misses: 0
+  result: ../../../../nsys_traces/h100/codec_b192/results/b192_stage0x6_cold_seed20260728.json
+
+separated_outliers: none
+validation:
+  focused_tests: {passed: 53, failed: 0}
+  common_quality_wer_percent: 4.21
+  common_quality_cer_percent: 1.19
+  quality_results: ../../../../nsys_traces/h100/codec_b256/quality_stage0x8_wer_cer.json

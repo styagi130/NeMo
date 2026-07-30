@@ -1,0 +1,272 @@
+# Best validated native EasyMagpie configuration for 16 concurrent requests
+# on the exact NVIDIA H100 NVL identified below. This is a reproducibility
+# manifest; the referenced deploy YAML remains the configuration consumed by
+# vLLM-Omni.
+profile: easymagpie_native_best_h100_zero_underrun_bs16
+saved_at: "2026-07-28"
+repository_commit: 09a9e5ae33a84502403301b16dce2e9da88ee1cc
+service_port: 8091
+
+hardware:
+  gpu: NVIDIA H100 NVL
+  gpu_uuid: GPU-f0f6dca4-b913-1454-856d-74a4331fdbb3
+  compute_capability: "9.0"
+  memory_mib: 95830
+  mig_mode: Disabled
+  driver: 580.173.02
+  power_limit_w: 400.00
+  max_sm_clock_mhz: 1785
+
+runtime:
+  image: easymp-vllm-omni:0.24-native
+  image_id: sha256:3e37980f33d692f172f8f1997d8f14ce87c4be7bd93b325f2f7e054295c09d0e
+  upstream_image: vllm/vllm-openai:v0.24.0
+  upstream_image_digest: sha256:251eba5cc7c12fed0b75da22a9240e582b1c9e39f6fbc064f86781b963bd814f
+  vllm_build_commit: ee0da84ab9e04ac7610e28580af62c365e898389
+  python: 3.12.13
+  pytorch: 2.11.0+cu130
+  cuda_runtime: "13.0"
+  triton: 3.6.0
+  vllm: 0.24.0
+  vllm_omni: 0.24.0
+  easymagpie_plugin: 0.1.0
+
+cache:
+  root: /workspace/.cache/easymp_h100
+  filesystem: local ext4
+  lustre_available: false
+  tmpdir: unset
+  redirected:
+    - CUDA_CACHE_PATH
+    - TRITON_CACHE_DIR
+    - TORCHINDUCTOR_CACHE_DIR
+    - XDG_CACHE_HOME
+    - TORCH_HOME
+    - HF_HOME
+    - HUGGINGFACE_HUB_CACHE
+    - TRANSFORMERS_CACHE
+    - VLLM_CACHE_ROOT
+    - FLASHINFER_WORKSPACE_BASE
+    - SPEAKER_SAMPLES_DIR
+  evidence: ../../../../nsys_traces/h100/logs/cache_process_environments.txt
+
+artifacts:
+  launcher:
+    path: ../scripts/run_server_native_optimized_bs16.sh
+    sha256: d42154db627e639dfa85514c7d60c816be5228e852a6b736140730507815591c
+  cache_environment:
+    path: ../scripts/setenv.sh
+    sha256: 7e74b20b715f02fd3680306dc3b47162c22629e67b86975cfdc0388ae466683b
+  deploy_config:
+    path: easymagpie_native_optimized_bs16.yaml
+    sha256: 9977d07923ba6e94f65c5e0c0d41e1ee0d85887f72def00afe6c7a30280f268e
+  moe_config:
+    path: ../moe_configs_h100/E=24,N=768,device_name=NVIDIA_H100_NVL.json
+    sha256: 83170fd409363e04ec06f1cb7566fb5b9a27374034c6f7e6d6993d8194247c42
+  corpus:
+    path: ../bench_corpus.tsv
+    sha256: 8bae1d20bfd5d17bee363afdbd6d25e0167d4bcc5c11ea6663d75c3b8d9450a2
+
+model_identity:
+  supplied_checkpoint:
+    path: ../../../../models/easy_tts/2605_EMTTS_SmallMamba_Step150k_posttrained_epoch12.nemo
+    sha256: 97006372419dce4f0ea75b5170bb7f80640218534423d68522df492448295643
+  supplied_codec:
+    path: ../../../../models/easy_tts/spectral_codec/25fps_spectral_codec_with_bandwidth_extension.nemo
+    sha256: 385dbccbb9eb94865c9745f28f2748845a9a567de7338375825fa2727095d243
+  converted_model_config_sha256: 0bf3cf3f49e9b3a3e4b2a986eec8b85eafe327be4ced95701848f69d3c55f4b1
+  converted_model_weights_sha256: 2639bcce1ae62f09586e385b0eec9db770a06146421b06a1f60d2771c74b9ab5
+  converted_codec_weights_sha256: 7af96f79cf7296e64fff360a83bbf3f3d399db8a8bbdf2abf155a45e7d1f075d
+
+required_runtime:
+  EASYMAGPIE_NATIVE_OPTIMIZATIONS: 1
+  EASYMAGPIE_STAGE0_CUDA_PAYLOAD: 1
+  EASYMAGPIE_LOCAL_TRANSFORMER_KV_CACHE: 1
+  EASYMAGPIE_CODEC_MPS_ACTIVE_THREAD_PERCENTAGE: 75
+  VLLM_DISABLE_SHARED_EXPERTS_STREAM: 0
+  VLLM_TUNED_CONFIG_FOLDER: /workspace/examples/tts/easymagpie_vllm_omni/moe_configs_h100
+  CUDA_MPS_PIPE_DIRECTORY: /tmp/nvidia-mps
+  CUDA_MPS_LOG_DIRECTORY: /tmp/nvidia-log
+
+packet_schedule:
+  codec_startup_chunk_frames: [2]
+  startup_audio_ms: 160
+  codec_chunk_frames: 6
+  steady_audio_ms: 480
+
+controlled_shared_expert_ab:
+  common:
+    tiles: vllm_default
+    stage1_mps_percent: 50
+    seeds: [20260729, 20260730, 20260731, 20260732, 20260733]
+    requests_per_seed: 16
+  stream_0:
+    VLLM_DISABLE_SHARED_EXPERTS_STREAM: 0
+    successful_requests: 80
+    failed_requests: 0
+    rtfx: {mean: 48.832, median: 51.80, min: 32.17, max: 56.63}
+    requests_per_second: {mean: 7.970, median: 8.99, min: 4.68, max: 9.76}
+    ttfa_ms: {mean: 230.02, median: 229.9}
+    itl_ms: {mean: 99.14, median: 92.0}
+    underruns: 0
+    deadline_misses: 13
+    result_glob: ../../../../nsys_traces/h100/results/matched_stream0_default_mps50_seed*.log
+  stream_1:
+    VLLM_DISABLE_SHARED_EXPERTS_STREAM: 1
+    successful_requests: 79
+    failed_requests: 1
+    rtfx: {mean: 42.720, median: 53.28, min: 0.57, max: 57.51}
+    requests_per_second: {mean: 6.696, median: 8.29}
+    ttfa_ms: {mean: 231.08}
+    itl_ms: {mean: 89.72}
+    underruns: 0
+    failure: "one request cancelled after 150 seconds"
+    result_glob: ../../../../nsys_traces/h100/results/matched_stream1_default_mps50_seed*.log
+  winner: stream_0
+
+h100_tile_attribution:
+  common:
+    shared_expert_stream: 0
+    stage1_mps_percent: 50
+    seeds: [20260729, 20260730, 20260731, 20260732, 20260733]
+  default_tiles_rtfx: {mean: 48.832, median: 51.80}
+  h100_tiles_rtfx: {mean: 57.190, median: 57.77, min: 51.89, max: 60.44}
+  strict_mean_improvement_percent: 17.12
+  median_improvement_percent: 11.53
+  h100_tiles_successful_requests: 80
+  h100_tiles_failed_requests: 0
+  h100_tiles_underruns: 0
+  h100_tiles_deadline_misses: 0
+  tuning_log: ../../../../nsys_traces/h100/logs/h100_moe_tile_tuning.log
+
+stage1_mps_ab:
+  common:
+    shared_expert_stream: 0
+    tiles: h100_tuned
+    seeds: [20260729, 20260730, 20260731, 20260732, 20260733]
+  percent_50:
+    rtfx: {mean: 57.190, median: 57.77, min: 51.89, max: 60.44}
+    requests_per_second: {mean: 9.190, median: 9.49, min: 8.32, max: 9.89}
+    ttfa_ms: {mean: 243.50, median: 247.5}
+    itl_ms: {mean: 88.64, median: 87.5}
+  percent_75:
+    rtfx: {mean: 57.280, median: 57.19, min: 51.76, max: 62.39}
+    requests_per_second: {mean: 9.228, median: 9.28, min: 8.43, max: 9.85}
+    ttfa_ms: {mean: 232.00, median: 231.0}
+    itl_ms: {mean: 87.52, median: 86.5}
+  percent_100:
+    rtfx: {mean: 57.088, median: 58.06, min: 50.84, max: 60.31}
+    requests_per_second: {mean: 9.240, median: 9.30, min: 8.60, max: 9.78}
+    ttfa_ms: {mean: 237.04, median: 230.6}
+    itl_ms: {mean: 89.18, median: 88.7}
+  winner: 75
+  note: "All three settings were close; 75% won mean RTFX and mean latency."
+
+validated_winner_c16:
+  seeds: [20260729, 20260730, 20260731, 20260732, 20260733]
+  runs: 5
+  successful_requests: 80
+  failed_requests: 0
+  generated_chunks: 1113
+  rtfx: {mean: 57.280, median: 57.19, min: 51.76, max: 62.39}
+  requests_per_second: {mean: 9.228, median: 9.28, min: 8.43, max: 9.85}
+  ttfa_ms: {mean: 232.00, median: 231.0, min: 212.6, max: 252.5}
+  itl_ms: {mean: 87.52, median: 86.5}
+  startup_transitions: 80
+  startup_deadline_misses: 0
+  startup_underruns: 0
+  steady_transitions: 953
+  steady_deadline_misses: 0
+  steady_underruns: 0
+  result_glob: ../../../../nsys_traces/h100/results/matched_stream0_h100tiles_mps75_seed*.log
+  server_log: ../../../../nsys_traces/h100/logs/matched_stream0_h100tiles_mps75_server.log
+
+separated_nonmatched_observations:
+  cold_first_request_path:
+    seed: 20260729
+    rtfx: 8.90
+    requests_per_second: 1.25
+    ttfa_ms: 7671.0
+    itl_ms: 4615.5
+    successful_requests: 16
+    startup_underruns: 16
+    startup_transitions: 16
+    log: ../../../../nsys_traces/h100/results/cold_stream0_default_mps50_seed20260729.log
+  warmup_outliers:
+    - seed: 20260730
+      rtfx: 43.67
+      startup_underruns: 16
+      reason: "request-path kernels still compiling/settling"
+    - seed: 20260731
+      rtfx: 8.00
+      steady_underruns: 12
+      maximum_steady_gap_ms: 9849.9
+      reason: "isolated no-JIT steady-state stall"
+  matched_default_stream0_outliers:
+    - seed: 20260729
+      rtfx: 47.67
+      maximum_steady_gap_ms: 810.8
+      deadline_misses: 11
+      underruns: 0
+    - seed: 20260730
+      rtfx: 32.17
+      maximum_steady_gap_ms: 1626.8
+      deadline_misses: 2
+      underruns: 0
+  matched_stream1_failure:
+    seed: 20260733
+    rtfx: 0.57
+    successful_requests: 15
+    failed_requests: 1
+    reason: "one server request cancelled after 150 seconds"
+
+profiling:
+  profiler: NVIDIA Nsight Systems 2025.6.3.541
+  capture_mode: warmed request-triggered cudaProfilerApi
+  report: ../../../../nsys_traces/h100/h100_warm_bs16_mps75.nsys-rep
+  report_sha256: d84ebc8b0f011a53c824fb0065af94779fb844951091fb55531457c74f6d42b1
+  sqlite: ../../../../nsys_traces/h100/h100_warm_bs16_mps75.sqlite
+  statistics: ../../../../nsys_traces/h100/logs/h100_warm_bs16_mps75_stats.log
+  instrumented:
+    seed: 20260730
+    rtfx: 36.67
+    successful_requests: 16
+    failed_requests: 0
+    startup_underruns: 1
+    steady_underruns: 0
+    steady_transitions: 212
+  gpu_kernel_leaders:
+    packed_causal_conv1d_percent: 8.5
+    flash_attention_percent: 7.9
+    cudnn_dgrad_percent: 6.3
+    fused_moe_percent: 5.5
+
+quality_validation:
+  asr_model: openai/whisper-large-v3
+  samples: 10
+  successful_generations: 10
+  wer_percent: 3.16
+  cer_percent: 1.84
+  word_counts: {hits: 186, substitutions: 4, deletions: 0, insertions: 2}
+  character_counts: {hits: 1072, substitutions: 9, deletions: 8, insertions: 3}
+  excluding_proper_name_prompts:
+    excluded: [utt01, utt10]
+    samples: 8
+    wer_percent: 0.56
+    cer_percent: 0.20
+  results: ../../../../nsys_traces/h100/quality/whisper_large_v3_wer_cer.json
+  wav_dir: ../../../../nsys_traces/h100/quality/wavs_seed20260734
+
+tests:
+  focused: "26 passed, 16 warnings in 15.68s"
+  focused_log: ../../../../nsys_traces/h100/logs/focused_pytest_final.log
+  benchmark_metrics: "4 passed in 0.31s"
+  benchmark_log: ../../../../nsys_traces/h100/logs/benchmark_pytest_final.log
+
+a4500_preservation:
+  lock:
+    path: easymagpie_native_best_bs16.lock.yaml
+    sha256: cf2e84eb8a00b8ca0e712339bd8fc75439bf1a58736ecdf89072f134a1ad2a41
+  tile:
+    path: ../moe_configs_a4500/E=24,N=768,device_name=NVIDIA_RTX_A4500.json
+    sha256: ebea4cb146da1c19f3eddb1e361255d5949e4ad8b69b1509ffa2c09626e6b2fa

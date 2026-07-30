@@ -1,0 +1,179 @@
+# Reproducibility lock for the zero-underrun H100 C64 low-TTFA profile.
+profile: easymagpie_native_best_h100_c64_stage0x2_low_ttfa
+saved_at: "2026-07-30"
+repository_commit: 09a9e5ae33a84502403301b16dce2e9da88ee1cc
+service_port: 8091
+
+hardware:
+  gpu: NVIDIA H100 NVL
+  gpu_uuid: GPU-f0f6dca4-b913-1454-856d-74a4331fdbb3
+  compute_capability: "9.0"
+  memory_mib: 95830
+  mig_mode: Disabled
+  driver: 580.173.02
+  power_limit_w: 400.00
+
+runtime:
+  image: easymp-vllm-omni:0.24-native
+  image_id: sha256:3e37980f33d692f172f8f1997d8f14ce87c4be7bd93b325f2f7e054295c09d0e
+  vllm_build_commit: ee0da84ab9e04ac7610e28580af62c365e898389
+  python: 3.12.13
+  pytorch: 2.11.0+cu130
+  cuda_runtime: "13.0"
+  triton: 3.6.0
+  vllm: 0.24.0
+  vllm_omni: 0.24.0
+  model_path: /workspace/examples/tts/easymagpie_vllm_omni/easymp_vllm_model
+
+cache:
+  root: /workspace/.cache/easymp_h100
+  source_before_server_benchmark_and_test: ../scripts/setenv.sh
+  tmpdir_before_source: unset
+  tmpdir_after_source: unset
+  tmpdir_must_not_be_redirected: true
+
+capacity:
+  requests: 64
+  layout: "2 x same-GPU Stage-0 B32 replicas -> 1 x Stage-1 C64 codec"
+  stage0_replicas: 2
+  stage0_max_num_seqs_per_replica: 32
+  stage0_aggregate_capacity: 64
+  stage0_transfer_parallelism_per_replica: 32
+  stage0_aggregate_transfer_parallelism: 64
+  stage1_max_num_seqs: 64
+  stage1_max_num_batched_tokens: 1024
+  full_startup_token_requirement: 1024
+  admission_serialization: false
+  transfer_serialization: false
+
+required_runtime:
+  PYTHONPATH_first_entry: /workspace/examples/tts/easymagpie_vllm_omni
+  EASYMAGPIE_NATIVE_OPTIMIZATIONS: 1
+  EASYMAGPIE_STAGE0_CUDA_PAYLOAD: 1
+  EASYMAGPIE_LOCAL_TRANSFORMER_KV_CACHE: 1
+  EASYMAGPIE_CODEC_TRANSFER_PARALLEL: 1
+  EASYMAGPIE_CODEC_COHORT_MAX_BATCH_SIZE: 64
+  EASYMAGPIE_CODEC_MPS_ACTIVE_THREAD_PERCENTAGE: 100
+  EASYMAGPIE_CODEC_PACKED_CONV_TF32: 1
+  EASYMAGPIE_CODEC_FUSED_CONV_TRANSPOSE: 1
+  EASYMAGPIE_CUDA_IPC_DIRECT_CONTROL: 1
+  VLLM_DISABLE_SHARED_EXPERTS_STREAM: 0
+  VLLM_TUNED_CONFIG_FOLDER: /workspace/examples/tts/easymagpie_vllm_omni/moe_configs_h100
+
+serialization_guard:
+  reason: "The runtime image contains an older site-packages plugin that does not install transfer-only parallelism."
+  fix: "Prepend the transferred workspace package to PYTHONPATH; the launcher does this automatically."
+  expected_startup_lines: 2
+  expected_line: "EasyMagpie codec transfer microbatching enabled: wait=1.50ms parallelism=32"
+  observed_parallelism_per_stage0_replica: [32, 32]
+
+packet_schedule:
+  codec_startup_chunk_frames: [10, 14, 16]
+  startup_audio_ms: 800
+  subsequent_startup_audio_ms: [1120, 1280]
+  codec_chunk_frames: 12
+  steady_audio_ms: 960
+  codec_fixed_chunk_frames: 12
+  launch_boundaries_frames: [10, 24, 40, 52]
+  rejoins_locked_steady_boundary_at_frame: 40
+
+artifacts:
+  deploy_config:
+    path: easymagpie_native_optimized_h100_c64_stage0x2_low_ttfa.yaml
+    sha256: b5b7c5b504252a5bcec5f956fe9654cd722b46fbc5024fb6b13c418f1967500b
+  launcher:
+    path: ../scripts/run_server_native_optimized_h100_c64_low_ttfa.sh
+    sha256: d37b3ce4ae12f21217b8b474463a4e693b23ff4cab1ec58e2d324dadbd80251f
+  scaling_launcher:
+    path: ../scripts/run_server_native_scaling_h100.sh
+    sha256: f1a149e70f0295d826afbf4b6f9c6c8748da77d1d06b72d0622803c27d8fc8d1
+  cache_environment:
+    path: ../scripts/setenv.sh
+    sha256: 7e74b20b715f02fd3680306dc3b47162c22629e67b86975cfdc0388ae466683b
+  moe_config:
+    path: ../moe_configs_h100/E=24,N=768,device_name=NVIDIA_H100_NVL.json
+    sha256: 4aebaa4790ba3f8bb75e8874e0521000c27fb2e6feb8a9b19c332976b8c2463b
+  mamba_ssu_config:
+    path: ../moe_configs_h100/headdim=24,dstate=128,device_name=NVIDIA_H100_NVL,cache_dtype=float32.json
+    sha256: af8f9828990898362af7552241f6989b611348e81bbac95672899ef657771011
+
+locked_baseline:
+  profile: easymagpie_native_best_h100_c64_stage0x2_fused_conv_transpose
+  packet_schedule_frames: [16]
+  seeds: [20260729, 20260730, 20260731, 20260732, 20260733]
+  successful_requests: 320
+  failed_requests: 0
+  generated_chunks: 2080
+  rtfx: {mean: 128.573073, median: 129.337583, min: 121.824182, max: 136.493979}
+  requests_per_second: {mean: 21.081420}
+  ttfa_ms: {mean: 782.146515}
+  itl_ms: {mean: 268.301706}
+  underruns: 0
+  deadline_misses: 0
+  result_glob: ../../../../nsys_traces/h100/codec_b64/results/b64_stage0x2_matched_seed*.json
+
+matched_measurements:
+  seeds: [20260729, 20260730, 20260731, 20260732, 20260733]
+  runs: 5
+  successful_requests: 320
+  failed_requests: 0
+  generated_chunks: 2098
+  rtfx: {mean: 130.631049, median: 130.975679, min: 124.826839, max: 137.413879}
+  requests_per_second: {mean: 21.393175, median: 20.958774, min: 20.880124, max: 22.445824}
+  ttfa_ms: {mean: 595.575621, median: 595.954535, min: 569.311132, max: 625.721260}
+  itl_ms: {mean: 286.738524, median: 292.281254, min: 268.442238, max: 297.917974}
+  playback_headroom_p05_ms_min: 372.226345
+  underruns: 0
+  deadline_misses: 0
+  result_glob: ../../../../nsys_traces/h100/codec_b64_low_ttfa/results/c64_startup10_14_16_mps100_parallel_matched_seed*.json
+
+matched_change_from_locked_baseline:
+  rtfx: 2.057976
+  rtfx_percent: 1.600628
+  requests_per_second: 0.311755
+  requests_per_second_percent: 1.478812
+  ttfa_ms: -186.570894
+  ttfa_percent: -23.853701
+  itl_ms: 18.436818
+  itl_percent: 6.871674
+
+separated_process_cold_run:
+  seed: 20260728
+  successful_requests: 64
+  failed_requests: 0
+  rtfx: 75.891929
+  requests_per_second: 11.470535
+  ttfa_ms: 3251.981768
+  itl_ms: 279.928856
+  underruns: 0
+  deadline_misses: 0
+  result: ../../../../nsys_traces/h100/codec_b64_low_ttfa/results/c64_startup10_14_16_mps100_parallel_cold_seed20260728.json
+
+separated_transition_warmup:
+  seed: 20260728
+  successful_requests: 64
+  failed_requests: 0
+  rtfx: 138.371959
+  requests_per_second: 21.061181
+  ttfa_ms: 579.003456
+  itl_ms: 293.180278
+  underruns: 0
+  deadline_misses: 0
+  result: ../../../../nsys_traces/h100/codec_b64_low_ttfa/results/c64_startup10_14_16_mps100_parallel_transition_seed20260728.json
+
+separated_diagnostics:
+  matched_outliers: none
+  note: "No matched measurement was discarded. Process-cold and transition cohorts are excluded from the matched aggregate."
+
+validation:
+  scaling_profile_tests: {passed: 20, failed: 0}
+  matched_requests: 320
+  matched_underruns: 0
+  matched_deadline_misses: 0
+  quality_rerun: false
+  quality_note: "Packet boundaries changed; the model, codec kernels, weights, and deterministic sampling settings did not."
+
+preservation:
+  prior_h100_c64_lock_sha256: f43fce99633cd6a34f4c314286b93f92824646001a07e9d74fb25ecd87e56112
+  a4500_moe_config_sha256: ebea4cb146da1c19f3eddb1e361255d5949e4ad8b69b1509ffa2c09626e6b2fa
+  a4500_lock_sha256: cf2e84eb8a00b8ca0e712339bd8fc75439bf1a58736ecdf89072f134a1ad2a41
