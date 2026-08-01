@@ -361,9 +361,13 @@ def talker2code2wav_async_chunk(
         frame_buffer.pop(request_id, None)
 
     if length <= 0:
-        if finished:
-            if true_finished:
-                _cleanup()
+        # A streaming-text segment can end before ``streaming_speech_delay``
+        # has elapsed.  That is only a resumable boundary, not the end of the
+        # utterance.  Publishing an empty ``finished=True`` payload here makes
+        # the downstream connector permanently finish Stage 1 before later
+        # segments produce their first real codec rows.
+        if true_finished:
+            _cleanup()
             return OmniPayloadStruct(
                 codes=CodesStruct(audio=torch.empty(0, dtype=torch.long)),
                 meta=MetaStruct(finished=torch.tensor(True, dtype=torch.bool)),

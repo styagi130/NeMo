@@ -1,0 +1,246 @@
+# EasyMagpie Rust EngineCore POC
+
+This POC proves a direct inference data path:
+
+```text
+Rust process
+  ├─ owns vLLM HELLO / INIT / READY handshake
+  ├─ optionally tokenizes context + target text natively
+  ├─ builds OmniEngineCoreRequest
+  ├─ sends ADD / ABORT over ZMQ
+  ├─ pre-submits Stage-0 and Stage-1 requests
+  └─ consumes acoustic-code and waveform tensor deltas
+                 │
+                 ▼
+Python-launched vLLM-Omni StageEngineCoreProc processes
+                 │
+                 ▼
+EasyMagpie talker → CUDA IPC connector → stateful codec
+                 │
+                 ▼
+             PCM16 WAV
+```
+
+There is no HTTP proxy, Python per-request bridge, C++ normalization, or
+pybind in this path. Python is used only to construct the vLLM configuration
+and launch the GPU engine subprocess.
+
+## Scope
+
+The POC has two modes:
+
+- Talker-only mode reports/saves acoustic-code tensor deltas and supports
+  concurrent request waves.
+- `--full-pipeline` pre-submits each cohort to both EngineCore processes, lets
+  their configured vLLM-Omni connector stream codes from Stage 0 to Stage 1,
+  and receives decoded waveform chunks in Rust. BS1 single-round runs write a
+  PCM16 WAV; concurrent runs retain only timing and tensor metadata.
+
+Rust owns request identity, submission, output draining, waveform assembly,
+and WAV serialization. With `--rust-tokenizer-model`, it also loads the
+checkpoint's `tokenizer.json`, tokenizes context and target text, and supplies
+the resulting IDs to Stage 0. The optimized CUDA IPC connector remains inside
+the engine processes, so acoustic tensors do not make an unnecessary
+GPU-to-Rust-to-GPU round trip.
+
+The wire schema is pinned to vLLM/vLLM-Omni 0.24:
+
+- base `EngineCoreRequest`: 20 array fields;
+- `OmniEngineCoreRequest`: one trailing `additional_information` field;
+- `OmniEngineCoreOutput`: trailing `multimodal_output`,
+  `is_segment_finished`, and `new_prompt_len_snapshot` fields.
+
+## Build
+
+```bash
+cd examples/tts/easymagpie_vllm_omni/rust_engine_poc
+cargo build --release
+cargo test
+```
+
+The Rust client and Python engine launcher must share a network namespace.
+For the existing development image, run both inside the same container and
+mount the built binary into it.
+
+## Direct Rust tokenizer
+
+Pass the converted model directory to move request tokenization out of the
+Python Stage-0 model:
+
+```bash
+target/release/easymagpie-rust-engine-poc \
+  --rust-tokenizer-model /model \
+  --text "Hello from the Rust tokenizer." \
+  ...
+```
+
+The directory must contain `tokenizer.json` and `config.json`. The client
+tokenizes the configured context once, batch-tokenizes each concurrent cohort
+with the Hugging Face `tokenizers` Rust crate, and appends EasyMagpie's
+model-specific text EOS ID. Request construction and MessagePack serialization
+also run in parallel. It sends `context_token_ids` and `text_tokens` in
+`additional_information`. Stage 0 prefers those IDs while retaining its
+existing checkpoint-tokenizer fallback when the flag is omitted.
+
+Token IDs can be inspected without starting vLLM:
+
+```bash
+target/release/easymagpie-rust-engine-poc \
+  --rust-tokenizer-model /model \
+  --tokenize-only \
+  --text "Hello, world!"
+```
+
+See [RUST_TOKENIZER_RESULTS.md](RUST_TOKENIZER_RESULTS.md) for token-parity
+validation and the matched BS16 benchmark. See
+[TOKENIZER_OPTIMIZATION_RESULTS.md](TOKENIZER_OPTIMIZATION_RESULTS.md) for the
+tokenizer-only microbenchmark and frontend phase timings.
+
+## Run
+
+Terminal 1 — start Rust first because it owns the handshake socket:
+
+```bash
+target/release/easymagpie-rust-engine-poc \
+  --handshake-address tcp://127.0.0.1:62100 \
+  --prompt-len 67 \
+  --max-tokens 32 \
+  --text "Hello from the Rust engine client." \
+  --output-dir /tmp/easymagpie-rust-output
+```
+
+Terminal 2 — launch only the Python GPU engine:
+
+```bash
+python3 launch_talker_engine.py \
+  --model /model \
+  --deploy-config \
+    /workspace/examples/tts/easymagpie_vllm_omni/deploy/easymagpie_talker.yaml \
+  --handshake-address tcp://127.0.0.1:62100
+```
+
+For the current `/model` checkpoint and known `eng` speaker, the prompt length
+is 67. Other checkpoints/speakers must provide their own prompt length.
+
+Successful output contains:
+
+```text
+request_id=rust-easymagpie-...
+generated_tokens=8
+multimodal_tensor_deltas=8
+```
+
+When `--output-dir` is supplied, every tensor delta is saved as a `.bin` file
+with a sibling `.txt` file containing its key, dtype, shape, and byte count.
+For the current checkpoint, the live smoke test returned one initial
+`int64[67, 16]` acoustic-code block followed by seven `int64[1, 16]` deltas.
+
+## Full pipeline
+
+Start Rust first so both handshake sockets exist:
+
+```bash
+target/release/easymagpie-rust-engine-poc \
+  --full-pipeline \
+  --handshake-address tcp://127.0.0.1:62100 \
+  --codec-handshake-address tcp://127.0.0.1:62101 \
+  --prompt-len 67 \
+  --max-tokens 256 \
+  --stop-token-id 1 \
+  --text "Hello, this audio was generated by the full EasyMagpie pipeline controlled directly from Rust." \
+  --wav-output /tmp/rust_full_pipeline.wav
+```
+
+Then launch the two lifecycle-only engine managers:
+
+```bash
+python3 launch_pipeline_engines.py \
+  --model /model \
+  --deploy-config \
+    /workspace/examples/tts/easymagpie_vllm_omni/deploy/easymagpie_native_optimized_bs16.yaml
+```
+
+The original BS1 validation generated 116,424 mono samples at 22.05 kHz. The
+concurrent runner described below supersedes that cold, single-request number
+for performance evaluation.
+
+## Concurrent benchmark
+
+The client can submit concurrent request waves through the same EngineCore
+connection. This command runs one BS16 warmup wave followed by five measured
+waves:
+
+```bash
+target/release/easymagpie-rust-engine-poc \
+  --handshake-address tcp://127.0.0.1:62100 \
+  --prompt-len 67 \
+  --max-tokens 128 \
+  --batch-size 16 \
+  --warmup-rounds 1 \
+  --rounds 5 \
+  --output-timeout-secs 300 \
+  --text "The quick brown fox jumps over the lazy dog near the riverbank."
+```
+
+On the development RTX A4500, the optimized talker-only configuration measured
+73.335x aggregate RTFX across 80 requests. RTFX uses the same estimate as
+`scripts/benchmark_model.py`: `(generated frames - speech delay) * frame
+stacking / 25 Hz`. This excludes codec/PCM generation and engine startup.
+
+## Matched full-pipeline BS16 benchmark
+
+Full-pipeline mode keeps both EngineCore connections alive and supports warmup
+plus measured cohorts. It uses a typed MessagePack decoder on the output hot
+path, skips unused EngineCore fields, leaves waveform data in ZMQ auxiliary
+frames, and timestamps TTFA immediately after socket receipt. PCM conversion
+and WAV writes are excluded from measured latency.
+
+Start the Rust client first:
+
+```bash
+target/release/easymagpie-rust-engine-poc \
+  --full-pipeline \
+  --handshake-address tcp://127.0.0.1:62100 \
+  --codec-handshake-address tcp://127.0.0.1:62101 \
+  --prompt-len 67 \
+  --max-tokens 1024 \
+  --stop-token-id 1 \
+  --batch-size 16 \
+  --warmup-rounds 1 \
+  --rounds 5 \
+  --seed 20260729 \
+  --text-file ../bench_corpus.tsv \
+  --output-timeout-secs 300
+```
+
+Launch the lifecycle-only engine manager with the same deployment and cache
+environment as the Python service. The two processes must share a network
+namespace; the local validation used host networking.
+
+The RTX A4500 run on 2026-07-30 used seeds `20260729` through `20260733` and
+measured:
+
+| Metric | Rust full pipeline | Python service baseline |
+| --- | ---: | ---: |
+| Mean cohort RTFX | **44.69x** | 43.42x |
+| Median cohort RTFX | **45.31x** | 43.69x |
+| Aggregate RTFX | **44.74x** | — |
+| Throughput | **7.14 req/s** | 6.93 req/s |
+| Mean TTFA | **192.7 ms** | 209.6 ms |
+| Mean ITL | **117.9 ms** | 120.7 ms |
+| Playback underruns | **0 / 1,132 chunks** | 0 / 1,130 chunks |
+
+The measured cohorts generated 501.2 seconds of audio across 80 requests in
+11.203 seconds of wall time. Corpus selection reproduces CPython
+`random.seed(seed); random.choices(...)`; a unit test locks the first seed's
+16-item selection.
+
+## Deliberate omissions
+
+- text normalization;
+- raw-text streaming updates;
+- HTTP/WebSocket serving;
+- dynamic/data-parallel engine selection.
+
+These omissions keep the POC focused on whether Rust can directly submit a
+real EasyMagpie request to the vLLM engine and receive model outputs.

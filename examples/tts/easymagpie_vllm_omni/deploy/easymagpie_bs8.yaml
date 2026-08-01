@@ -1,0 +1,63 @@
+# Eight-stream EasyMagpie serving profile.
+# Stage 0 produces acoustic codes and Stage 1 batches their codec decoding.
+pipeline: easymagpie
+async_chunk: true
+
+trust_remote_code: true
+dtype: float16
+
+connectors:
+  connector_of_shared_memory:
+    name: SharedMemoryConnector
+    extra:
+      shm_threshold_bytes: 65536
+      connector_get_sleep_s: 0.01
+      connector_get_max_wait_first_chunk: 3000
+      connector_get_max_wait: 300
+      codec_chunk_frames: 3
+      codec_left_context_frames: 12
+      initial_codec_chunk_frames: 1
+      codec_fixed_chunk_frames: 15
+      codec_microbatch_wait_us: 1500
+      codec_microbatch_parallelism: 8
+      # Must not exceed codec_export.json:max_batch_size.
+      decode_cudagraph_capture_frames: [15]
+      decode_cudagraph_batch_sizes: [1, 2, 4, 8]
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 8
+    gpu_memory_utilization: 0.5
+    enforce_eager: false
+    async_scheduling: true
+    enable_prefix_caching: false
+    enable_chunked_prefill: true
+    max_num_batched_tokens: 4096
+    max_model_len: 4096
+    devices: "0"
+    output_connectors:
+      to_stage_1: connector_of_shared_memory
+    mamba_ssm_cache_dtype: float32
+    skip_tokenizer_init: true
+    engine_extras:
+      worker_cls: easymagpie_vllm_omni.runner.EasyMagpieGPUARWorker
+    default_sampling_params:
+      temperature: 0.0
+      detokenize: false
+      max_tokens: 2048
+
+  - stage_id: 1
+    max_num_seqs: 8
+    gpu_memory_utilization: 0.35
+    enforce_eager: true
+    async_scheduling: false
+    enable_prefix_caching: false
+    # 8 sequences x 16 codebooks x 15 frames = 1,920 token IDs.
+    max_num_batched_tokens: 4096
+    max_model_len: 512
+    devices: "0"
+    input_connectors:
+      from_stage_0: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.0
+      max_tokens: 65536

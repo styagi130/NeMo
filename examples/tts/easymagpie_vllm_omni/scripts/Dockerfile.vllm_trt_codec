@@ -1,0 +1,10 @@
+# TensorRT runtime libraries are in the base serving image, but its Python
+# environment intentionally omits the bindings.  Stage 1 imports them to own
+# the codec plan directly, without sending a BLS request to Triton.
+FROM easymp-vllm-omni:latest
+
+RUN python3 -m pip install --no-cache-dir --break-system-packages --no-deps \
+    --extra-index-url https://pypi.nvidia.com \
+    tensorrt==10.15.1.29 \
+    tensorrt_cu13==10.15.1.29 \
+    tensorrt_cu13_bindings==10.15.1.29

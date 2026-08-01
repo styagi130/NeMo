@@ -56,12 +56,14 @@ def test_async_codec_state_stays_continuous_across_resumable_segments():
     request = _Request()
 
     # Warm-up is counted over the whole request, including segment boundaries.
+    # A segment that ends entirely inside the speech-delay prefix must not send
+    # an empty ``finished=True`` payload: the downstream connector would treat
+    # it as the end of the utterance and ignore the real audio from later text.
     request.output_token_ids = [0]
     assert talker2code2wav_async_chunk(manager, _output(1), request) is None
     request.output_token_ids = [0, 0]
     request.finished = True
-    warmup_flush = talker2code2wav_async_chunk(manager, _output(2), request, is_finished=True)
-    assert warmup_flush.codes.audio.numel() == 0
+    assert talker2code2wav_async_chunk(manager, _output(2), request, is_finished=True) is None
     manager.code_prompt_token_ids.pop(request.external_req_id, None)
 
     # The framework buffer is reset per segment, but the processor's request

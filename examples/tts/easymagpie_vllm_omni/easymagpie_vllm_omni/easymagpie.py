@@ -87,6 +87,24 @@ def _merge_streaming_text_chunk(
     return text_tokens + chunk[overlap:], True
 
 
+def _coerce_external_token_ids(value: Any, field_name: str) -> Optional[list[int]]:
+    """Validate token IDs supplied by a non-Python frontend.
+
+    ``None`` means that the model should retain its checkpoint-tokenizer
+    fallback. An explicit empty list is valid and means no tokens.
+    """
+    if value is None:
+        return None
+    if isinstance(value, torch.Tensor):
+        value = value.detach().cpu().reshape(-1).tolist()
+    if not isinstance(value, (list, tuple)):
+        raise ValueError(f"{field_name} must be a list of integer token IDs")
+    token_ids = [int(token) for token in value]
+    if any(token < 0 for token in token_ids):
+        raise ValueError(f"{field_name} cannot contain negative token IDs")
+    return token_ids
+
+
 # Context text used when the request omits ``context_text``
 _DEFAULT_CONTEXT_TEXT = "[EN]"
 
@@ -733,8 +751,10 @@ class EasyMagpieTTSForConditionalGeneration(
           embedding is precomputed model state, see
           :meth:`_resolve_speaker_embedding`) or, for custom / one-off voices, a
           2-D ``(T_audio, embedding_dim)`` ``speaker_embedding`` tensor.
-        * ``context_text`` — a plain string (e.g. ``"[EN]"``); tokenized in-model
-          and embedded through the baked per-subword ``text_embedding`` table.
+        * ``context_token_ids`` — optional checkpoint-tokenizer IDs supplied by
+          a native frontend. When absent, ``context_text`` (e.g. ``"[EN]"``) is
+          tokenized in-model. Either form is embedded through the baked
+          per-subword ``text_embedding`` table.
         * ``task_mode_id`` — selects the per-mode task ("service token")
           embedding row; prepended only when the checkpoint has a task table.
 
@@ -750,6 +770,9 @@ class EasyMagpieTTSForConditionalGeneration(
         """
         speaker_id = info_dict.get("speaker_id")
         context_text = info_dict.get("context_text") or _DEFAULT_CONTEXT_TEXT
+        external_context_ids = _coerce_external_token_ids(
+            info_dict.get("context_token_ids"), "context_token_ids"
+        )
         if self.task_embedding is not None:
             task_mode_id = int(info_dict.get("task_mode_id", 0) or 0)
             task_mode_id = max(0, min(task_mode_id, self.num_task_embeddings - 1))
@@ -757,7 +780,14 @@ class EasyMagpieTTSForConditionalGeneration(
             task_mode_id = 0
 
         # Custom raw-tensor voices (no speaker_id) are one-off, so skip the cache.
-        cache_key = (task_mode_id, speaker_id, context_text, str(device)) if speaker_id else None
+        context_cache_key = (
+            ("text", context_text)
+            if external_context_ids is None
+            else ("ids", tuple(external_context_ids))
+        )
+        cache_key = (
+            (task_mode_id, speaker_id, context_cache_key, str(device)) if speaker_id else None
+        )
         if cache_key is not None:
             cached = self._prefill_cache.get(cache_key)
             if cached is not None:
@@ -774,8 +804,12 @@ class EasyMagpieTTSForConditionalGeneration(
         # Speaker-encoded context audio (known-speaker state or custom tensor).
         parts.append(self._resolve_speaker_embedding(device, info_dict))
 
-        # Context text: tokenized in-model and embedded through the baked table.
-        ctx_ids = self._encode_context_text(context_text, device)
+        # Prefer IDs supplied by a native frontend. Keep the checkpoint
+        # tokenizer as a backwards-compatible fallback for Python callers.
+        if external_context_ids is None:
+            ctx_ids = self._encode_context_text(context_text, device)
+        else:
+            ctx_ids = torch.tensor(external_context_ids, device=device, dtype=torch.long)
         if ctx_ids.numel() > 0:
             parts.append(self.text_embedding(ctx_ids).to(dtype))
 
