@@ -12,13 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Autoregressive intra-frame codebook predictor for EasyMagpieTTS."""
+
 from __future__ import annotations
 
 import torch
 from easymagpie_vllm_omni.config import EasyMagpieOmniArch
 from torch import nn
 from vllm.compilation.decorators import support_torch_compile
-from vllm.config import VllmConfig
+from vllm.config import CUDAGraphMode, VllmConfig
+from vllm.forward_context import get_forward_context, is_forward_context_available
 
 # Default top-k width for audio-codebook sampling. Because ``torch.topk``'s ``k``
 # shapes tensors inside the captured graph, this becomes a capture-time constant.
@@ -351,4 +353,18 @@ class EasyMagpieCodePredictor(nn.Module):
         noise.log_().neg_().log_().neg_()
 
         self._temperature_buf.fill_(max(float(self.temperature), _MIN_SAMPLING_TEMPERATURE))
-        return self._code_loop(in_buf, noise, self._temperature_buf)
+        if not is_forward_context_available():
+            return self._code_loop(in_buf, noise, self._temperature_buf)
+
+        # This dense submodel has no attention split points, so its independently
+        # compiled graph must not inherit PIECEWISE mode from a mixed
+        # prefill/decode pass through the outer hybrid model.
+        ctx = get_forward_context()
+        runtime_mode = ctx.cudagraph_runtime_mode
+        if runtime_mode != CUDAGraphMode.PIECEWISE:
+            return self._code_loop(in_buf, noise, self._temperature_buf)
+        ctx.cudagraph_runtime_mode = CUDAGraphMode.FULL
+        try:
+            return self._code_loop(in_buf, noise, self._temperature_buf)
+        finally:
+            ctx.cudagraph_runtime_mode = runtime_mode

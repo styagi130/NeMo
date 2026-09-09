@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Tests for local-transformer sampling contracts."""
+
 from __future__ import annotations
 
 import pytest
@@ -20,8 +21,10 @@ torch = pytest.importorskip("torch")
 pytest.importorskip("vllm")
 
 from conftest import build_vllm_config  # noqa: E402
+from easymagpie_vllm_omni import local_transformer as local_transformer_module  # noqa: E402
 from easymagpie_vllm_omni.config import EasyMagpieOmniArch  # noqa: E402
 from easymagpie_vllm_omni.local_transformer import EasyMagpieCodePredictor  # noqa: E402
+from vllm.config import CUDAGraphMode  # noqa: E402
 
 # Cover identity and linear projection paths.
 ARCH_PROFILES = {
@@ -116,6 +119,36 @@ def test_generate_codes_deterministic_with_seed():
     second = cp.generate_codes(dec_hidden)
 
     assert torch.equal(first, second)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("raise_from_loop", [False, True], ids=["success", "failure"])
+def test_generate_codes_uses_full_cudagraph_mode_and_restores_outer_mode(monkeypatch, raise_from_loop):
+    """The independently compiled code loop must not inherit the outer PIECEWISE graph mode."""
+    cp, arch = _build_predictor(ARCH_PROFILES["equal_dims"])
+    outer_context = type("ForwardContext", (), {"cudagraph_runtime_mode": CUDAGraphMode.PIECEWISE})()
+    observed_modes = []
+
+    monkeypatch.setattr(local_transformer_module, "get_forward_context", lambda: outer_context, raising=False)
+    monkeypatch.setattr(local_transformer_module, "is_forward_context_available", lambda: True, raising=False)
+
+    def fake_code_loop(dec_hidden, _noise, _temperature):
+        observed_modes.append(outer_context.cudagraph_runtime_mode)
+        if raise_from_loop:
+            raise RuntimeError("code loop failed")
+        return torch.zeros(dec_hidden.shape[0], arch.num_stacked_codebooks, dtype=torch.long)
+
+    monkeypatch.setattr(cp._code_loop, "forward", fake_code_loop)
+    dec_hidden = torch.randn(3, arch.hidden_dim)
+
+    if raise_from_loop:
+        with pytest.raises(RuntimeError, match="code loop failed"):
+            cp.generate_codes(dec_hidden)
+    else:
+        cp.generate_codes(dec_hidden)
+
+    assert observed_modes == [CUDAGraphMode.FULL]
+    assert outer_context.cudagraph_runtime_mode == CUDAGraphMode.PIECEWISE
 
 
 @pytest.mark.unit
