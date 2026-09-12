@@ -15,6 +15,11 @@ Model definition and pipeline registration live in
 [`vllm_plugin_easymagpie_omni/`](vllm_plugin_easymagpie_omni/).
 Deployment knobs are in [`deploy/easymagpie.yaml`](deploy/easymagpie.yaml).
 
+The two-stage configuration selects `EasyMagpieCodecGPUGenerationWorker` to pack
+compatible waveform lists into one CPU transfer before upstream output handling.
+It preserves request order and waveform shapes; unsupported payloads use upstream
+handling unchanged. Stage capacities and streaming chunk sizes are unaffected.
+
 ### Convert a NeMo checkpoint
 
 This step turns the training-time `.nemo` checkpoints into a self-contained
