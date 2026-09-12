@@ -48,6 +48,7 @@ class RequestResult:
 
 
 def _save_wav(path: Path, audio: np.ndarray, sample_rate: int) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     audio = np.clip(audio, -1.0, 1.0)
     pcm = (audio * 32767.0).astype(np.int16)
     with wave.open(str(path), "wb") as wf:
@@ -127,7 +128,9 @@ def _load_items(text_file: str) -> list[tuple[str, str]]:
                 continue
             parts = line.split("\t", 1)
             if len(parts) != 2:
-                raise ValueError(f"Expected '<uttid>\\t<text>' per line, got: {line!r}")
+                parts = line.split("|", 1)
+            if len(parts) != 2:
+                raise ValueError(f"Expected '<uttid>\\t<text>' or '<uttid>|<text>' per line, got: {line!r}")
             uttid, text = parts[0].strip(), parts[1].strip()
             if not uttid or not text:
                 raise ValueError(f"Empty uttid or text in line: {line!r}")
@@ -161,6 +164,15 @@ def _run_level(tasks: list[dict], concurrency: int, output_dir: str | None) -> t
     with ProcessPoolExecutor(max_workers=concurrency) as ex:
         results = list(ex.map(_do_request, tasks))
     return results, time.perf_counter() - wall0
+
+
+def _server_version(url: str, timeout: float) -> str:
+    try:
+        response = requests.get(f"{url}/version", timeout=timeout)
+        response.raise_for_status()
+        return response.json().get("version") or "unknown"
+    except (requests.RequestException, ValueError, AttributeError):
+        return "unknown"
 
 
 def _percentile(sorted_vals: list[float], pct: float) -> float:
@@ -277,6 +289,9 @@ def _summarize(results: list[RequestResult], wall_s: float, concurrency: int) ->
         "concurrency": concurrency,
         "ok": len(ok),
         "failed": len(failed),
+        # Raw PCM has no finish reason: HTTP success is not evidence of EOS.
+        "completion_unknown": len(ok),
+        "cap_hits": None,
         "wall_s": wall_s,
         "audio_s": audio_s,
         "tput": len(ok) / wall_s if wall_s > 0 else 0.0,
@@ -300,8 +315,12 @@ def _summarize(results: list[RequestResult], wall_s: float, concurrency: int) ->
 
 
 def _print_detailed(s: dict) -> None:
-    print(f"[concurrency={s['concurrency']}]  {s['ok']} ok / {s['failed']} failed")
+    print(f"[concurrency={s['concurrency']}]  {s['ok']} HTTP audio responses / {s['failed']} failed")
     print(f"    req/s {s['tput']:.2f}  |  rtf {s['rtf']:.2f}x  (audio {s['audio_s']:.0f}s / wall {s['wall_s']:.2f}s)")
+    print(
+        f"    completion unknown {s['completion_unknown']}; cap hits unknown; "
+        "complete-utterance throughput unverified"
+    )
     print(f"    ttfa  mean {s['ttfa_mean_ms']:.1f}ms  p95 {s['ttfa_p95_ms']:.1f}ms")
     print(f"    lat   mean {s['lat_mean_s']:.2f}s   p95 {s['lat_p95_s']:.2f}s")
     print(f"    itl   mean {s['itl_mean_ms']:.1f}ms  p95 {s['itl_p95_ms']:.1f}ms")
@@ -325,23 +344,27 @@ def _print_summary(s: dict) -> None:
         f"concurrency={s['concurrency']}:  req/s {s['tput']:.2f},  "
         f"ttfa {s['ttfa_mean_ms']:.1f}ms,  itl {s['itl_mean_ms']:.1f}ms,  "
         f"rtf {s['rtf']:.2f}x,  underrun {s['underrun_pct']:.1f}%,  "
-        f"{s['ok']} ok / {s['failed']} failed"
+        f"{s['ok']} HTTP audio responses / {s['failed']} failed; completion unverified"
     )
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Benchmark the EasyMagpieTTS HTTP server")
-    parser.add_argument("--text-file", required=True, help="Path to file with '<uttid>\\t<text>' per line")
+    parser.add_argument("--text-file", required=True, help="Path to tab- or pipe-separated '<uttid><separator><text>'")
     parser.add_argument("-n", "--num-requests", type=int, required=True, help="Requests per concurrency level")
     parser.add_argument("-c", "--concurrency", type=int, nargs="+", default=[4], help="Concurrency (process) levels")
     parser.add_argument("--url", default="http://localhost:8091", help="Server base URL (default: %(default)s)")
     parser.add_argument("--speaker-id", default=None, help="Speaker id (default: server default)")
-    parser.add_argument("--max-new-tokens", type=int, default=1024)
+    parser.add_argument("--max-new-tokens", type=int, default=1024, help="Requested upstream generation cap")
     parser.add_argument("--sample-rate", type=int, default=22050, help="Raw PCM sample rate (default: %(default)s)")
     parser.add_argument("--timeout", type=float, default=300, help="Per-request timeout, s (default: 300)")
+    parser.add_argument("--seed", type=int, default=0, help="Request selection seed, not acoustic sampling seed")
     parser.add_argument("--no-warmup", action="store_true", help="Skip warmup phase (concurrency requests)")
     parser.add_argument("--output-dir", default=None, help="If set, write each waveform to <output-dir>/<uttid>.wav")
     args = parser.parse_args()
+    if args.max_new_tokens <= 0 or args.sample_rate <= 0 or args.num_requests <= 0 or min(args.concurrency) <= 0:
+        parser.error("generation cap, sample rate, request count, and concurrency must be positive")
+    random.seed(args.seed)
 
     items = _load_items(args.text_file)
     if not items:
@@ -356,9 +379,15 @@ def main() -> None:
     print(
         f"Loaded {len(items)} utterances; {args.num_requests} req/level; concurrency {args.concurrency}; url {args.url}"
     )
+    print(f"API vLLM-Omni /v1/audio/speech; vLLM server version {_server_version(args.url, args.timeout)}")
+    print(f"PCM sample rate {args.sample_rate} Hz; selection seed {args.seed}")
+    print(f"max_new_tokens requested {args.max_new_tokens}; effective unknown (not reported by raw PCM)")
 
     summaries = []
     for concurrency in args.concurrency:
+        print(
+            f"[concurrency={concurrency}] warmup {0 if args.no_warmup else concurrency}; measured {args.num_requests}"
+        )
         if not args.no_warmup:
             warmup = _make_tasks(
                 items,

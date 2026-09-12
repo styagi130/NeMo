@@ -151,9 +151,27 @@ python scripts/benchmark_model.py --model ./converted_model -n 128 -c 1 32 \
     [--streaming --tokens-per-chunk 5]
 
 # Benchmark the service's HTTP API.
-python scripts/benchmark_server.py --text-file vctk_subset.txt -n 128 -c 1 32
+python scripts/benchmark_server.py --text-file vctk_subset.txt -n 128 -c 1 32 \
+    --max-new-tokens 1024 --seed 9101
 
 # Benchmark the service's incremental synthesis via its WebSocket API.
 python scripts/benchmark_incremental_server.py --model ./converted_model \
     --text-file vctk_subset.txt --tokens-per-chunk 5 -n 128 -c 1 32
 ```
+
+The HTTP benchmark uses the upstream vLLM-Omni speech API with `stream=true`,
+`stream_format=audio`, and the requested `max_new_tokens`. Text manifests accept
+`uttid<TAB>text` or `uttid|text`. `--seed` reproduces request selection, not acoustic
+sampling. Warmup is one request per worker unless `--no-warmup` is set. Output
+directories are created automatically; use unique utterance IDs and separate output
+directories per run/concurrency when retaining waveforms for quality evaluation.
+
+The report records the server's `/version` value (or `unknown`), assumed PCM sample
+rate, requested cap, seed, warmup count, and measured request count. Raw PCM carries
+no finish reason or effective generation limit, so HTTP success is reported as an
+audio response with **unknown completion and cap-hit status**. RTFx measures received
+audio seconds per wall second, not verified complete-utterance throughput. Correlate
+server finish reasons/token counts to identify truncations before using these numbers
+for quality or complete-utterance comparisons. Verify small/large caps at the backend
+and first PCM arrival before generation completion; several network chunks alone do
+not establish generation-time streaming. Client concurrency is not engine batch capacity.
