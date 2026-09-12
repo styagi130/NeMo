@@ -81,6 +81,27 @@ class EasyMagpieGPUARModelRunner(GPUARModelRunner):
         payload.setdefault("hidden_states", hidden_states[:, :0])
         return payload
 
+    def _update_intermediate_buffer(self, req_id: str, upd: dict) -> None:
+        if not isinstance(upd, dict) or not upd:
+            return
+        request = self.requests.get(req_id)
+        if request is None:
+            return
+
+        gpu_keys = getattr(getattr(self, "model", None), "gpu_resident_buffer_keys", set())
+        top_level_gpu_keys = {key for key in gpu_keys if isinstance(key, str)}
+        nested_gpu_keys = {key for key in gpu_keys if isinstance(key, tuple) and len(key) == 2}
+        existing = self.model_intermediate_buffer.setdefault(req_id, {})
+        for key, value in upd.items():
+            if isinstance(value, dict):
+                existing_sub = existing.setdefault(key, {})
+                resident_qualifiers = {qualifier for type_key, qualifier in nested_gpu_keys if type_key == key}
+                for qualifier, subvalue in value.items():
+                    self._store_value(existing_sub, qualifier, subvalue, resident_qualifiers)
+            else:
+                self._store_value(existing, key, value, top_level_gpu_keys)
+        request.additional_information_cpu = existing
+
     def _update_streaming_request(self, req_id, new_req_data):
         payload = getattr(new_req_data, "additional_information", None)
         incoming = deserialize_additional_information(payload)

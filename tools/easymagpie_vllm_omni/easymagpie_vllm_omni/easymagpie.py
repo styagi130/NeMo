@@ -120,6 +120,9 @@ class EasyMagpieTTSForConditionalGeneration(
     has_preprocess: bool = True
     has_postprocess: bool = True
     have_multimodal_outputs: bool = True
+    use_async_omni_output: bool = True
+    eager_omni_postprocess_before_async_output: bool = True
+    postprocess_uses_req_infos: bool = False
 
     # Stage 1 (Code2Wav) consumes only the sampled codes (multimodal outputs),
     # never the backbone hidden states. Opt out of attaching ``hidden`` to the
@@ -131,7 +134,7 @@ class EasyMagpieTTSForConditionalGeneration(
     gpu_resident_buffer_keys: set[str] = {
         "last_audio_codes",
         "last_phoneme_token",
-        "last_hidden",
+        "phoneme_ended",
     }
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
@@ -157,8 +160,7 @@ class EasyMagpieTTSForConditionalGeneration(
         #   per-step deltas) instead of re-accumulating and re-sending the whole
         #   cumulative code tensor on every step.
         # * otherwise (two-stage EasyMagpie LM; ``engine_output_type="latent"``): emit
-        #   the inter-stage keys (``audio_codes`` + nested ``codes.audio``) that
-        #   the Code2Wav connector / async-chunk streamer consume.
+        #   nested ``codes.audio`` for the Code2Wav connector.
         engine_output_type = getattr(vllm_config.model_config, "engine_output_type", None)
         self._single_stage_audio = str(engine_output_type or "").lower() == "audio"
 
@@ -571,10 +573,8 @@ class EasyMagpieTTSForConditionalGeneration(
     def make_omni_output(self, model_outputs, **_: Any) -> OmniOutput:
         """Surface the sampled codes (``BT x num_codebooks``).
 
-        The codes are exposed under **two** keys so the same model serves both
-        deployment shapes:
+        The output key follows the deployment shape:
 
-        * ``audio_codes`` — the flat single-stage key read by :meth:`postprocess`.
         * ``codes.audio`` — the nested :class:`~vllm_omni.data_entry_keys.OmniPayload`
           layout consumed by the in-engine two-stage pipeline (Code2Wav). The
           AR runner's ``flatten_payload`` turns this into the ``codes.audio``
@@ -598,7 +598,7 @@ class EasyMagpieTTSForConditionalGeneration(
             )
         return OmniOutput(
             text_hidden_states=hidden,
-            multimodal_outputs={"audio_codes": audio_codes, "codes": {"audio": audio_codes}},
+            multimodal_outputs={"codes": {"audio": audio_codes}},
         )
 
     # ------------------------------------------------------------------
@@ -1054,24 +1054,24 @@ class EasyMagpieTTSForConditionalGeneration(
         # with phoneme BOS), then feeds back the previous step's prediction, and
         # closes one step after the model emits the phoneme EOS (sticky flag).
         if self.has_phoneme:
-            phoneme_ended = bool(info_dict.get("phoneme_ended", False))
-            feed_eos = False
-            if phoneme_ended or decode_offset < self.phonemes_delay:
+            phoneme_ended = torch.as_tensor(
+                info_dict.get("phoneme_ended", False), device=device, dtype=torch.bool
+            ).reshape(())
+            if decode_offset < self.phonemes_delay:
                 self._dec_phoneme_valid[start] = 0
             elif decode_offset == self.phonemes_delay:
                 self._dec_phoneme_tokens[start].fill_(self.phoneme_bos_id)
-                self._dec_phoneme_valid[start] = 1
+                self._dec_phoneme_valid[start].copy_((~phoneme_ended).to(torch.long))
             else:
                 last_phon = info_dict.get("last_phoneme_token")
                 if isinstance(last_phon, torch.Tensor) and last_phon.numel() > 0:
                     p = last_phon.to(device=device, dtype=torch.long).reshape(-1)[: self.arch.phoneme_stacking_factor]
                     self._dec_phoneme_tokens[start, : p.shape[0]].copy_(p)
-                    self._dec_phoneme_valid[start] = 1
-                    feed_eos = bool((p == self.phoneme_eos_id).any())
+                    self._dec_phoneme_valid[start].copy_((~phoneme_ended).to(torch.long))
+                    phoneme_ended = phoneme_ended | (p == self.phoneme_eos_id).any()
                 else:
                     self._dec_phoneme_valid[start] = 0
-            if phoneme_ended or feed_eos:
-                info_update["phoneme_ended"] = True
+            info_update["phoneme_ended"] = phoneme_ended
 
         # ── Audio channel ── opens at decode step == ``speech_delay`` (seeded with
         # audio BOS), then feeds back the previous frame's codes. For the leading
@@ -1109,8 +1109,8 @@ class EasyMagpieTTSForConditionalGeneration(
         out: dict[str, Any] = {}
         mm = multimodal_outputs or {}
         # The codes key depends on the emission mode (see make_omni_output):
-        # single-stage uses "model_outputs", two-stage uses "audio_codes" /
-        # nested "codes.audio". Read whichever is present.
+        # single-stage uses "model_outputs", two-stage uses "codes.audio".
+        # Keep accepting the legacy "audio_codes" key from older callers.
         audio_codes = mm.get("audio_codes")
         if audio_codes is None:
             audio_codes = mm.get("model_outputs")
@@ -1123,7 +1123,8 @@ class EasyMagpieTTSForConditionalGeneration(
         if isinstance(audio_codes, torch.Tensor) and audio_codes.numel() > 0:
             out["last_audio_codes"] = audio_codes[last : last + 1].detach()
         if self.has_phoneme:
-            out["last_phoneme_token"] = self._dec_phoneme_tokens[last : last + 1].detach().clone()
+            # The runner takes an owning copy before the next model invocation.
+            out["last_phoneme_token"] = self._dec_phoneme_tokens[last : last + 1].detach()
         return out
 
     # ------------------------------------------------------------------
