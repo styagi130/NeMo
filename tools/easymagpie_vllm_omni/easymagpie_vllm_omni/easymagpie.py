@@ -37,6 +37,7 @@ from easymagpie_vllm_omni.backbone_patches import (
 )
 from easymagpie_vllm_omni.config import EasyMagpieOmniArch
 from easymagpie_vllm_omni.local_transformer import EasyMagpieCodePredictor
+from easymagpie_vllm_omni.speakers import load_speaker_embedding, preload_speakers, speaker_fingerprint
 from easymagpie_vllm_omni.tokenizer import EasyMagpieTextTokenizer
 from torch import nn
 from vllm.compilation.backends import set_model_tag
@@ -272,18 +273,15 @@ class EasyMagpieTTSForConditionalGeneration(
         # ``compute_logits``
         self._sample_stop = torch.zeros(max_num_tokens, dtype=torch.bool)
 
-        # ── Assembled prefill context embeddings (the only context cache) ──
-        # ``preprocess`` runs on the host, once per request, serially on the
-        # runner's critical path, so per-request speaker-tensor transfer + the
-        # tokenize/embed/cat dominate TTFT under concurrency. Cache the *whole*
-        # assembled context ``[task | speaker | context_text]`` per
-        # ``(task_mode_id, speaker_id, context_text, device)`` (see
-        # :meth:`_build_prefill_embeds`): for a known speaker it is identical on
-        # every request, so the cache subsumes a separate speaker-embedding table
-        # — the speaker ``.pt`` is read from disk only on the (first) cache miss
-        # for that combo (see :meth:`_load_known_speaker_embedding`), then never
-        # again. Custom raw-tensor voices are one-off and skip the cache.
+        # Keep assembled context/task caching independent of optional voice buffers.
         self._prefill_cache: dict[tuple, torch.Tensor] = {}
+        self._speaker_buffers = {}
+        for speaker_id, fingerprint, embedding in preload_speakers(
+            self.model_path, width=self.embedding_dim, dtype=dtype
+        ):
+            name = f"_speaker_embedding_{len(self._speaker_buffers)}"
+            self.register_buffer(name, embedding.to(self._combined_embeddings.device), persistent=False)
+            self._speaker_buffers[speaker_id] = (name, fingerprint)
 
     # ------------------------------------------------------------------
     # Embedding helpers
@@ -826,13 +824,9 @@ class EasyMagpieTTSForConditionalGeneration(
     def _resolve_speaker_embedding(self, device: torch.device, info_dict: dict[str, Any]) -> torch.Tensor:
         """Return the speaker context-audio embedding on ``device`` in model dtype.
 
-        For a known ``speaker_id`` the embedding is read from disk by
-        :meth:`_load_known_speaker_embedding`; this only ever runs on a
-        prefill-cache miss (see :meth:`_build_prefill_embeds`), i.e. once per
-        ``(speaker_id, context_text, task)`` combo, so there is no separate
-        speaker-embedding table — the assembled prefill cache subsumes it. Falls
-        back to a raw ``speaker_embedding`` tensor (custom / one-off voice),
-        copied H2D here. Exactly one of the two must be supplied.
+        Known voices reuse startup buffers when their files are unchanged;
+        other voices load lazily on a prefill-cache miss. Custom raw tensors
+        retain their original uncached path.
         """
         dtype = self._combined_embeddings.dtype
         speaker_id = info_dict.get("speaker_id")
@@ -849,21 +843,15 @@ class EasyMagpieTTSForConditionalGeneration(
         return speaker_embedding.to(device=device, dtype=dtype)
 
     def _load_known_speaker_embedding(self, speaker_id: str, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-        """Read one known speaker's embedding from ``<model_path>/speaker_embeddings/<id>.pt``.
-
-        The file holds either a bare ``(T_audio, embedding_dim)`` tensor or a dict
-        with a ``speaker_encoding`` key (the converter/caller layout); it is moved
-        to ``device`` in model dtype. Called only on a prefill-cache miss, so each
-        known speaker is read at most once per ``(context_text, task)`` combo and
-        the result is then baked into ``self._prefill_cache``. Read from disk (not
-        via :meth:`load_weights`) so known speakers work even under
-        ``--load-format dummy``, which skips weight loading.
-        """
+        """Reuse an unchanged startup voice; keep late/replaced voices lazy."""
         import glob
         import os
 
         spk_dir = os.path.join(self.model_path, "speaker_embeddings")
         path = os.path.join(spk_dir, f"{speaker_id}.pt")
+        prepared = getattr(self, "_speaker_buffers", {}).get(speaker_id)
+        if prepared is not None and speaker_fingerprint(path) == prepared[1]:
+            return getattr(self, prepared[0]).to(device=device, dtype=dtype)
         if not os.path.exists(path):
             known = sorted(os.path.splitext(os.path.basename(p))[0] for p in glob.glob(os.path.join(spk_dir, "*.pt")))
             raise AssertionError(
@@ -871,13 +859,7 @@ class EasyMagpieTTSForConditionalGeneration(
                 "Register it under the checkpoint's speaker_embeddings/ dir, or pass a raw "
                 "speaker_embedding tensor for a custom voice."
             )
-        loaded = torch.load(path, map_location="cpu")
-        embedding = loaded["speaker_encoding"] if isinstance(loaded, dict) else loaded
-        assert isinstance(embedding, torch.Tensor) and embedding.ndim == 2, (
-            f"EasyMagpieTTS: speaker embedding {path} must be a 2-D (T_audio, embedding_dim) tensor; "
-            f"got {type(embedding).__name__}"
-            + (f" with ndim={embedding.ndim}" if isinstance(embedding, torch.Tensor) else "")
-        )
+        embedding = load_speaker_embedding(path, width=self.embedding_dim, dtype=dtype)
         return embedding.to(device=device, dtype=dtype)
 
     def _maybe_set_lt_sampling_params(self, info_dict: dict[str, Any]) -> None:
@@ -987,11 +969,10 @@ class EasyMagpieTTSForConditionalGeneration(
         path = os.path.join(model_path, "speaker_embeddings", f"{speaker_id}.pt")
         if not os.path.exists(path):
             raise FileNotFoundError(f"EasyMagpieTTS: no speaker embedding {path} for speaker_id {speaker_id!r}")
-        loaded = torch.load(path, map_location="cpu")
-        speaker_embedding = loaded["speaker_encoding"] if isinstance(loaded, dict) else loaded
-
         with open(os.path.join(model_path, "config.json")) as f:
-            num_task_embeddings = int(json.load(f).get("num_task_embeddings", 0))
+            config = json.load(f)
+        num_task_embeddings = int(config.get("num_task_embeddings", 0))
+        speaker_embedding = load_speaker_embedding(path, width=config.get("embedding_dim", config.get("hidden_size")))
 
         return cls.estimate_prompt_len(
             speaker_embedding,
