@@ -37,6 +37,22 @@ def test_packed_half_snake() -> None:
     torch.testing.assert_close(actual, expected, atol=2e-5, rtol=2e-5)
 
 
+@pytest.mark.parametrize("shape", [(1, 32), (113, 32), (257, 64)])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("use_residual", [False, True])
+def test_packed_half_snake_residual_matches_separate_add(shape, dtype, use_residual) -> None:
+    torch.manual_seed(18)
+    inputs = torch.randn(shape, dtype=dtype, device="cuda")
+    residual = torch.randn_like(inputs) if use_residual else None
+    alpha = torch.rand(1, shape[1] // 2, 1, dtype=dtype, device="cuda") + 0.25
+    combined = inputs if residual is None else inputs + residual
+    expected = packed_half_snake(combined, alpha)
+
+    actual = packed_half_snake(inputs, alpha, residual)
+
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
 def test_packed_causal_conv1d() -> None:
     torch.manual_seed(19)
     device = torch.device("cuda")

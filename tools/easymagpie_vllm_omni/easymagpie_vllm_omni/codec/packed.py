@@ -131,11 +131,13 @@ class PackedHalfSnake(nn.Module):
         # Preserve the NeMo checkpoint shape.
         self.alpha = nn.Parameter(torch.ones(1, self.snake_channels, 1))
 
-    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+    def forward(self, inputs: torch.Tensor, residual: torch.Tensor | None = None) -> torch.Tensor:
         if inputs.is_cuda:
             from easymagpie_vllm_omni.codec.kernels import packed_half_snake
 
-            return packed_half_snake(inputs, self.alpha)
+            return packed_half_snake(inputs, self.alpha, residual)
+        if residual is not None:
+            inputs = inputs + residual
         snake_in = inputs[:, : self.snake_channels]
         alpha = self.alpha.reshape(1, -1)
         snake_out = snake_in + torch.sin(alpha * snake_in).square() / (alpha + 1e-9)
@@ -517,7 +519,7 @@ class PackedResidualBlock(nn.Module):
         self.output_activation = PackedHalfSnake(channels)
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-        return self.output_activation(inputs + self.skip_conv(self.input_conv(inputs)))
+        return self.output_activation(self.skip_conv(self.input_conv(inputs)), inputs)
 
 
 class PackedResNetDecoder(nn.Module):
