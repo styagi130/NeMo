@@ -17,7 +17,7 @@ from math import prod
 import pytest
 import torch
 from easymagpie_vllm_omni.codec.config import EasyMagpieCodecConfig
-from easymagpie_vllm_omni.codec.packed import PackedFiniteScalarDequantizer
+from easymagpie_vllm_omni.codec.packed import PackedFiniteScalarDequantizer, PackedHalfSnake
 
 
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
@@ -40,3 +40,18 @@ def test_fsq_full_codebook_matches_arithmetic(device, levels, index_dtype):
 
     torch.testing.assert_close(dequantizer(indices), expected, atol=0, rtol=0)
     assert not dequantizer.state_dict()
+
+
+@pytest.mark.parametrize("shape", [(1, 32), (113, 32), (257, 64)])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("use_residual", [False, True])
+def test_half_snake_cpu_residual_matches_separate_add(shape, dtype, use_residual):
+    torch.manual_seed(18)
+    activation = PackedHalfSnake(shape[1]).to(dtype=dtype)
+    inputs = torch.randn(shape, dtype=dtype)
+    residual = torch.randn_like(inputs) if use_residual else None
+    original = inputs.clone()
+    expected = activation(inputs if residual is None else inputs + residual)
+
+    torch.testing.assert_close(activation(inputs, residual), expected, atol=0, rtol=0)
+    torch.testing.assert_close(inputs, original, atol=0, rtol=0)
