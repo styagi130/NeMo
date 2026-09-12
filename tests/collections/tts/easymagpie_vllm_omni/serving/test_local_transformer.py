@@ -135,3 +135,89 @@ def test_generate_codes_uses_full_cudagraph_mode_and_restores_outer_mode(monkeyp
     expected = CUDAGraphMode.FULL if outer_mode == CUDAGraphMode.PIECEWISE else outer_mode
     assert observed_modes == [expected]
     assert outer_context.cudagraph_runtime_mode == outer_mode
+
+
+def _full_buffer_codes(cp, dec_hidden, gumbel_noise, temperature):
+    """Reference the original loop that transforms all codebook positions."""
+    num_tokens = dec_hidden.shape[0]
+    num_codebooks = cp.num_codebooks
+    buf = dec_hidden.new_zeros(num_tokens, num_codebooks, cp.lt_hidden)
+    buf[:, 0, :] = cp.local_transformer_in_projection(dec_hidden)
+
+    codes = []
+    for k in range(num_codebooks):
+        hidden = cp.local_transformer(buf)
+        row = cp.local_transformer_audio_out_projection(hidden[:, k, :])
+        logits = cp.local_transformer_out_projections[k](row)
+        logits = logits.masked_fill(cp.forbidden_mask, float("-inf")) / temperature
+        vals, idxs = torch.topk(logits, cp._sample_top_k, dim=-1)
+        picked = (vals + gumbel_noise[:, k, :]).argmax(dim=-1, keepdim=True)
+        code = idxs.gather(-1, picked).squeeze(-1)
+        codes.append(code)
+        if k + 1 < num_codebooks:
+            emb = cp.audio_in_projection(cp.audio_embeddings[k](code))
+            buf[:, k + 1, :] = cp.local_transformer_in_projection(emb)
+    return torch.stack(codes, dim=1)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("profile", ARCH_PROFILES.values(), ids=ARCH_PROFILES)
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16], ids=["fp32", "bf16", "fp16"])
+def test_code_loop_matches_full_buffer_reference(profile, device, dtype):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    torch.manual_seed(9101)
+    cp, arch = _build_predictor(profile)
+    cp.to(device=device, dtype=dtype)
+    dec_hidden = torch.randn(3, arch.hidden_dim, device=device, dtype=dtype)
+    noise = torch.rand(3, arch.num_stacked_codebooks, cp._sample_top_k, device=device).clamp_(1e-20, 1 - 1e-7)
+    noise.log_().neg_().log_().neg_()
+    temperature = torch.tensor([0.7], device=device)
+    logits = []
+    handles = [
+        layer.register_forward_hook(lambda _m, _args, out: logits.append(out.detach().clone()))
+        for layer in cp.local_transformer_out_projections
+    ]
+    try:
+        expected = _full_buffer_codes(cp, dec_hidden, noise, temperature)
+        reference_logits = list(logits)
+        logits.clear()
+        actual = cp._code_loop(dec_hidden, noise, temperature)
+    finally:
+        for handle in handles:
+            handle.remove()
+    assert len(logits) == len(reference_logits) == arch.num_stacked_codebooks
+    for got, wanted in zip(logits, reference_logits, strict=True):
+        torch.testing.assert_close(got, wanted)
+    assert torch.equal(actual, expected)
+
+
+@pytest.mark.unit
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("batch_size", [1, 32, 128])
+def test_code_loop_cuda_graph_replay_matches_full_buffer(batch_size):
+    """Exercise real dense-loop capture/replay, independently of vLLM graph dispatch."""
+    torch.manual_seed(9102)
+    cp, arch = _build_predictor(ARCH_PROFILES["equal_dims"])
+    cp.to(device="cuda", dtype=torch.float16)
+    hidden = torch.randn(batch_size, arch.hidden_dim, device="cuda", dtype=torch.float16)
+    noise = torch.empty(batch_size, arch.num_stacked_codebooks, cp._sample_top_k, device="cuda")
+    noise.exponential_().log_().neg_()
+    temperature = torch.tensor([0.7], device="cuda")
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.no_grad(), torch.cuda.stream(stream):
+        for _ in range(3):
+            cp._code_loop(hidden, noise, temperature)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.no_grad(), torch.cuda.graph(graph):
+        actual = cp._code_loop(hidden, noise, temperature)
+    for _ in range(3):
+        hidden.normal_()
+        noise.exponential_().log_().neg_()
+        graph.replay()
+        with torch.no_grad():
+            expected = _full_buffer_codes(cp, hidden, noise, temperature)
+        assert torch.equal(actual, expected)
