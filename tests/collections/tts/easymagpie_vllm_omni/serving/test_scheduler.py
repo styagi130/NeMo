@@ -20,11 +20,14 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from easymagpie_vllm_omni import scheduler as scheduler_module
 from easymagpie_vllm_omni.scheduler import (
     EasyMagpieARAsyncScheduler,
     EasyMagpieCodecScheduler,
     _poll_native_codec_chunk,
 )
+from vllm.v1.core.sched.async_scheduler import AsyncScheduler
+from vllm.v1.core.sched.request_queue import SchedulingPolicy
 from vllm.v1.request import RequestStatus
 from vllm_omni.core.sched.omni_ar_scheduler import OmniARAsyncScheduler
 from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler
@@ -113,6 +116,7 @@ def test_native_codec_chunk_appends_prompt_without_resetting_state(monkeypatch):
     adapter = object.__new__(OmniChunkTransferAdapter)
     adapter._easymagpie_num_quantizers = 2
     adapter._easymagpie_chunk_lock = threading.Lock()
+    adapter._easymagpie_chunk_ready = threading.Condition(adapter._easymagpie_chunk_lock)
     adapter.get_req_chunk = {"request": 1}
     request = SimpleNamespace(
         prompt_token_ids=[0, 0],
@@ -159,6 +163,7 @@ def test_native_codec_empty_segment_marker_does_not_reset_state(monkeypatch):
     adapter = object.__new__(OmniChunkTransferAdapter)
     adapter._easymagpie_num_quantizers = 2
     adapter._easymagpie_chunk_lock = threading.Lock()
+    adapter._easymagpie_chunk_ready = threading.Condition(adapter._easymagpie_chunk_lock)
     request = SimpleNamespace(
         prompt_token_ids=[0, 0, 0],
         request_id="request",
@@ -192,6 +197,7 @@ def test_native_codec_loaded_empty_segment_marker_is_not_scheduled(monkeypatch):
     adapter = object.__new__(OmniChunkTransferAdapter)
     adapter._easymagpie_num_quantizers = 2
     adapter._easymagpie_chunk_lock = threading.Lock()
+    adapter._easymagpie_chunk_ready = threading.Condition(adapter._easymagpie_chunk_lock)
     adapter._finished_load_reqs = {"request"}
     adapter.upstream_exhausted_requests = set()
     request = SimpleNamespace(
@@ -296,6 +302,7 @@ def test_native_codec_poll_without_arrival_preserves_metadata(monkeypatch):
     adapter = object.__new__(OmniChunkTransferAdapter)
     adapter._easymagpie_num_quantizers = 2
     adapter._easymagpie_chunk_lock = threading.Lock()
+    adapter._easymagpie_chunk_ready = threading.Condition(adapter._easymagpie_chunk_lock)
     info = {"codes": {"audio": torch.ones(3, 2)}, "meta": {"chunk_seq": 1}}
     request = SimpleNamespace(
         request_id="request",
@@ -410,12 +417,331 @@ def test_native_codec_segment_resume_stays_on_cached_request_path(status, queue_
     assert scheduler.chunk_transfer_adapter.segment_finished_requests == set()
 
 
+@pytest.mark.parametrize(
+    ("key", "maximum", "codec", "attribute"),
+    [
+        ("stage0_admission_coalesce_ms", 50, False, "_admission_wait_s"),
+        ("codec_startup_coalesce_ms", 2, True, "_codec_startup_wait_s"),
+        ("codec_busy_coalesce_ms", 4, True, "_codec_busy_wait_s"),
+    ],
+)
+def test_coalescing_wait_bounds_and_disabled_defaults(monkeypatch, key, maximum, codec, attribute):
+    assert getattr(_policy_scheduler(monkeypatch, codec=codec), attribute) == 0
+    for value in (0, maximum):
+        scheduler = _policy_scheduler(monkeypatch, codec=codec, extra={key: value})
+        assert getattr(scheduler, attribute) == value / 1000
+    for value in (-1, maximum + 0.001, float("inf"), float("nan")):
+        with pytest.raises(ValueError, match=key):
+            _policy_scheduler(monkeypatch, codec=codec, extra={key: value})
+
+
+@pytest.mark.parametrize("target", [None, 3])
+@pytest.mark.parametrize("wait_ms", [10, 50])
+def test_admission_coalescing_has_one_bounded_deadline(monkeypatch, wait_ms, target):
+    extra = {"stage0_admission_coalesce_ms": wait_ms}
+    if target is not None:
+        extra["stage0_admission_batch_target"] = target
+    scheduler = _policy_scheduler(monkeypatch, extra=extra)
+    scheduler.waiting = [SimpleNamespace(num_computed_tokens=0)]
+    deadline = 1.0 + wait_ms / 1000
+    times = iter((1.0, deadline - 0.001, deadline, 2.0, 3.0))
+    monkeypatch.setattr(scheduler_module, "monotonic", lambda: next(times), raising=False)
+
+    assert scheduler._should_defer_waiting_admission() is True
+    scheduler.waiting.append(SimpleNamespace(num_computed_tokens=0))
+    assert scheduler._should_defer_waiting_admission() is True
+    assert scheduler._admission_deadline == deadline
+    assert scheduler._should_defer_waiting_admission() is False
+    assert scheduler._should_defer_waiting_admission() is False
+    scheduler.waiting.clear()
+    assert scheduler._should_defer_waiting_admission() is False
+    scheduler.waiting.append(SimpleNamespace(num_computed_tokens=0))
+    assert scheduler._should_defer_waiting_admission() is True
+    assert scheduler._admission_deadline == 3.0 + wait_ms / 1000
+
+
+@pytest.mark.parametrize("target", [1, 16, 64, 128])
+def test_admission_batch_target_is_capped_without_changing_capacity(monkeypatch, target):
+    scheduler = _policy_scheduler(monkeypatch, extra={"stage0_admission_batch_target": target}, max_requests=64)
+    assert scheduler._admission_batch_target == min(target, 64)
+    assert scheduler.max_num_running_reqs == 64
+    assert _policy_scheduler(monkeypatch)._admission_batch_target == 4
+
+
+@pytest.mark.parametrize("target", [0, -1, True, False, 1.5, "16", None])
+def test_admission_batch_target_rejects_nonpositive_or_noninteger_values(monkeypatch, target):
+    with pytest.raises(ValueError, match="stage0_admission_batch_target"):
+        _policy_scheduler(monkeypatch, extra={"stage0_admission_batch_target": target})
+
+
+def test_admission_target_releases_early_without_consuming_or_reordering_requests(monkeypatch):
+    scheduler = _policy_scheduler(
+        monkeypatch,
+        extra={"stage0_admission_coalesce_ms": 50, "stage0_admission_batch_target": 16},
+        max_requests=64,
+    )
+    monkeypatch.setattr(scheduler_module, "monotonic", lambda: 1.0)
+    scheduler.waiting = [SimpleNamespace(num_computed_tokens=0) for _ in range(15)]
+    assert scheduler._should_defer_waiting_admission() is True
+    scheduler.waiting.extend(SimpleNamespace(num_computed_tokens=0) for _ in range(4))
+    requests = scheduler.waiting.copy()
+    assert scheduler._should_defer_waiting_admission() is False
+    assert all(a is b for a, b in zip(scheduler.waiting, requests, strict=True))
+    assert scheduler._admission_deadline == 0.0
+    scheduler.waiting[:] = requests[:1]  # Cancellation must not restart a released wait.
+    assert scheduler._should_defer_waiting_admission() is False
+    scheduler.waiting.clear()
+    assert scheduler._should_defer_waiting_admission() is False
+    scheduler.waiting[:] = requests[:1]
+    assert scheduler._should_defer_waiting_admission() is True
+
+
+@pytest.mark.parametrize(("target", "count", "deferred"), [(16, 15, True), (16, 16, False), (64, 16, True)])
+def test_admission_target_preserves_upstream_abort_and_exception_restoration(monkeypatch, target, count, deferred):
+    scheduler = _policy_scheduler(
+        monkeypatch,
+        extra={"stage0_admission_coalesce_ms": 50, "stage0_admission_batch_target": target},
+        max_requests=64,
+    )
+    monkeypatch.setattr(scheduler_module, "monotonic", lambda: 1.0)
+    scheduler.waiting = [SimpleNamespace(num_computed_tokens=0, status=RequestStatus.WAITING) for _ in range(count)]
+    original = scheduler.waiting
+    original.append(SimpleNamespace(num_computed_tokens=0, status=RequestStatus.FINISHED_ABORTED))
+    scheduler.policy = SchedulingPolicy.FCFS
+    scheduler.requests = {}
+    scheduler.input_coordinator = None
+    events = []
+    scheduler._consume_pending_connector_output = lambda **kwargs: events.append("consume")
+    scheduler._process_pending_input_timeouts = lambda: events.append("timeouts")
+    scheduler.chunk_transfer_adapter.process_pending_chunks = lambda *args, **kwargs: events.append("poll")
+    scheduler.chunk_transfer_adapter.restore_queues = lambda *args, **kwargs: events.append("restore")
+
+    def base_schedule(self, *args):
+        assert events == ["consume", "timeouts", "poll"]
+        assert len(original) == count
+        assert len(self.waiting) == (0 if deferred else count)
+        assert (self.waiting is original) is not deferred
+        raise RuntimeError("base schedule failed")
+
+    monkeypatch.setattr(AsyncScheduler, "schedule", base_schedule)
+    with pytest.raises(RuntimeError, match="base schedule failed"):
+        scheduler.schedule()
+    assert scheduler.waiting is original
+    assert len(original) == count
+    assert events == ["consume", "timeouts", "poll", "restore"]
+
+
+@pytest.mark.parametrize("target", [None, 1])
+@pytest.mark.parametrize("bypass", ["disabled", "empty", "running", "resumed", "full"])
+@pytest.mark.parametrize("wait_ms", [10, 50])
+def test_admission_coalescing_bypasses_active_resume_and_full_batches(monkeypatch, bypass, wait_ms, target):
+    wait_ms = 0 if bypass == "disabled" else wait_ms
+    extra = {"stage0_admission_coalesce_ms": wait_ms}
+    if target is not None:
+        extra["stage0_admission_batch_target"] = target
+    scheduler = _policy_scheduler(monkeypatch, extra=extra)
+    scheduler.waiting = [SimpleNamespace(num_computed_tokens=int(bypass == "resumed"))]
+    scheduler._admission_deadline = 100.0
+    if bypass == "empty":
+        scheduler.waiting.clear()
+    elif bypass == "running":
+        scheduler.running = [object()]
+    elif bypass == "full":
+        scheduler.waiting *= scheduler.max_num_running_reqs
+
+    assert scheduler._should_defer_waiting_admission() is False
+    assert scheduler._admission_deadline == (0.0 if bypass == "full" else None)
+    if bypass == "full":
+        scheduler.waiting.pop()
+        assert scheduler._should_defer_waiting_admission() is False
+        assert scheduler._admission_deadline == 0.0
+
+
+@pytest.mark.parametrize(
+    ("running", "waiting", "ready", "startup", "busy"),
+    [
+        ([], [0], {"w0"}, True, False),
+        ([], [], set(), False, False),
+        ([8, 8], [], {"r0"}, False, True),
+        ([8, 8], [0], {"r0", "w0"}, False, False),
+        ([8, 8], [], {"r0", "r1"}, False, False),
+        ([8], [], {"r0"}, False, False),
+        ([8, 8], [], set(), False, False),
+    ],
+)
+def test_codec_coalescing_waits_only_for_eligible_batches(monkeypatch, running, waiting, ready, startup, busy):
+    scheduler = _policy_scheduler(
+        monkeypatch, codec=True, extra={"codec_startup_coalesce_ms": 2, "codec_busy_coalesce_ms": 4}
+    )
+    for prefix, values, target in (("r", running, scheduler.running), ("w", waiting, scheduler.waiting)):
+        target.extend(
+            SimpleNamespace(
+                request_id=f"{prefix}{index}",
+                num_computed_tokens=tokens,
+                status=RequestStatus.WAITING_FOR_CHUNK,
+            )
+            for index, tokens in enumerate(values)
+        )
+    scheduler.chunk_transfer_adapter._finished_load_reqs = ready
+
+    assert scheduler._should_coalesce_codec_startup() is startup
+    assert scheduler._should_coalesce_codec_busy() is busy
+    scheduler._codec_startup_wait_s = scheduler._codec_busy_wait_s = 0
+    assert scheduler._should_coalesce_codec_startup() is False
+    assert scheduler._should_coalesce_codec_busy() is False
+
+
+def test_codec_startup_wait_does_not_hold_payload_lock(monkeypatch):
+    scheduler = _policy_scheduler(monkeypatch, codec=True, extra={"codec_startup_coalesce_ms": 2})
+    scheduler.waiting = [
+        SimpleNamespace(request_id="new", num_computed_tokens=0, status=RequestStatus.WAITING_FOR_CHUNK)
+    ]
+    adapter = scheduler.chunk_transfer_adapter
+    adapter._finished_load_reqs.add("new")
+    waits = []
+
+    def wait(duration):
+        assert adapter._easymagpie_chunk_lock.acquire(blocking=False)
+        adapter._easymagpie_chunk_lock.release()
+        waits.append(duration)
+
+    monkeypatch.setattr(scheduler_module, "sleep", wait, raising=False)
+    monkeypatch.setattr(OmniGenerationScheduler, "schedule", lambda *args, **kwargs: "scheduled")
+    assert scheduler.schedule() == "scheduled"
+    assert waits == [0.002]
+
+
+@pytest.mark.parametrize("arrival", ["terminal", "first_chunk"])
+def test_codec_busy_wait_releases_lock_and_ready_arrival_wakes_it(monkeypatch, arrival):
+    scheduler = _policy_scheduler(monkeypatch, codec=True, extra={"codec_busy_coalesce_ms": 4})
+    payload = {"meta": {"finished": True}} if arrival == "terminal" else {"codes": {"audio": torch.ones(1, 2)}}
+    adapter, request = _codec_poll_state([payload])
+    adapter._finished_load_reqs.add("ready")
+    scheduler.chunk_transfer_adapter = adapter
+    scheduler.running = [SimpleNamespace(request_id="ready", num_computed_tokens=3), request]
+    if arrival == "first_chunk":
+        request.num_computed_tokens = 0
+        scheduler.running[-1] = SimpleNamespace(request_id="stalled", num_computed_tokens=3)
+        scheduler.waiting = [request]
+    # Give thread synchronization headroom; production validation caps this at 4 ms.
+    scheduler._codec_busy_wait_s = 2.0
+    condition = adapter._easymagpie_chunk_ready
+    wait_started = threading.Event()
+    original_wait = condition.wait
+    published = []
+
+    def wait(timeout):
+        wait_started.set()
+        notified = original_wait(timeout)
+        assert notified, "ready arrival must notify the waiter, not just reach its timeout"
+        return notified
+
+    def publish_chunk():
+        if wait_started.wait(2):
+            published.append(_poll_native_codec_chunk(adapter, request))
+
+    def schedule(*args, **kwargs):
+        assert adapter._easymagpie_chunk_lock.locked()
+        return "scheduled"
+
+    monkeypatch.setattr(condition, "wait", wait)
+    monkeypatch.setattr(OmniGenerationScheduler, "schedule", schedule)
+    publisher = threading.Thread(target=publish_chunk, daemon=True)
+    publisher.start()
+    try:
+        assert scheduler.schedule() == "scheduled"
+    finally:
+        publisher.join(3)
+    assert not publisher.is_alive()
+    assert published == [True]
+    assert request.request_id in adapter._finished_load_reqs
+    if arrival == "terminal":
+        assert request.request_id in adapter.upstream_exhausted_requests
+        assert request.num_prompt_tokens == request.num_computed_tokens == 3
+        assert "audio" not in request.additional_information["codes"]
+    else:
+        assert request.num_prompt_tokens == 1
+        assert request.num_computed_tokens == 0
+        assert "stalled" not in adapter._finished_load_reqs
+
+
+def test_codec_busy_wait_timeout_keeps_requests_and_state(monkeypatch):
+    scheduler = _policy_scheduler(monkeypatch, codec=True, extra={"codec_busy_coalesce_ms": 4})
+    scheduler.running = [SimpleNamespace(request_id=rid, num_computed_tokens=8) for rid in ("a", "b")]
+    adapter = scheduler.chunk_transfer_adapter
+    adapter._finished_load_reqs = {"a"}
+    waits = []
+
+    def wait_for(predicate, timeout):
+        assert not predicate()
+        waits.append(timeout)
+        return False
+
+    monkeypatch.setattr(adapter._easymagpie_chunk_ready, "wait_for", wait_for)
+    monkeypatch.setattr(OmniGenerationScheduler, "schedule", lambda *args, **kwargs: "scheduled")
+    assert scheduler.schedule() == "scheduled"
+    assert waits == [0.004]
+    assert [request.num_computed_tokens for request in scheduler.running] == [8, 8]
+    assert adapter._finished_load_reqs == {"a"}
+
+
+@pytest.mark.parametrize("previous", [None, (True, False)])
+@pytest.mark.parametrize("fail", [False, True])
+def test_talker_sender_restores_nested_finish_context(monkeypatch, previous, fail):
+    adapter = _policy_scheduler(monkeypatch).chunk_transfer_adapter
+    adapter._easymagpie_send_finish = previous
+    outer = {"is_finished": False, "is_segment_finished": True}
+    inner = {"is_finished": True, "is_segment_finished": False}
+    seen = []
+
+    def send(self, task):
+        seen.append(self._easymagpie_send_finish)
+        if task is outer:
+            try:
+                return self._send_single_request(inner)
+            finally:
+                assert self._easymagpie_send_finish == (False, True)
+        if fail:
+            raise RuntimeError("send failed")
+        return "sent"
+
+    monkeypatch.setattr(OmniChunkTransferAdapter, "_send_single_request", send)
+    if fail:
+        with pytest.raises(RuntimeError, match="send failed"):
+            adapter._send_single_request(outer)
+    else:
+        assert adapter._send_single_request(outer) == "sent"
+    assert seen == [(False, True), (True, False)]
+    assert adapter._easymagpie_send_finish is previous
+
+
+def _policy_scheduler(monkeypatch, *, codec=False, extra=None, max_requests=4):
+    cls = EasyMagpieCodecScheduler if codec else EasyMagpieARAsyncScheduler
+    base = OmniGenerationScheduler if codec else OmniARAsyncScheduler
+    monkeypatch.setattr(base, "__init__", lambda *args, **kwargs: None)
+    scheduler = object.__new__(cls)
+    scheduler.vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            stage_id=int(codec),
+            stage_connector_config={"extra": extra or {}},
+            hf_config=SimpleNamespace(num_stacked_codebooks=2),
+        )
+    )
+    scheduler.chunk_transfer_adapter = SimpleNamespace(_finished_load_reqs=set())
+    scheduler.running = []
+    scheduler.waiting = []
+    scheduler.max_num_running_reqs = max_requests
+    scheduler.__init__()
+    return scheduler
+
+
 def _codec_poll_state(payloads):
     """Use the actual upstream poll and queues with only connector I/O stubbed."""
     payloads = deque(payloads)
     adapter = object.__new__(OmniChunkTransferAdapter)
     adapter._easymagpie_num_quantizers = 2
     adapter._easymagpie_chunk_lock = threading.Lock()
+    adapter._easymagpie_chunk_ready = threading.Condition(adapter._easymagpie_chunk_lock)
     adapter._finished_load_reqs = set()
     adapter.get_req_chunk = defaultdict(int)
     adapter.request_ids_mapping = {}

@@ -1,0 +1,99 @@
+{
+  "1": {
+    "BLOCK_SIZE_K": 64,
+    "BLOCK_SIZE_M": 16,
+    "BLOCK_SIZE_N": 64,
+    "GROUP_SIZE_M": 1,
+    "num_stages": 3,
+    "num_warps": 4
+  },
+  "1136": {
+    "BLOCK_SIZE_K": 64,
+    "BLOCK_SIZE_M": 128,
+    "BLOCK_SIZE_N": 128,
+    "GROUP_SIZE_M": 16,
+    "num_stages": 3,
+    "num_warps": 8
+  },
+  "142": {
+    "BLOCK_SIZE_K": 128,
+    "BLOCK_SIZE_M": 16,
+    "BLOCK_SIZE_N": 64,
+    "GROUP_SIZE_M": 1,
+    "num_stages": 2,
+    "num_warps": 4
+  },
+  "16": {
+    "BLOCK_SIZE_K": 64,
+    "BLOCK_SIZE_M": 16,
+    "BLOCK_SIZE_N": 64,
+    "GROUP_SIZE_M": 1,
+    "num_stages": 2,
+    "num_warps": 4
+  },
+  "2": {
+    "BLOCK_SIZE_K": 64,
+    "BLOCK_SIZE_M": 32,
+    "BLOCK_SIZE_N": 64,
+    "GROUP_SIZE_M": 1,
+    "num_stages": 3,
+    "num_warps": 8
+  },
+  "284": {
+    "BLOCK_SIZE_K": 128,
+    "BLOCK_SIZE_M": 128,
+    "BLOCK_SIZE_N": 128,
+    "GROUP_SIZE_M": 16,
+    "num_stages": 3,
+    "num_warps": 4
+  },
+  "32": {
+    "BLOCK_SIZE_K": 64,
+    "BLOCK_SIZE_M": 32,
+    "BLOCK_SIZE_N": 128,
+    "GROUP_SIZE_M": 1,
+    "num_stages": 3,
+    "num_warps": 4
+  },
+  "4": {
+    "BLOCK_SIZE_K": 128,
+    "BLOCK_SIZE_M": 16,
+    "BLOCK_SIZE_N": 64,
+    "GROUP_SIZE_M": 1,
+    "num_stages": 3,
+    "num_warps": 4
+  },
+  "568": {
+    "BLOCK_SIZE_K": 64,
+    "BLOCK_SIZE_M": 128,
+    "BLOCK_SIZE_N": 32,
+    "GROUP_SIZE_M": 1,
+    "num_stages": 2,
+    "num_warps": 4
+  },
+  "64": {
+    "BLOCK_SIZE_K": 64,
+    "BLOCK_SIZE_M": 64,
+    "BLOCK_SIZE_N": 32,
+    "GROUP_SIZE_M": 1,
+    "num_stages": 4,
+    "num_warps": 8
+  },
+  "71": {
+    "BLOCK_SIZE_K": 64,
+    "BLOCK_SIZE_M": 16,
+    "BLOCK_SIZE_N": 32,
+    "GROUP_SIZE_M": 1,
+    "num_stages": 4,
+    "num_warps": 8
+  },
+  "8": {
+    "BLOCK_SIZE_K": 64,
+    "BLOCK_SIZE_M": 32,
+    "BLOCK_SIZE_N": 64,
+    "GROUP_SIZE_M": 1,
+    "num_stages": 4,
+    "num_warps": 8
+  },
+  "triton_version": "3.6.0"
+}
