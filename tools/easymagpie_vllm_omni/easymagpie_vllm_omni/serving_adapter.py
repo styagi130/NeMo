@@ -72,6 +72,27 @@ def _build_adapter_cls() -> type:
             self._prompt_len_cache: dict[tuple[str, str], int] = {}
             self._model_config_cache: dict[str, Any] | None = None
             self._arch_cache: EasyMagpieOmniArch | None = None
+            self._speaker_lengths = {}
+            self._preload_speaker_lengths()
+
+        def _preload_speaker_lengths(self) -> None:
+            from easymagpie_vllm_omni.speakers import preload_speakers
+
+            try:
+                path = self._model_path()
+            except RuntimeError:
+                return  # Some callers provide the model metadata after construction.
+            try:
+                config = json.loads((Path(path) / "config.json").read_text())
+            except (OSError, ValueError):
+                return
+            if not isinstance(config, dict):
+                return
+            width = config.get("embedding_dim", config.get("hidden_size"))
+            self._speaker_lengths = {
+                speaker_id: (fingerprint, int(embedding.shape[0]))
+                for speaker_id, fingerprint, embedding in preload_speakers(path, width=width)
+            }
 
         def _model_path(self) -> str:
             if self._model_path_cache is not None:
@@ -105,12 +126,19 @@ def _build_adapter_cls() -> type:
             if cached is not None:
                 return cached
             from easymagpie_vllm_omni.easymagpie import EasyMagpieTTSForConditionalGeneration
+            from easymagpie_vllm_omni.speakers import speaker_fingerprint
 
-            plen = int(
-                EasyMagpieTTSForConditionalGeneration.get_prompt_len(
-                    speaker_id, self._model_path(), tokenize=self._tokenize(), context_text=context_text
+            path = Path(self._model_path()) / "speaker_embeddings" / f"{speaker_id}.pt"
+            prepared = self._speaker_lengths.get(speaker_id)
+            if prepared is not None and speaker_fingerprint(path) == prepared[0]:
+                task_len = int(int(self._model_config().get("num_task_embeddings", 0)) > 0)
+                plen = prepared[1] + task_len + len(list(self._tokenize()(context_text or _DEFAULT_CONTEXT_TEXT)))
+            else:
+                plen = int(
+                    EasyMagpieTTSForConditionalGeneration.get_prompt_len(
+                        speaker_id, self._model_path(), tokenize=self._tokenize(), context_text=context_text
+                    )
                 )
-            )
             self._prompt_len_cache[key] = plen
             return plen
 

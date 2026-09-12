@@ -85,6 +85,14 @@ Container caches and uploaded speaker samples default to writable `/tmp` paths.
 Override the cache variables with writable persistent mounts when reusing compilation caches.
 The launcher uses `exec` for signal forwarding; graceful shutdown still needs runtime validation.
 
+Known voices remain `speaker_embeddings/<voice>.pt`: a 2-D tensor or a dictionary's `speaker_encoding` tensor.
+Startup examines the first 64 sorted `.pt` entries, skips files over 16 MiB, and retains at most 16 MiB of
+converted voice buffers per LM; the API retains only frame counts. Invalid/unreadable voices do not block other
+voices. Skipped, late, or replaced voices load lazily on a new context/task cache miss; existing cached contexts
+keep their previous values. Loading uses `weights_only=True` and checks shape, finite values and dtype overflow
+before device transfer. These limits bound retained startup state, not peak deserialization memory. This moves
+cold voice work into startup without changing formats, default context, or promising warm throughput gains.
+
 ### Quick start — offline synthesis
 
 See the [`offline_demo.ipynb`](../../tutorials/tts/easymagpie_vllm_omni/offline_demo.ipynb) tutorial to check how
