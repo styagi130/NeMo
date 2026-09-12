@@ -31,6 +31,7 @@ from typing import Any, Optional
 
 import torch
 from easymagpie_vllm_omni.backbone_patches import (
+    patch_mamba_prefill_initial_states,
     patch_mamba_streaming_decode,
     patch_moe_routed_scale,
     patch_shared_expert_activation,
@@ -185,6 +186,7 @@ class EasyMagpieTTSForConditionalGeneration(
         # state_indices_tensor_d). Force single-token extends to classify as
         # decodes so FULL/FULL_DECODE_ONLY cudagraphs read the right Mamba slot.
         patch_mamba_streaming_decode()
+        patch_mamba_prefill_initial_states()
 
         # ── Local transformer (its own compile group / CUDA graph) ──────
         with set_model_tag("local_transformer"):
@@ -275,6 +277,8 @@ class EasyMagpieTTSForConditionalGeneration(
 
         # Keep assembled context/task caching independent of optional voice buffers.
         self._prefill_cache: dict[tuple, torch.Tensor] = {}
+        self._batch_text_prefill: dict[str, tuple[int, tuple[int, ...], torch.Tensor]] = {}
+        self._batch_decode = {}
         self._speaker_buffers = {}
         for speaker_id, fingerprint, embedding in preload_speakers(
             self.model_path, width=self.embedding_dim, dtype=dtype
@@ -352,7 +356,27 @@ class EasyMagpieTTSForConditionalGeneration(
                 break
         return None, None
 
-    def _get_query_dispatch(self):
+    @staticmethod
+    def _leading_decode_count(spans, num_queries, max_query_len):
+        if not isinstance(spans, (list, tuple)) or len(spans) != num_queries:
+            return None
+        end = num_decodes = longest = 0
+        for index, span in enumerate(spans):
+            if not isinstance(span, (list, tuple)) or len(span) != 2:
+                return None
+            start, stop = span
+            if type(start) is not int or type(stop) is not int or start != end or stop <= start:
+                return None
+            length = stop - start
+            if length == 1:
+                if index != num_decodes:
+                    return None
+                num_decodes += 1
+            end = stop
+            longest = max(longest, length)
+        return num_decodes if longest == max_query_len else None
+
+    def _get_query_dispatch(self, request_token_spans=None):
         """Return decode rows and the final row of each prefill query.
 
         * ``(None, 0, None)`` → run the local transformer on every token (a warm-up
@@ -375,10 +399,19 @@ class EasyMagpieTTSForConditionalGeneration(
         if max_query_len is None or max_query_len == 1 or start_loc is None:
             return None, 0, None
 
-        tokens_per_req = start_loc[1:] - start_loc[:-1]
-        is_decode = tokens_per_req == 1
-        decode_token_indices = start_loc[:-1][is_decode]
-        prefill_last_indices = start_loc[1:][~is_decode] - 1
+        # The runner owns fresh CPU spans for this call. Only a proven decode
+        # prefix can replace dynamic CUDA boolean indexing with fixed slices.
+        num_decodes = None
+        if getattr(ctx, "ubatch_slices", None) is None:
+            num_decodes = self._leading_decode_count(request_token_spans, start_loc.shape[0] - 1, max_query_len)
+        if num_decodes is None:
+            tokens_per_req = start_loc[1:] - start_loc[:-1]
+            is_decode = tokens_per_req == 1
+            decode_token_indices = start_loc[:-1][is_decode]
+            prefill_last_indices = start_loc[1:][~is_decode] - 1
+        else:
+            decode_token_indices = start_loc[:num_decodes]
+            prefill_last_indices = start_loc[num_decodes + 1 :] - 1
 
         num_requests = decode_token_indices.shape[0]
         padded_num_requests = num_requests
@@ -425,7 +458,7 @@ class EasyMagpieTTSForConditionalGeneration(
         self._token_stop[:num_tokens].zero_()
         logits_index = kwargs.get("logits_index")
 
-        decode_idx, num_req, prefill_last_idx = self._get_query_dispatch()
+        decode_idx, num_req, prefill_last_idx = self._get_query_dispatch(kwargs.get("request_token_spans"))
 
         if decode_idx is not None:
             # Acoustic prediction is skipped on prefill rows. Clear their shared
@@ -602,6 +635,103 @@ class EasyMagpieTTSForConditionalGeneration(
     # ------------------------------------------------------------------
     # preprocess / postprocess
     # ------------------------------------------------------------------
+
+    @torch.no_grad()
+    def preprocess_batch(self, req_ids, model_intermediate_buffer, device) -> None:
+        """Prepare batch-owned inputs; the scalar hook owns phase and row placement."""
+        self._batch_text_prefill = {}
+        self._batch_decode = {}
+        entries = {}
+        infos = {}
+        for request_id in req_ids:
+            info = model_intermediate_buffer.get(request_id)
+            if not isinstance(request_id, str) or not isinstance(info, dict):
+                continue
+            nested = info.get("additional_information")
+            if isinstance(nested, dict):
+                info = {**nested, **{k: v for k, v in info.items() if k != "additional_information"}}
+            infos[request_id] = info
+            key = self._text_prefill_key(info)
+            if key is not None:
+                entries[request_id] = key
+        self._prepare_batch_decode(infos, device)
+        if not entries:
+            return
+        count = self.arch.text_prefill_num
+        if self.has_phoneme and not 0 <= self.phonemes_delay < count:
+            return  # Preserve scalar validation when the actual prefill executes.
+        dtype = self._combined_embeddings.dtype
+        rows = torch.zeros((len(entries), count, self.embedding_dim), device=device, dtype=dtype)
+        ids, destinations = [], []
+        for index, (_, prefix) in enumerate(entries.values()):
+            ids.extend(prefix)
+            destinations.extend(index * count + offset for offset in range(len(prefix)))
+        if ids:
+            embeddings = self.text_embedding(torch.tensor(ids, device=device, dtype=torch.long)).to(dtype)
+            rows.flatten(0, 1).index_copy_(0, torch.tensor(destinations, device=device, dtype=torch.long), embeddings)
+        if self.has_phoneme:
+            bos = torch.full(
+                (1, self.arch.phoneme_stacking_factor), self.phoneme_bos_id, device=device, dtype=torch.long
+            )
+            rows[:, self.phonemes_delay] += self._embed_phoneme(bos).to(dtype)
+        self._batch_text_prefill = {
+            request_id: (*key, rows[index]) for index, (request_id, key) in enumerate(entries.items())
+        }
+
+    def _text_prefill_key(self, info):
+        """Conservative preparation eligibility, never a prefill/decode classifier."""
+        offset = info.get("prefill_offset", 0)
+        if offset is not None and (type(offset) is not int or offset != 0):
+            return None
+        count = info.get("text_prefill_num", 0)
+        if type(count) is not int or count <= 0 or count != self.arch.text_prefill_num:
+            return None
+        prefix = info.get("prefill_text_tokens")
+        if prefix is None:
+            prefix = ()
+        if not isinstance(prefix, (list, tuple)) or len(prefix) > count:
+            return None
+        if any(type(token) is not int or not 0 <= token < self.text_embedding.num_embeddings for token in prefix):
+            return None
+        return count, tuple(prefix)
+
+    def _prepare_batch_decode(self, infos, device) -> None:
+        """Batch feedback calculations without choosing request rows or phases."""
+        if not infos:
+            return
+        zeros = torch.zeros((len(infos), 1, self.embedding_dim), device=device, dtype=self._combined_embeddings.dtype)
+        self._batch_decode = {request_id: (zeros[i], None) for i, request_id in enumerate(infos)}
+        entries = [
+            (request_id, key)
+            for request_id, info in infos.items()
+            if (key := self._decode_phoneme_key(info, device)) is not None
+        ]
+        if not entries:
+            return
+        phonemes = torch.stack([key[1].reshape(-1) for _, key in entries])
+        old_ended = torch.stack([key[2].reshape(()) for _, key in entries])
+        valid = (~old_ended).to(torch.long)
+        ended = old_ended | (phonemes == self.phoneme_eos_id).any(dim=1)
+        for i, (request_id, key) in enumerate(entries):
+            zero, _ = self._batch_decode[request_id]
+            self._batch_decode[request_id] = (zero, (key, valid[i], ended[i]))
+
+    def _decode_phoneme_key(self, info, device):
+        offset = info.get("decode_offset", 0)
+        if not self.has_phoneme or type(offset) is not int or offset <= self.phonemes_delay:
+            return None
+        phonemes, ended = info.get("last_phoneme_token"), info.get("phoneme_ended")
+        for value, dtype, size in ((phonemes, torch.long, self.arch.phoneme_stacking_factor), (ended, torch.bool, 1)):
+            if (
+                not isinstance(value, torch.Tensor)
+                or value.layout != torch.strided
+                or value.device != device
+                or value.dtype != dtype
+                or value.numel() != size
+                or not value.is_contiguous()
+            ):
+                return None
+        return offset, phonemes, ended, self.phoneme_eos_id
 
     def preprocess(
         self,
@@ -802,6 +932,18 @@ class EasyMagpieTTSForConditionalGeneration(
         assert len(prefix_ids) <= text_prefill_num, (
             f"EasyMagpieTTS got {len(prefix_ids)} prefill text tokens for " f"text_prefill_num={text_prefill_num}"
         )
+        request_id = info_dict.get("request_id")
+        prepared = (
+            getattr(self, "_batch_text_prefill", {}).pop(request_id, None) if isinstance(request_id, str) else None
+        )
+        if prepared is not None:
+            count, prefix, target = prepared
+            if (
+                self._text_prefill_key(info_dict) == (count, prefix)
+                and target.device == device
+                and target.dtype == dtype
+            ):
+                return target
         rows = torch.zeros((text_prefill_num, self.embedding_dim), device=device, dtype=dtype)
         if prefix_ids:
             ids = torch.tensor(prefix_ids, device=device, dtype=torch.long)
@@ -990,6 +1132,9 @@ class EasyMagpieTTSForConditionalGeneration(
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
         decode_offset = int(info_dict.get("decode_offset", 0) or 0)
         info_update: dict[str, Any] = {"decode_offset": decode_offset + 1}
+        request_id = info_dict.get("request_id")
+        prepared = getattr(self, "_batch_decode", {}).pop(request_id, None) if isinstance(request_id, str) else None
+        zero, prepared_phoneme = prepared if prepared is not None else (None, None)
 
         # ── Text channel ── (delay 0: one subword per step from step 0). The text
         # stream leads the phoneme/audio streams by their respective delays. The
@@ -1026,10 +1171,11 @@ class EasyMagpieTTSForConditionalGeneration(
             if appended:
                 info_update["text_tokens"] = text_tokens
         if decode_offset < len(text_tokens):
-            self._dec_text_tokens[start] = int(text_tokens[decode_offset])
-            self._dec_text_mask[start] = 1
+            # fill_ avoids the synchronous host-to-device copy of scalar assignment.
+            self._dec_text_tokens[start].fill_(int(text_tokens[decode_offset]))
+            self._dec_text_mask[start].fill_(1)
         else:
-            self._dec_text_mask[start] = 0
+            self._dec_text_mask[start].fill_(0)
 
         # ── Phoneme channel ── opens at decode step == ``phonemes_delay`` (seeded
         # with phoneme BOS), then feeds back the previous step's prediction, and
@@ -1039,7 +1185,7 @@ class EasyMagpieTTSForConditionalGeneration(
                 info_dict.get("phoneme_ended", False), device=device, dtype=torch.bool
             ).reshape(())
             if decode_offset < self.phonemes_delay:
-                self._dec_phoneme_valid[start] = 0
+                self._dec_phoneme_valid[start].fill_(0)
             elif decode_offset == self.phonemes_delay:
                 self._dec_phoneme_tokens[start].fill_(self.phoneme_bos_id)
                 self._dec_phoneme_valid[start].copy_((~phoneme_ended).to(torch.long))
@@ -1048,10 +1194,23 @@ class EasyMagpieTTSForConditionalGeneration(
                 if isinstance(last_phon, torch.Tensor) and last_phon.numel() > 0:
                     p = last_phon.to(device=device, dtype=torch.long).reshape(-1)[: self.arch.phoneme_stacking_factor]
                     self._dec_phoneme_tokens[start, : p.shape[0]].copy_(p)
-                    self._dec_phoneme_valid[start].copy_((~phoneme_ended).to(torch.long))
-                    phoneme_ended = phoneme_ended | (p == self.phoneme_eos_id).any()
+                    key = self._decode_phoneme_key(info_dict, device) if prepared_phoneme is not None else None
+                    saved, valid, ended = prepared_phoneme if prepared_phoneme is not None else (None, None, None)
+                    if (
+                        key is not None
+                        and saved[0] == key[0]
+                        and saved[3] == key[3]
+                        and saved[1] is key[1]
+                        and saved[2] is key[2]
+                    ):
+                        # Previous-frame feedback owns its storage until scalar consumption.
+                        self._dec_phoneme_valid[start].copy_(valid)
+                        phoneme_ended = ended
+                    else:
+                        self._dec_phoneme_valid[start].copy_((~phoneme_ended).to(torch.long))
+                        phoneme_ended = phoneme_ended | (p == self.phoneme_eos_id).any()
                 else:
-                    self._dec_phoneme_valid[start] = 0
+                    self._dec_phoneme_valid[start].fill_(0)
             info_update["phoneme_ended"] = phoneme_ended
 
         # ── Audio channel ── opens at decode step == ``speech_delay`` (seeded with
@@ -1061,23 +1220,29 @@ class EasyMagpieTTSForConditionalGeneration(
         # stability but its codes for those frames are discarded by the caller and
         # never fed back here.
         if decode_offset < self.speech_delay:
-            self._dec_audio_valid[start] = 0
+            self._dec_audio_valid[start].fill_(0)
         elif decode_offset == self.speech_delay:
             self._dec_audio_codes[start].fill_(self.arch.audio_bos_id)
-            self._dec_audio_valid[start] = 1
+            self._dec_audio_valid[start].fill_(1)
         else:
             last_codes = info_dict.get("last_audio_codes")
             if isinstance(last_codes, torch.Tensor) and last_codes.numel() > 0:
                 c = last_codes.to(device=device, dtype=torch.long).reshape(-1)[: self.num_codebooks]
                 self._dec_audio_codes[start, : c.shape[0]].copy_(c)
-                self._dec_audio_valid[start] = 1
+                self._dec_audio_valid[start].fill_(1)
             else:
                 # Fallback (should not happen once audio has started): seed BOS.
                 self._dec_audio_codes[start].fill_(self.arch.audio_bos_id)
-                self._dec_audio_valid[start] = 1
+                self._dec_audio_valid[start].fill_(1)
 
-        inputs_embeds_out = torch.zeros((1, self.embedding_dim), device=device, dtype=self._combined_embeddings.dtype)
-        return input_ids, inputs_embeds_out, info_update
+        if (
+            zero is None
+            or zero.shape != (1, self.embedding_dim)
+            or zero.device != device
+            or zero.dtype != self._combined_embeddings.dtype
+        ):
+            zero = torch.zeros((1, self.embedding_dim), device=device, dtype=self._combined_embeddings.dtype)
+        return input_ids, zero, info_update
 
     def postprocess(self, hidden_states: torch.Tensor, multimodal_outputs: Optional[dict[str, Any]] = None, **_: Any):
         """Stash the last frame's codes (and phoneme) for the next decode step."""

@@ -16,13 +16,15 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from itertools import accumulate
 from typing import Any
 
 import torch
 import torch.nn as nn
 from easymagpie_vllm_omni.codec.config import EasyMagpieCodecConfig
-from easymagpie_vllm_omni.codec.packed import PackedEasyMagpieCodec
+from easymagpie_vllm_omni.codec.packed import CodecStateLayer, CodecStateMetadata, PackedEasyMagpieCodec
 from vllm.config import VllmConfig
+from vllm.forward_context import set_forward_context
 from vllm.model_executor.layers.mamba.mamba_utils import MambaStateCopyFuncCalculator
 from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm_omni.model_executor.models.output_templates import OmniOutput
@@ -228,3 +230,83 @@ class EasyMagpieCodecForConditionalGeneration(nn.Module):
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         mapped = ((f"codec.{name}" if name.startswith("audio_decoder.") else name, tensor) for name, tensor in weights)
         return AutoWeightsLoader(self, skip_prefixes=["codec.dequantizer."]).load_weights(mapped)
+
+    @torch.inference_mode()
+    def warmup_codec(self) -> None:
+        """Compile packed paths before readiness, using only temporary state pages."""
+        connector = getattr(self.vllm_config.model_config, "stage_connector_config", None) or {}
+        extra = connector.get("extra") or {}
+        sizes = {int(extra.get("codec_chunk_frames", 25))}
+        startup_sizes = set()
+        for key in ("codec_startup_chunk_frames", "codec_busy_startup_chunk_frames"):
+            schedule = [int(size) for size in extra.get(key, [])]
+            sizes.update(schedule)
+            if schedule:
+                startup_sizes.add(schedule[0])
+        if any(size <= 0 for size in sizes):
+            raise ValueError("codec warmup chunk sizes must be positive")
+
+        cases = [((size, size), decodes, False) for size in sorted(sizes) for decodes in (0, 1)]
+        # Retain synthetic compilation coverage even for smaller scheduler limits.
+        # A decode prefix covers the unaligned prefill page-index view.
+        cases += [((2, 4, 8), 0, False), ((2, 4, 8), 0, True), ((2, 4, 8), 1, True), ((), 4, True)]
+        scheduler = self.vllm_config.scheduler_config
+        for size in sorted(startup_sizes):
+            limit = min(scheduler.max_num_seqs, scheduler.max_num_batched_tokens // size)
+            # N2 is already covered above; absent startup schedules add no sweep.
+            cases.extend(((size,) * batch, 0, False) for batch in range(1, limit + 1) if batch != 2)
+        pages = max(len(lengths) + decodes for lengths, decodes, _ in cases)
+
+        layers = [layer for layer in self.codec.modules() if isinstance(layer, CodecStateLayer)]
+        original = [layer.kv_cache for layer in layers]
+        device = original[0][0].device
+        try:
+            for layer, cache in zip(layers, original, strict=True):
+                state = cache[0]
+                layer.kv_cache = [
+                    torch.empty_strided(
+                        (pages, state.shape[1]), state.stride(), dtype=state.dtype, device=device
+                    ).zero_()
+                ]
+            for lengths, decodes, initial in cases:
+                metadata = _warmup_metadata(lengths, decodes, initial, device)
+                codes = torch.zeros(
+                    (sum(lengths) + decodes, self.config.num_stacked_codebooks), dtype=torch.long, device=device
+                )
+                with set_forward_context({layer.prefix: metadata for layer in layers}, self.vllm_config):
+                    self.codec(codes)
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+        finally:
+            for layer, cache in zip(layers, original, strict=True):
+                layer.kv_cache = cache
+
+
+def _warmup_metadata(lengths, decodes, initial, device) -> CodecStateMetadata:
+    prefills = len(lengths)
+    pages = torch.arange(prefills + decodes, dtype=torch.int32, device=device)
+    uniform = bool(lengths) and len(set(lengths)) == 1
+    return CodecStateMetadata(
+        num_prefills=prefills,
+        num_prefill_tokens=sum(lengths),
+        num_decodes=decodes,
+        num_decode_tokens=decodes,
+        num_reqs=prefills + decodes,
+        has_initial_states_p=torch.full((prefills,), initial, dtype=torch.bool, device=device),
+        query_start_loc_p=torch.tensor([0, *accumulate(lengths)], dtype=torch.int32, device=device),
+        num_computed_tokens_p=None,
+        state_indices_tensor_p=pages[decodes:],
+        state_indices_tensor_d=pages[:decodes].reshape(-1, 1),
+        query_start_loc_d=None,
+        num_accepted_tokens=None,
+        block_idx_last_scheduled_token=None,
+        block_idx_first_scheduled_token_p=None,
+        block_idx_last_computed_token=None,
+        block_idx_last_scheduled_token_prev_step=None,
+        seq_lens=torch.tensor(
+            [2] * decodes + [size + int(initial) for size in lengths], dtype=torch.int32, device=device
+        ),
+        codec_uniform=(not decodes and uniform) or not prefills,
+        codec_prefill_uniform=uniform,
+        codec_max_query_len=max(lengths, default=1),
+    )
