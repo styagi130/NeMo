@@ -42,7 +42,7 @@ PYTHONPATH="$PWD" python tools/easymagpie_vllm_omni/scripts/convert_to_vllm.py \
 
 ### Setup the serving environment
 
-Serving needs a GPU, matching **vLLM 0.24 / vLLM-Omni 0.24** versions, and this package.
+Serving needs a GPU, matching **vLLM 0.26.0 / vLLM-Omni 0.26.0** versions, and this package.
 It does not need NeMo after conversion:
 
 ```bash
@@ -69,6 +69,33 @@ better kernels; for an explicit sweep, run `python scripts/tune_mamba_ssu.py --m
 
 EasyMagpie audio is watermarked with [Perth](https://github.com/resemble-ai/perth) after native codec decoding and before float
 PCM leaves the vLLM-Omni codec stage. Pass `NEMOTRON_TTS_PERTH_WATERMARK=0` to disable it.
+
+### Standalone serving image
+
+Build from the Speech repository root; the image installs this entire package on
+the pinned upstream stack, without a nemotron-speech overlay:
+
+```bash
+docker build -f tools/easymagpie_vllm_omni/Dockerfile -t easymagpie-omni .
+docker run --rm --gpus all --ipc=host -p 8091:8091 \
+  -v /absolute/path/to/converted_model:/model:ro easymagpie-omni /model 8091
+```
+
+The image builds pinned Cairo bindings with builder-only native prerequisites and aligns `nixl-cu13` with
+the base's NIXL 1.3.1 packages; the final install must pass `pip check`. This does not validate optional NIXL
+GPU transfers. The inherited system PyGObject binding targets CPython 3.10 and cannot load in CPython 3.12;
+it is not required by EasyMagpie's shared-memory pipeline.
+
+The default profile has one LM and one FP32 codec, each with capacity 32. It is
+not the tuned H100 BS128 profile. This source accepts converted `.pt` speaker
+contexts; do not replace an existing speaker bundle without a separate migration.
+The codec retains per-stream state between chunks, so streams waiting for their
+next chunk still count toward its capacity. This prevents parked streams from
+being re-admitted with already-decoded history as a new chunk.
+Container caches and uploaded speaker samples default to writable `/tmp` paths.
+Override the cache variables with writable persistent mounts when reusing compilation caches.
+The launcher uses `exec` for signal forwarding; graceful shutdown still needs runtime validation.
+
 
 ### Quick start — offline synthesis
 
@@ -161,6 +188,24 @@ APIs are available:
   or one request-time `ref_audio`.
 - `WS /v1/audio/speech/stream` with incremental text/token updates and
   asynchronous PCM audio output.
+
+The upstream HTTP `max_new_tokens` field limits Stage 0 only; it does not change
+the codec limit or shared sampling defaults. Raw PCM does not expose a backend
+finish reason, so a successful response alone cannot prove natural EOS.
+WebSocket `input.done` drains queued text and codec output before normal completion;
+empty audio payloads are not sent as PCM frames. Intermediate segment boundaries
+remain resumable and must not replay consumed audio.
+WebSocket `max_new_tokens` is a session-wide Stage 0 budget across text updates
+and the acoustic tail. At the limit, queued text is drained through `input.done`
+without generating extra tokens; the final codec payload still completes normally.
+Codec completion follows the connector's terminal message, even when no audio
+remains to flush. A streaming session's final text-input marker does not submit
+another codec placeholder, so late input bookkeeping cannot reopen the request.
+
+HTTP `extra_params.context_text` conditions and sizes the same prefill context;
+omitted, null or empty values retain `[EN]`. Other value types are rejected before
+generation. The upstream WebSocket configuration does not expose this override
+and ignores unknown configuration keys; WebSocket context remains `[EN]`.
 
 Converted checkpoints with `enable_phoneme_text_input=true` accept inline IPA
 spans such as `Turn <bop>lɛft<eop> here`. The markers are syntax only: ordinary

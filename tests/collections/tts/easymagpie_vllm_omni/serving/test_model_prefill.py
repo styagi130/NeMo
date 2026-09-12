@@ -534,3 +534,30 @@ def test_first_agent_decode_uses_user_speaking_end_token():
     model.has_phoneme = False
     model._combined_embeddings = torch.zeros(1, 3)
     model._dec_text_tokens = torch.zeros(1, dtype=torch.long)
+
+
+def test_load_weights_maps_hf_backbone_names_with_auto_loader():
+    model = EasyMagpieTTSForConditionalGeneration.__new__(EasyMagpieTTSForConditionalGeneration)
+    nn.Module.__init__(model)
+    model.backbone = nn.Module()
+    model.backbone.embed_tokens = nn.Embedding(4, 3)
+    model.backbone.layers = nn.ModuleList([nn.Module()])
+    model.backbone.layers[0].mixer = nn.Module()
+    model.backbone.layers[0].mixer.A = nn.Parameter(torch.zeros(3))
+    model.text_embedding = nn.Embedding(4, 3)
+    model.code_predictor = SimpleNamespace(init_forbidden_mask=lambda: None)
+    embeddings = torch.arange(12, dtype=torch.float32).reshape(4, 3)
+    mamba_a = torch.tensor([1.0, 2.0, 3.0])
+
+    loaded = model.load_weights(
+        [
+            ("decoder.embeddings.weight", embeddings),
+            ("decoder.layers.0.mixer.A_log", mamba_a),
+            ("text_embedding.weight", embeddings + 1),
+        ]
+    )
+
+    assert loaded == {"backbone.embed_tokens.weight", "backbone.layers.0.mixer.A", "text_embedding.weight"}
+    torch.testing.assert_close(model.backbone.embed_tokens.weight, embeddings)
+    torch.testing.assert_close(model.backbone.layers[0].mixer.A, mamba_a)
+    torch.testing.assert_close(model.text_embedding.weight, embeddings + 1)
