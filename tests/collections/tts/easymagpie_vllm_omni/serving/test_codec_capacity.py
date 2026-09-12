@@ -20,6 +20,7 @@ from unittest.mock import Mock
 
 import pytest
 import torch
+from easymagpie_vllm_omni.codec.config import EasyMagpieCodecConfig
 from easymagpie_vllm_omni.codec.model import EasyMagpieCodecForConditionalGeneration
 from easymagpie_vllm_omni.pipeline import EASYMAGPIE_PIPELINE
 from easymagpie_vllm_omni.scheduler import EasyMagpieCodecScheduler, _poll_native_codec_chunk
@@ -142,11 +143,18 @@ def _validate_payloads(scheduler, output):
         offset += count
     codec = object.__new__(EasyMagpieCodecForConditionalGeneration)
     torch.nn.Module.__init__(codec)
-    codec.config = SimpleNamespace(num_stacked_codebooks=2)
-    packed, frames = codec._payload_codes(infos, torch.device("cpu"), spans)
+    codec.config = EasyMagpieCodecConfig(input_dim=5, num_codebooks=1)
+    packed, frames, valid_samples = codec._payload_codes(infos, torch.device("cpu"), spans)
     assert frames == list(output.num_scheduled_tokens.values())
+    assert valid_samples == [count * codec.config.samples_per_frame for count in frames]
     if expected:
         torch.testing.assert_close(packed, torch.cat(expected), rtol=0, atol=0)
+
+
+def _audio_rows(request_id, start, frames):
+    identity = (ord(request_id[0]) - ord("a")) * 128 + int(request_id[1:])
+    positions = torch.arange(start, start + frames)
+    return torch.stack((torch.full_like(positions, identity), positions), dim=1)
 
 
 def _deliver(adapter, request, payloads, frames):
@@ -154,7 +162,7 @@ def _deliver(adapter, request, payloads, frames):
     if frames is None:
         payloads[key] = ({"meta": {"finished": True}}, 1)
     else:
-        audio = torch.arange(frames * 2).view(frames, 2) + int(request.request_id[1:]) * 100
+        audio = _audio_rows(request.request_id, request.num_computed_tokens, frames)
         payloads[key] = ({"codes": {"audio": audio}}, audio.numel() * audio.element_size())
     assert _poll_native_codec_chunk(adapter, request)
     if frames is not None:
@@ -229,7 +237,7 @@ def _scheduler(capacity, retains_state):
             request_id = f"{group}{index}"
             request = Request(request_id, [0] * 6, SamplingParams(max_tokens=65536), None, resumable=True)
             request.external_req_id = request_id
-            audio = torch.arange(12).view(6, 2) + ord(group) * 1000 + index * 100
+            audio = _audio_rows(request_id, 0, 6)
             request.additional_information = {"codes": {"audio": audio}}
             request.status = RequestStatus.RUNNING if group == "a" else RequestStatus.WAITING
             request.num_computed_tokens = 6 if group == "a" else 0
