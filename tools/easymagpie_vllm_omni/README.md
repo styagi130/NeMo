@@ -93,6 +93,19 @@ keep their previous values. Loading uses `weights_only=True` and checks shape, f
 before device transfer. These limits bound retained startup state, not peak deserialization memory. This moves
 cold voice work into startup without changing formats, default context, or promising warm throughput gains.
 
+### Batch preparation and startup compilation
+
+The runner batches compatible text/phoneme preparation and copies feedback into owned storage before async
+output. Exact request spans avoid dynamic decode indexing when eligible; other layouts keep the existing path.
+Mamba prefill flags use equivalent CPU metadata, and ragged codec convolution retains IEEE precision with a
+contiguous kernel/input/output weight layout. These changes preserve the API, context and sampling semantics.
+
+Before readiness, the codec warms its packed kernels with temporary state. When
+a startup ramp is configured, it also warms that ramp's first chunk at each
+feasible batch size, bounded by the codec request and token limits. This adds
+startup work and may retain library caches; measure startup memory as well as
+steady-state performance. Model weights and live request state are unchanged.
+
 ### Quick start — offline synthesis
 
 See the [`offline_demo.ipynb`](../../tutorials/tts/easymagpie_vllm_omni/offline_demo.ipynb) tutorial to check how

@@ -20,6 +20,8 @@ per-chunk EasyMagpie text and conditioning metadata.
 from __future__ import annotations
 
 from collections.abc import Mapping
+from contextlib import contextmanager
+from threading import local
 from typing import Any
 
 import torch
@@ -65,6 +67,81 @@ def merge_streaming_additional_information(
 
 class EasyMagpieGPUARModelRunner(GPUARModelRunner):
     """GPU AR runner that restores streaming chunk metadata propagation."""
+
+    def _preprocess(self, *args, **kwargs):
+        with self._batch_feedback_copies("before_preprocess"):
+            return super()._preprocess(*args, **kwargs)
+
+    def _maybe_run_batch_preprocess(self, req_ids, device):
+        result = super()._maybe_run_batch_preprocess(req_ids, device)
+        context = getattr(self, "_feedback_copy_context", None)
+        if getattr(context, "phase", None) == "before_preprocess":
+            # Incoming metadata and the batch hook must see immediate stores.
+            context.phase = "preprocess"
+        return result
+
+    def _maybe_run_eager_omni_postprocess_before_async_output(self, **kwargs):
+        with self._batch_feedback_copies("postprocess"):
+            return super()._maybe_run_eager_omni_postprocess_before_async_output(**kwargs)
+
+    @contextmanager
+    def _batch_feedback_copies(self, phase):
+        # Feedback sources stay stable until this thread finishes preparation
+        # or postprocessing. Other threads keep immediate owning stores.
+        context = getattr(self, "_feedback_copy_context", None)
+        if context is None:
+            context = self.__dict__.setdefault("_feedback_copy_context", local())
+        previous = getattr(context, "pending", None), getattr(context, "phase", None)
+        if previous[0]:
+            # A nested scope must observe earlier writes, never overwrite them later.
+            self._flush_feedback_copies(previous[0])
+        context.pending = pending = {}
+        context.phase = phase
+        try:
+            yield
+        finally:
+            context.pending, context.phase = previous
+            self._flush_feedback_copies(pending)
+
+    @staticmethod
+    def _flush_feedback_copies(pending):
+        groups = {}
+        for dest, key, value in pending.values():
+            groups.setdefault((value.device, value.dtype), []).append((dest, key, value))
+        updates = []
+        for entries in groups.values():
+            packed = torch.cat([value.reshape(-1) for _, _, value in entries])
+            parts = packed.split([value.numel() for _, _, value in entries])
+            updates.extend(
+                (dest, key, part.view(value.shape)) for (dest, key, value), part in zip(entries, parts, strict=True)
+            )
+        # Each view owns a disjoint part of a fresh snapshot, never reused
+        # model scratch. Finish these copies before async output can start.
+        for dest, key, value in updates:
+            dest[key] = value
+        pending.clear()
+
+    def _store_value(self, dest: dict, key: str, value: Any, gpu_keys: set) -> None:
+        context = getattr(self, "_feedback_copy_context", None)
+        pending = getattr(context, "pending", None)
+        phase = getattr(context, "phase", None)
+        if pending is not None and phase != "before_preprocess":
+            target = (id(dest), key)
+            pending.pop(target, None)
+            if (
+                key in gpu_keys
+                and isinstance(value, torch.Tensor)
+                and value.layout == torch.strided
+                and not value.is_quantized
+                and value.is_contiguous()
+                and (
+                    phase != "preprocess"
+                    or (key == "phoneme_ended" and value.dtype == torch.bool and value.numel() == 1)
+                )
+            ):
+                pending[target] = (dest, key, value.detach())
+                return
+        return super()._store_value(dest, key, value, gpu_keys)
 
     def _build_omni_async_snapshot_payload(
         self,
@@ -164,6 +241,10 @@ class EasyMagpieCodecGPUGenerationModelRunner(GPUGenerationModelRunner):
 
 class EasyMagpieCodecGPUGenerationWorker(GPUGenerationWorker):
     """Construct the codec runner through the upstream worker."""
+
+    def compile_or_warm_up_model(self):
+        self.get_model().warmup_codec()
+        return super().compile_or_warm_up_model()
 
     def init_device(self):
         original_runner_cls = gpu_generation_worker.GPUGenerationModelRunner

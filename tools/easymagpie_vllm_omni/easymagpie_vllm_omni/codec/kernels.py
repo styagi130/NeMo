@@ -190,56 +190,57 @@ def _packed_causal_conv1d_kernel(
         base_end = tl.load(query_start_loc_ptr + seq_idx + 1)
         has_initial = tl.load(has_initial_ptr + seq_idx)
     sequence_length = (base_end - base_start) * time_factor
-    sequence_start = base_start * time_factor
-    page = tl.load(cache_indices_ptr + seq_idx)
-    history = kernel_size - 1
+    if tl.program_id(1) * BLOCK_T < sequence_length:
+        sequence_start = base_start * time_factor
+        page = tl.load(cache_indices_ptr + seq_idx)
+        history = kernel_size - 1
 
-    accumulator = tl.zeros((BLOCK_T, BLOCK_O), dtype=tl.float32)
-    for kernel_offset in range(kernel_size):
-        source_offsets = token_offsets - (history - kernel_offset)
-        current_mask = source_offsets >= 0
-        for input_block in range(tl.cdiv(input_channels, BLOCK_I)):
-            channels = input_block * BLOCK_I + input_offsets
-            x_offsets = (sequence_start + source_offsets[:, None]) * input_channels + channels[None, :]
-            current = tl.load(
-                x_ptr + x_offsets,
-                mask=(token_offsets[:, None] < sequence_length)
-                & current_mask[:, None]
-                & (channels[None, :] < input_channels),
-                other=0.0,
-            )
-            state_row = history + source_offsets
-            state_offsets = page * stride_state_page + state_row[:, None] * input_channels + channels[None, :]
-            previous = tl.load(
-                state_ptr + state_offsets,
-                mask=(token_offsets[:, None] < sequence_length)
-                & (~current_mask[:, None])
-                & (channels[None, :] < input_channels)
-                & (has_initial != 0),
-                other=0.0,
-            )
-            values = tl.where(current_mask[:, None], current, previous)
-            weight_offsets = (
-                output_offsets[None, :] * input_channels * kernel_size
-                + channels[:, None] * kernel_size
-                + kernel_offset
-            )
-            weights = tl.load(
-                weight_ptr + weight_offsets,
-                mask=(channels[:, None] < input_channels) & (output_offsets[None, :] < output_channels),
-                other=0.0,
-            )
-            accumulator += tl.dot(values, weights, input_precision="ieee")
+        accumulator = tl.zeros((BLOCK_T, BLOCK_O), dtype=tl.float32)
+        for kernel_offset in range(kernel_size):
+            source_offsets = token_offsets - (history - kernel_offset)
+            current_mask = source_offsets >= 0
+            for input_block in range(tl.cdiv(input_channels, BLOCK_I)):
+                channels = input_block * BLOCK_I + input_offsets
+                x_offsets = (sequence_start + source_offsets[:, None]) * input_channels + channels[None, :]
+                current = tl.load(
+                    x_ptr + x_offsets,
+                    mask=(token_offsets[:, None] < sequence_length)
+                    & current_mask[:, None]
+                    & (channels[None, :] < input_channels),
+                    other=0.0,
+                )
+                state_row = history + source_offsets
+                state_offsets = page * stride_state_page + state_row[:, None] * input_channels + channels[None, :]
+                previous = tl.load(
+                    state_ptr + state_offsets,
+                    mask=(token_offsets[:, None] < sequence_length)
+                    & (~current_mask[:, None])
+                    & (channels[None, :] < input_channels)
+                    & (has_initial != 0),
+                    other=0.0,
+                )
+                values = tl.where(current_mask[:, None], current, previous)
+                weight_offsets = (
+                    kernel_offset * input_channels * output_channels
+                    + channels[:, None] * output_channels
+                    + output_offsets[None, :]
+                )
+                weights = tl.load(
+                    weight_ptr + weight_offsets,
+                    mask=(channels[:, None] < input_channels) & (output_offsets[None, :] < output_channels),
+                    other=0.0,
+                )
+                accumulator += tl.dot(values, weights, input_precision="ieee")
 
-    if HAS_BIAS:
-        bias = tl.load(bias_ptr + output_offsets, mask=output_offsets < output_channels, other=0.0)
-        accumulator += bias[None, :]
-    output_indices = (sequence_start + token_offsets[:, None]) * output_channels + output_offsets[None, :]
-    tl.store(
-        output_ptr + output_indices,
-        accumulator,
-        mask=(token_offsets[:, None] < sequence_length) & (output_offsets[None, :] < output_channels),
-    )
+        if HAS_BIAS:
+            bias = tl.load(bias_ptr + output_offsets, mask=output_offsets < output_channels, other=0.0)
+            accumulator += bias[None, :]
+        output_indices = (sequence_start + token_offsets[:, None]) * output_channels + output_offsets[None, :]
+        tl.store(
+            output_ptr + output_indices,
+            accumulator,
+            mask=(token_offsets[:, None] < sequence_length) & (output_offsets[None, :] < output_channels),
+        )
 
 
 @triton.jit
@@ -422,6 +423,8 @@ def update_packed_state(
     is_decode: bool,
 ) -> None:
     """Update fixed-history state pages from packed layer inputs."""
+    if history == 0:
+        return
     num_sequences = cache_indices.numel() if is_decode else query_start_loc.numel() - 1
     metadata_placeholder = cache_indices
     query_start_loc_ptr = metadata_placeholder if is_decode else query_start_loc
@@ -459,8 +462,8 @@ def packed_causal_conv1d(
     if not inputs.is_cuda:
         raise ValueError("packed_causal_conv1d is a CUDA kernel")
     inputs = inputs.contiguous()
-    weight = weight.contiguous()
     output_channels, input_channels, kernel_size = weight.shape
+    weight = weight.permute(2, 1, 0).contiguous()
     outputs = torch.empty((inputs.shape[0], output_channels), dtype=inputs.dtype, device=inputs.device)
     num_sequences = cache_indices.numel() if is_decode else query_start_loc.numel() - 1
     if is_decode:
@@ -474,7 +477,7 @@ def packed_causal_conv1d(
     metadata_placeholder = cache_indices
     query_start_loc_ptr = metadata_placeholder if is_decode else query_start_loc
     has_initial_ptr = metadata_placeholder if is_decode else has_initial
-    block_t, block_i, block_o = 16, 32, 32
+    block_t, block_i, block_o = 16, 32, 64
     grid = (
         num_sequences,
         triton.cdiv(max_length, block_t),
