@@ -11,11 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Tests for the vLLM-Omni 0.24 async scheduler compatibility layer."""
+"""Tests for EasyMagpie streaming accounting on vLLM-Omni 0.26."""
 from __future__ import annotations
 
 import threading
-from collections import deque
+from collections import defaultdict, deque
 from types import SimpleNamespace
 
 import pytest
@@ -27,92 +27,13 @@ from easymagpie_vllm_omni.scheduler import (
 )
 from vllm.v1.request import RequestStatus
 from vllm_omni.core.sched.omni_ar_scheduler import OmniARAsyncScheduler
+from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler
 from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import OmniChunkTransferAdapter
 
 
-def test_no_stop_is_inert_for_non_resumable_requests(monkeypatch):
-    """A plain HTTP request never hits a segment stop, so the override must pass
-    ``super()`` through unchanged and leave request accounting untouched."""
-    scheduler = object.__new__(EasyMagpieARAsyncScheduler)
-    request = SimpleNamespace(
-        async_tokens_to_discard=0,
-        num_computed_tokens=20,
-        num_output_placeholders=0,
-    )
-
-    def fake_update_request_with_output(self, req, new_token_ids):
-        return new_token_ids, False  # no stop this step
-
-    def fake_update_from_output(self, scheduler_output, model_runner_output):
-        self._update_request_with_output(request, [7])
-        return "outputs"
-
-    monkeypatch.setattr(OmniARAsyncScheduler, "_update_request_with_output", fake_update_request_with_output)
-    monkeypatch.setattr(OmniARAsyncScheduler, "update_from_output", fake_update_from_output)
-
-    outputs = scheduler.update_from_output(None, None)
-
-    assert outputs == "outputs"
-    assert request.async_tokens_to_discard == 0
-    assert request.num_computed_tokens == 20
-    assert request.num_output_placeholders == 0
-
-
-def test_terminal_stop_without_discard_is_inert(monkeypatch):
-    """HTTP requests end on a normal audio-EOS stop (not a resumable segment
-    stop), so omni arms no discard and the override must not roll anything back."""
-    scheduler = object.__new__(EasyMagpieARAsyncScheduler)
-    request = SimpleNamespace(
-        async_tokens_to_discard=0,
-        num_computed_tokens=20,
-        num_output_placeholders=0,
-    )
-
-    def fake_update_request_with_output(self, req, new_token_ids):
-        req.num_output_placeholders = 0  # terminal stop, nothing else in flight
-        return new_token_ids, True
-
-    def fake_update_from_output(self, scheduler_output, model_runner_output):
-        self._update_request_with_output(request, [7])
-        return "outputs"  # omni does not arm a discard for a terminal stop
-
-    monkeypatch.setattr(OmniARAsyncScheduler, "_update_request_with_output", fake_update_request_with_output)
-    monkeypatch.setattr(OmniARAsyncScheduler, "update_from_output", fake_update_from_output)
-
-    outputs = scheduler.update_from_output(None, None)
-
-    assert outputs == "outputs"
-    assert request.async_tokens_to_discard == 0
-    assert request.num_computed_tokens == 20
-
-
-@pytest.mark.parametrize("remaining_placeholders", [0, 1, 2])
-def test_segment_stop_discards_and_rolls_back_exact_inflight_count(monkeypatch, remaining_placeholders):
-    scheduler = object.__new__(EasyMagpieARAsyncScheduler)
-    request = SimpleNamespace(
-        async_tokens_to_discard=0,
-        num_computed_tokens=20,
-        num_output_placeholders=remaining_placeholders + 1,
-    )
-
-    def fake_update_request_with_output(self, req, new_token_ids):
-        req.num_output_placeholders -= 1  # stopping token returned
-        return new_token_ids, True
-
-    def fake_update_from_output(self, scheduler_output, model_runner_output):
-        self._update_request_with_output(request, [7])
-        request.async_tokens_to_discard = 1
-        request.num_output_placeholders = 0
-        return "outputs"
-
-    monkeypatch.setattr(OmniARAsyncScheduler, "_update_request_with_output", fake_update_request_with_output)
-    monkeypatch.setattr(OmniARAsyncScheduler, "update_from_output", fake_update_from_output)
-
-    outputs = scheduler.update_from_output(None, None)
-
-    assert outputs == "outputs"
-    assert request.async_tokens_to_discard == remaining_placeholders
-    assert request.num_computed_tokens == 20 - remaining_placeholders
+def test_segment_stop_accounting_uses_upstream_026():
+    assert EasyMagpieARAsyncScheduler.update_from_output is OmniARAsyncScheduler.update_from_output
+    assert EasyMagpieARAsyncScheduler._update_request_with_output is OmniARAsyncScheduler._update_request_with_output
 
 
 def test_final_streaming_sentinel_marks_session_non_resumable(monkeypatch):
@@ -138,13 +59,14 @@ def test_empty_streaming_queue_remains_resumable_while_waiting(monkeypatch):
     assert request.resumable is True
 
 
-def test_resume_uses_exact_discard_count_and_forwards_chunk_metadata(monkeypatch):
+@pytest.mark.parametrize("outstanding", [0, 1, 2, 4])
+def test_resume_uses_exact_discard_count_and_forwards_chunk_metadata(monkeypatch, outstanding):
     scheduler = object.__new__(EasyMagpieARAsyncScheduler)
     scheduler.vllm_config = SimpleNamespace(model_config=SimpleNamespace(stage_id=0))
     session = SimpleNamespace(
         async_tokens_to_discard=0,
         num_computed_tokens=20,
-        num_output_placeholders=2,
+        num_output_placeholders=outstanding,
         num_tokens=23,
         max_tokens=1,
         additional_information={"text_token": [1]},
@@ -152,7 +74,7 @@ def test_resume_uses_exact_discard_count_and_forwards_chunk_metadata(monkeypatch
     update = SimpleNamespace(max_tokens=5, additional_information={"text_token": [2, 3]})
 
     def fake_update_request_as_session(self, req, streaming_update):
-        req.async_tokens_to_discard = 1
+        req.async_tokens_to_discard = int(req.num_output_placeholders > 0)
         req.num_computed_tokens -= req.num_output_placeholders
         req.num_output_placeholders = 0
 
@@ -160,10 +82,31 @@ def test_resume_uses_exact_discard_count_and_forwards_chunk_metadata(monkeypatch
 
     scheduler._update_request_as_session(session, update)
 
-    assert session.async_tokens_to_discard == 2
-    assert session.num_computed_tokens == 18
+    assert session.async_tokens_to_discard == outstanding
+    assert session.num_computed_tokens == 20 - outstanding
     assert session.max_tokens == 5
     assert session.additional_information == {"text_token": [2, 3]}
+
+
+@pytest.mark.parametrize("computed", [5, 6])
+def test_resume_recomputes_last_token_without_replacing_codec_metadata(monkeypatch, computed):
+    scheduler = object.__new__(EasyMagpieARAsyncScheduler)
+    scheduler.vllm_config = SimpleNamespace(model_config=SimpleNamespace(stage_id=1))
+    session = SimpleNamespace(
+        num_computed_tokens=computed,
+        num_output_placeholders=0,
+        num_tokens=5,
+        max_tokens=7,
+        additional_information={"codes": {"audio": "cached"}},
+    )
+    update = SimpleNamespace(max_tokens=None, additional_information={"text_token": [2]})
+    monkeypatch.setattr(OmniARAsyncScheduler, "_update_request_as_session", lambda *args: None)
+
+    scheduler._update_request_as_session(session, update)
+
+    assert session.num_computed_tokens == 4
+    assert session.max_tokens == 7
+    assert session.additional_information == {"codes": {"audio": "cached"}}
 
 
 def test_native_codec_chunk_appends_prompt_without_resetting_state(monkeypatch):
@@ -243,6 +186,132 @@ def test_native_codec_empty_segment_marker_does_not_reset_state(monkeypatch):
     assert request._all_token_ids == [0, 0, 0]
     assert request.num_prompt_tokens == 3
     assert request.num_computed_tokens == 3
+
+
+def test_native_codec_loaded_empty_segment_marker_is_not_scheduled(monkeypatch):
+    adapter = object.__new__(OmniChunkTransferAdapter)
+    adapter._easymagpie_num_quantizers = 2
+    adapter._easymagpie_chunk_lock = threading.Lock()
+    adapter._finished_load_reqs = {"request"}
+    adapter.upstream_exhausted_requests = set()
+    request = SimpleNamespace(
+        prompt_token_ids=[0, 0, 0],
+        request_id="request",
+        _all_token_ids=[0, 0, 0],
+        num_computed_tokens=3,
+        num_prompt_tokens=3,
+        additional_information={"codes": {"audio": torch.ones((3, 2), dtype=torch.long)}},
+        update_block_hashes=lambda: None,
+    )
+
+    def fake_poll(self, req):
+        req.prompt_token_ids = []
+        req._all_token_ids[:] = []
+        req.num_prompt_tokens = 0
+        req.num_computed_tokens = 0
+        req.additional_information = {"meta": {"is_segment_finished": True}}
+        return True
+
+    monkeypatch.setattr(OmniChunkTransferAdapter, "_poll_single_request", fake_poll)
+
+    assert _poll_native_codec_chunk(adapter, request) is False
+    assert request.prompt_token_ids == [0, 0, 0]
+    assert request._all_token_ids == [0, 0, 0]
+    assert request.num_prompt_tokens == 3
+    assert request.num_computed_tokens == 3
+    assert adapter._finished_load_reqs == set()
+
+
+@pytest.mark.parametrize("marker", ["finished", "is_segment_finished"])
+@pytest.mark.parametrize("audio_shape", [None, (0,), (0, 2)], ids=["absent", "empty-flat", "empty-rows"])
+@pytest.mark.parametrize("queue_method", ["_process_chunk_queue_legacy", "_process_chunk_queue"])
+def test_native_codec_control_marker_queue_liveness(marker, audio_shape, queue_method):
+    payload = {"meta": {marker: True}}
+    if audio_shape is not None:
+        payload["codes"] = {"audio": torch.empty(audio_shape, dtype=torch.long)}
+    adapter, request = _codec_poll_state([payload])
+    ref = request.additional_information["codes"]["ref"]
+    terminal = marker == "finished"
+
+    received = _poll_native_codec_chunk(adapter, request)
+    assert (request.request_id in adapter.upstream_exhausted_requests) is terminal
+    assert request.resumable is not terminal
+    assert request.prompt_token_ids == [0, 0, 0]
+    assert request._all_token_ids == [0, 0, 0]
+    assert request.num_prompt_tokens == 3
+    assert request.num_computed_tokens == 3
+    audio = request.additional_information["codes"].get("audio")
+    assert audio is None or audio.numel() == 0
+    assert request.additional_information["codes"]["ref"] is ref
+    assert request.additional_information["meta"]["chunk_seq"] == 1
+
+    # Exercise the real upstream queue gate, not just the poll return value.
+    running, parked = [request], deque()
+    getattr(adapter, queue_method)(running, parked, RequestStatus.RUNNING, adapter._finished_load_reqs)
+    assert running == ([request] if terminal else [])
+    assert list(parked) == ([] if terminal else [request])
+    assert request.status == (RequestStatus.RUNNING if terminal else RequestStatus.WAITING_FOR_CHUNK)
+    assert received is terminal
+    assert request.request_id not in adapter._finished_load_reqs
+    # A terminal marker is runnable for completion, with no codec tokens to execute.
+    assert len(request.prompt_token_ids) - request.num_computed_tokens == 0
+
+
+@pytest.mark.parametrize("queue_method", ["_process_chunk_queue_legacy", "_process_chunk_queue"])
+def test_native_codec_segment_then_audio_then_terminal_keeps_state(queue_method):
+    frames = torch.tensor([[1, 2], [3, 4]])
+    adapter, request = _codec_poll_state(
+        [{"meta": {"is_segment_finished": True}}, {"codes": {"audio": frames}}, {"meta": {"finished": True}}]
+    )
+    assert _poll_native_codec_chunk(adapter, request) is False
+    assert request.request_id not in adapter._finished_load_reqs
+
+    assert _poll_native_codec_chunk(adapter, request) is True
+    assert request.prompt_token_ids == [0] * 5
+    assert request._all_token_ids == [0] * 5
+    assert request.num_computed_tokens == 3
+    assert torch.equal(request.additional_information["codes"]["audio"], frames)
+    running, parked = [request], deque()
+    getattr(adapter, queue_method)(running, parked, RequestStatus.RUNNING, adapter._finished_load_reqs)
+    assert running == [request]
+    assert not parked
+
+    # Simulate consuming the actual two-frame payload before the final control arrives.
+    request.num_computed_tokens = 5
+    request.status = RequestStatus.WAITING_FOR_CHUNK
+    adapter.requests_with_ready_chunks.clear()
+    adapter.segment_finished_requests.clear()
+    assert _poll_native_codec_chunk(adapter, request) is True
+    getattr(adapter, queue_method)(running, parked, RequestStatus.RUNNING, adapter._finished_load_reqs)
+    assert running == [request]
+    assert not parked
+    assert request.status == RequestStatus.RUNNING
+    assert request.num_prompt_tokens == request.num_computed_tokens == 5
+    assert request.prompt_token_ids == request._all_token_ids == [0] * 5
+    assert "audio" not in request.additional_information["codes"]
+    assert request.resumable is False
+
+
+def test_native_codec_poll_without_arrival_preserves_metadata(monkeypatch):
+    adapter = object.__new__(OmniChunkTransferAdapter)
+    adapter._easymagpie_num_quantizers = 2
+    adapter._easymagpie_chunk_lock = threading.Lock()
+    info = {"codes": {"audio": torch.ones(3, 2)}, "meta": {"chunk_seq": 1}}
+    request = SimpleNamespace(
+        request_id="request",
+        prompt_token_ids=[0, 0, 0],
+        _all_token_ids=[0, 0, 0],
+        num_computed_tokens=3,
+        num_prompt_tokens=3,
+        additional_information=info,
+        update_block_hashes=lambda: None,
+    )
+    monkeypatch.setattr(OmniChunkTransferAdapter, "_poll_single_request", lambda *args: False)
+
+    assert _poll_native_codec_chunk(adapter, request) is False
+    assert request.additional_information is info
+    assert request.num_computed_tokens == 3
+    assert request.prompt_token_ids == [0, 0, 0]
 
 
 def test_native_codec_streaming_update_preserves_state_and_resumes_polling():
@@ -339,3 +408,38 @@ def test_native_codec_segment_resume_stays_on_cached_request_path(status, queue_
     assert session.num_computed_tokens == 6
     assert scheduler.num_waiting_for_streaming_input == 0
     assert scheduler.chunk_transfer_adapter.segment_finished_requests == set()
+
+
+def _codec_poll_state(payloads):
+    """Use the actual upstream poll and queues with only connector I/O stubbed."""
+    payloads = deque(payloads)
+    adapter = object.__new__(OmniChunkTransferAdapter)
+    adapter._easymagpie_num_quantizers = 2
+    adapter._easymagpie_chunk_lock = threading.Lock()
+    adapter._finished_load_reqs = set()
+    adapter.get_req_chunk = defaultdict(int)
+    adapter.request_ids_mapping = {}
+    adapter.model_mode = "generation"
+    adapter.upstream_exhausted_requests = set()
+    adapter.segment_finished_requests = set()
+    adapter.requests_with_ready_chunks = set()
+    adapter.requests_origin_status = {}
+    adapter._active_window = 32
+    adapter._active_streams = {}
+    adapter.connector = SimpleNamespace(stage_id=1, get=lambda *_args: (payloads.popleft(), 1))
+    request = SimpleNamespace(
+        request_id="request",
+        prompt_token_ids=[0, 0, 0],
+        _all_token_ids=[0, 0, 0],
+        num_computed_tokens=3,
+        num_prompt_tokens=3,
+        resumable=True,
+        prefill_stats=None,
+        status=RequestStatus.WAITING_FOR_CHUNK,
+        additional_information={
+            "codes": {"audio": torch.ones((3, 2), dtype=torch.long), "ref": torch.tensor([0.1, -0.1])},
+            "meta": {"chunk_seq": 1},
+        },
+        update_block_hashes=lambda: None,
+    )
+    return adapter, request

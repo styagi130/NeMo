@@ -24,6 +24,7 @@ from typing import Any
 
 import torch
 from vllm.logger import init_logger
+from vllm.v1.request import RequestStatus
 from vllm_omni.data_entry_keys import CodesStruct, MetaStruct, OmniPayload, OmniPayloadStruct
 from vllm_omni.engine.serialization import deserialize_additional_information
 
@@ -281,7 +282,28 @@ def talker2code2wav_async_chunk(
     passes it by keyword.
     """
     request_id = request.external_req_id
-    finished = bool(is_finished or request.is_finished())
+    requests = getattr(transfer_manager, "_emp_requests", None)
+    if requests is None:
+        requests = transfer_manager._emp_requests = {}
+    if _is_failed_codec_request(request):
+        if requests.get(request_id) is request:
+            _cleanup_codec_request(transfer_manager, request_id)
+        return None
+    # Queued sends outlive Request status changes; use their captured finish flags.
+    send_finish = getattr(transfer_manager, "_easymagpie_send_finish", None)
+    if send_finish is None:
+        finished = bool(is_finished or request.is_finished())
+        true_finished = _is_true_request_finish(request)
+    else:
+        true_finished, segment_finished = send_finish
+        finished = bool(true_finished or segment_finished)
+    if not isinstance(multimodal_output, Mapping) and not finished:
+        return None
+    if requests.get(request_id) is not request:
+        for previous_id, previous in list(requests.items()):
+            if _is_failed_codec_request(previous):
+                _cleanup_codec_request(transfer_manager, previous_id)
+        requests[request_id] = request
 
     if isinstance(multimodal_output, Mapping):
         frame = _extract_last_frame(multimodal_output)
@@ -321,9 +343,6 @@ def talker2code2wav_async_chunk(
             # Keep the framework buffer populated too (some connector bookkeeping
             # counts active requests by its non-empty per-request lists).
             transfer_manager.code_prompt_token_ids[request_id].append(frame_row)
-    elif not finished:
-        return None
-
     connector = getattr(transfer_manager, "connector", None)
     raw_cfg = getattr(connector, "config", {}) or {}
     cfg = raw_cfg.get("extra", raw_cfg) if isinstance(raw_cfg, dict) else {}
@@ -353,20 +372,10 @@ def talker2code2wav_async_chunk(
     emitted_chunks_state = _persistent_state(transfer_manager, "_emp_emitted_chunks")
     emitted_chunks = emitted_chunks_state[request_id]
 
-    true_finished = _is_true_request_finish(request)
-
-    def _cleanup() -> None:
-        emitted_state.pop(request_id, None)
-        emitted_chunks_state.pop(request_id, None)
-        _persistent_state(transfer_manager, "_emp_seen_frames").pop(request_id, None)
-        _persistent_state(transfer_manager, "_emp_request_speech_delay").pop(request_id, None)
-        base_state.pop(request_id, None)
-        frame_buffer.pop(request_id, None)
-
     if length <= 0:
         if finished:
             if true_finished:
-                _cleanup()
+                _cleanup_codec_request(transfer_manager, request_id)
             return OmniPayloadStruct(
                 codes=CodesStruct(audio=torch.empty(0, dtype=torch.long)),
                 meta=MetaStruct(finished=torch.tensor(True, dtype=torch.bool)),
@@ -378,7 +387,7 @@ def talker2code2wav_async_chunk(
         # Nothing new to emit. Never re-emit already-sent frames; the adapter
         # still forwards segment/request finish markers when we return None.
         if true_finished:
-            _cleanup()
+            _cleanup_codec_request(transfer_manager, request_id)
         return None
 
     # Startup targets ramp independently from the steady codec chunk size.
@@ -402,7 +411,7 @@ def talker2code2wav_async_chunk(
         del buffer[:drop]
         base_state[request_id] = new_end
     if true_finished:
-        _cleanup()
+        _cleanup_codec_request(transfer_manager, request_id)
 
     return OmniPayloadStruct(
         codes=CodesStruct(audio=code_predictor_codes),
@@ -411,6 +420,23 @@ def talker2code2wav_async_chunk(
             finished=torch.tensor(finished, dtype=torch.bool),
         ),
     )
+
+
+def _is_failed_codec_request(request: Any) -> bool:
+    return getattr(request, "status", None) in (RequestStatus.FINISHED_ABORTED, RequestStatus.FINISHED_ERROR)
+
+
+def _cleanup_codec_request(transfer_manager: Any, request_id: str) -> None:
+    for name in (
+        "_emp_requests",
+        "_emp_emitted_frames",
+        "_emp_emitted_chunks",
+        "_emp_seen_frames",
+        "_emp_request_speech_delay",
+        "_emp_frame_buffer_base",
+        "_emp_frame_buffer",
+    ):
+        getattr(transfer_manager, name, {}).pop(request_id, None)
 
 
 def _extract_audio_codes(mm: Mapping | dict[str, Any] | None) -> torch.Tensor | None:

@@ -45,7 +45,7 @@ from vllm.forward_context import BatchDescriptor, get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.models.interfaces import HasInnerState, IsHybrid, SupportsMambaPrefixCaching
 from vllm.model_executor.models.nemotron_h import NemotronHForCausalLM, NemotronHModel
-from vllm.model_executor.models.utils import maybe_prefix
+from vllm.model_executor.models.utils import AutoWeightsLoader, maybe_prefix
 from vllm.sequence import IntermediateTensors
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
@@ -167,7 +167,7 @@ class EasyMagpieTTSForConditionalGeneration(
             vllm_config=vllm_config,
             prefix=maybe_prefix(prefix, "backbone"),
         )
-        # vLLM 0.24's NemotronHMLP hard-codes ReLU² in shared_experts,
+        # vLLM 0.26's NemotronHMLP hard-codes ReLU² in shared_experts,
         # ignoring the checkpoint's mlp_hidden_act. Restore the configured
         # activation (no-op when the backbone has no MoE layers).
         patch_shared_expert_activation(self.backbone)
@@ -963,7 +963,14 @@ class EasyMagpieTTSForConditionalGeneration(
         return task_len + t_audio + ctx_len
 
     @classmethod
-    def get_prompt_len(cls, speaker_id: str, model_path: str, *, tokenize: Callable[[str], Iterable[int]]) -> int:
+    def get_prompt_len(
+        cls,
+        speaker_id: str,
+        model_path: str,
+        *,
+        tokenize: Callable[[str], Iterable[int]],
+        context_text: str = _DEFAULT_CONTEXT_TEXT,
+    ) -> int:
         """Known-speaker convenience wrapper around :meth:`estimate_prompt_len`.
 
         Resolves everything from the checkpoint dir so it cannot disagree with
@@ -971,10 +978,8 @@ class EasyMagpieTTSForConditionalGeneration(
         ``speaker_embeddings/<speaker_id>.pt`` (the same file the engine reads in
         :meth:`_load_known_speaker_embedding`), reads ``has_task_embedding`` from
         ``config.json`` (``num_task_embeddings``),
-        and conditions on the fixed :data:`_DEFAULT_CONTEXT_TEXT`. Lets a caller
-        holding only a ``speaker_id`` size ``prompt_token_ids`` without an engine
-        instance (``context_text`` / ``has_task_embedding`` are intentionally not
-        params — they must match the precomputed checkpoint, not be overridden).
+        and tokenizes the same ``context_text`` sent to the engine. The default
+        remains ``[EN]``. Task-embedding presence comes from the checkpoint.
         """
         import json
         import os
@@ -991,7 +996,7 @@ class EasyMagpieTTSForConditionalGeneration(
         return cls.estimate_prompt_len(
             speaker_embedding,
             tokenize=tokenize,
-            context_text=_DEFAULT_CONTEXT_TEXT,
+            context_text=context_text,
             has_task_embedding=num_task_embeddings > 0,
         )
 
@@ -1156,8 +1161,8 @@ class EasyMagpieTTSForConditionalGeneration(
         Nemotron-H names) and the TTS submodules at top level
         (``audio_embeddings.*``, ``local_transformer.*``, ``phoneme_*``,
         ``text_embedding.*``, projection heads). Backbone weights are routed to
-        :meth:`NemotronHModel.load_weights` (which handles HF naming + Mamba/MoE
-        packing); TTS weights are copied directly by name.
+        ``AutoWeightsLoader`` after HF name mapping; child modules handle
+        Mamba/MoE packing. TTS weights are copied directly by name.
         """
         own_params = dict(self.named_parameters())
         loaded: set[str] = set()
@@ -1192,15 +1197,10 @@ class EasyMagpieTTSForConditionalGeneration(
                 target.data.copy_(tensor.to(target.dtype))
             loaded.add(mapped)
 
-        # ``NemotronHModel.load_weights`` (the inner model) does *not* apply the
-        # HF->vLLM renaming that lives on the ``NemotronHForCausalLM`` wrapper, so
-        # raw HF names such as ``embeddings.weight`` / ``...mixer.A_log`` would not
-        # match the inner param names (``embed_tokens.weight`` / ``...mixer.A``).
-        # Apply that mapper here so the converted checkpoint can keep stock HF
-        # Nemotron-H names. The wrapper's ``backbone -> model`` prefix rule is a
-        # no-op here because we already stripped the ``decoder.`` prefix.
+        # The inner model has no generic loader in 0.26. Preserve the wrapper's
+        # HF mapping (embeddings -> embed_tokens, A_log -> A and packed QKV).
         backbone_weights = list(NemotronHForCausalLM.hf_to_vllm_mapper.apply(backbone_weights))
-        backbone_loaded = self.backbone.load_weights(backbone_weights)
+        backbone_loaded = AutoWeightsLoader(self.backbone).load_weights(backbone_weights)
         loaded |= {f"backbone.{n}" for n in backbone_loaded}
 
         # Derived runtime state.

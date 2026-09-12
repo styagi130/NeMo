@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Compatibility fixes for the EasyMagpie backbone on the pinned vLLM 0.24.0."""
+"""Compatibility fixes for the EasyMagpie backbone on the pinned vLLM 0.26.0."""
 from __future__ import annotations
 
 import torch
@@ -54,7 +54,7 @@ def patch_mamba_streaming_decode() -> None:
 def patch_shared_expert_activation(backbone) -> int:
     """Make shared experts honor ``mlp_hidden_act`` from the model config.
 
-    vLLM 0.24's ``NemotronHMLP`` hard-codes ReLU² even though routed experts
+    vLLM 0.26's ``NemotronHMLP`` hard-codes ReLU² even though routed experts
     read ``mlp_hidden_act``. NeMo uses the configured activation for both.
     """
     activation_name = getattr(getattr(backbone, "config", None), "mlp_hidden_act", None)

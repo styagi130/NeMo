@@ -14,14 +14,18 @@
 """Tests for local-transformer sampling contracts."""
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 torch = pytest.importorskip("torch")
 pytest.importorskip("vllm")
 
 from conftest import build_vllm_config  # noqa: E402
+from easymagpie_vllm_omni import local_transformer as local_transformer_module  # noqa: E402
 from easymagpie_vllm_omni.config import EasyMagpieOmniArch  # noqa: E402
 from easymagpie_vllm_omni.local_transformer import EasyMagpieCodePredictor  # noqa: E402
+from vllm.config import CUDAGraphMode  # noqa: E402
 
 # Cover identity and linear projection paths.
 ARCH_PROFILES = {
@@ -93,3 +97,41 @@ def test_generate_codes_deterministic_with_seed():
     second = cp.generate_codes(dec_hidden)
 
     assert torch.equal(first, second)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("outer_mode", [None, CUDAGraphMode.NONE, CUDAGraphMode.FULL, CUDAGraphMode.PIECEWISE])
+@pytest.mark.parametrize("raise_from_loop", [False, True], ids=["success", "failure"])
+def test_generate_codes_uses_full_cudagraph_mode_and_restores_outer_mode(monkeypatch, outer_mode, raise_from_loop):
+    """Check context selection/restoration, not numerical equivalence or CUDA replay."""
+    cp, arch = _build_predictor(ARCH_PROFILES["equal_dims"])
+    outer_context = SimpleNamespace(cudagraph_runtime_mode=outer_mode)
+    observed_modes = []
+
+    def get_context():
+        assert outer_mode is not None
+        return outer_context
+
+    monkeypatch.setattr(local_transformer_module, "get_forward_context", get_context, raising=False)
+    monkeypatch.setattr(
+        local_transformer_module, "is_forward_context_available", lambda: outer_mode is not None, raising=False
+    )
+
+    def fake_code_loop(dec_hidden, _noise, _temperature):
+        observed_modes.append(outer_context.cudagraph_runtime_mode)
+        if raise_from_loop:
+            raise RuntimeError("code loop failed")
+        return torch.zeros(dec_hidden.shape[0], arch.num_stacked_codebooks, dtype=torch.long)
+
+    monkeypatch.setattr(cp._code_loop, "forward", fake_code_loop)
+    dec_hidden = torch.randn(3, arch.hidden_dim)
+
+    if raise_from_loop:
+        with pytest.raises(RuntimeError, match="code loop failed"):
+            cp.generate_codes(dec_hidden)
+    else:
+        cp.generate_codes(dec_hidden)
+
+    expected = CUDAGraphMode.FULL if outer_mode == CUDAGraphMode.PIECEWISE else outer_mode
+    assert observed_modes == [expected]
+    assert outer_context.cudagraph_runtime_mode == outer_mode

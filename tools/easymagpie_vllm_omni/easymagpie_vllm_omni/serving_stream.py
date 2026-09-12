@@ -163,7 +163,9 @@ class EasyMagpieInputStream:
             first_required_frames = len(first_token_ids)
         yield StreamingInput(
             prompt=first_prompt,
-            sampling_params=_sampling_params_with_max_tokens(self.sampling_params, first_required_frames),
+            sampling_params=_sampling_params_with_max_tokens(
+                self.sampling_params, min(first_required_frames, self.max_new_tokens)
+            ),
         )
         text_token_start += len(first_token_ids)
 
@@ -174,6 +176,12 @@ class EasyMagpieInputStream:
                 break
             token_ids = cast(list[int], item)
             await self._wait_for_segment_completion()
+            remaining = self.max_new_tokens - self.observed_output_frames
+            if remaining <= 0:
+                # Keep the receiver's bounded queue moving until input.done.
+                while await self._input_queue.get() is not _DONE:
+                    pass
+                return
             token_ids, input_done = self._accumulate_queued_tokens(token_ids)
             if input_done:
                 token_ids.append(self.text_eos_id)
@@ -182,13 +190,15 @@ class EasyMagpieInputStream:
                     "prompt_token_ids": [0],
                     "additional_information": {"text_token": token_ids, "text_token_start": text_token_start},
                 },
-                sampling_params=_sampling_params_with_max_tokens(self.sampling_params, len(token_ids)),
+                sampling_params=_sampling_params_with_max_tokens(self.sampling_params, min(len(token_ids), remaining)),
             )
             text_token_start += len(token_ids)
             if input_done:
                 break
 
         await self._wait_for_segment_completion()
+        if self.observed_output_frames >= self.max_new_tokens:
+            return
         if not input_done:
             yield StreamingInput(
                 prompt={
@@ -204,6 +214,8 @@ class EasyMagpieInputStream:
             await self._wait_for_segment_completion()
 
         tail_max_tokens = self.max_new_tokens - self.observed_output_frames
+        if tail_max_tokens <= 0:
+            return
         yield StreamingInput(
             prompt={
                 "prompt_token_ids": [0],
@@ -218,6 +230,16 @@ class EasyMagpieInputStream:
 
 class EasyMagpieStreamingSpeechHandler(OmniStreamingSpeechHandler):
     """Use resumable EasyMagpie requests while preserving the generic handler."""
+
+    async def _receive_config(self, websocket: WebSocket):
+        raw = await asyncio.wait_for(websocket.receive_text(), timeout=self._config_timeout)
+        msg = await self._parse_message(websocket, raw)
+        if msg is None:
+            return None
+        if msg.get("type") != "session.config":
+            await self._send_error(websocket, f"Expected session.config, got: {msg.get('type')}")
+            return None
+        return await self._build_config(websocket, msg)
 
     async def handle_session(self, websocket: WebSocket) -> None:
         if getattr(self._speech_service, "_tts_model_type", None) != _MODEL_TYPE:
@@ -244,14 +266,6 @@ class EasyMagpieStreamingSpeechHandler(OmniStreamingSpeechHandler):
                     websocket, "word_timestamps is not supported with incremental EasyMagpie input."
                 )
                 return
-            if config.model and hasattr(self._speech_service, "_check_model"):
-                error = await self._speech_service._check_model(
-                    OpenAICreateSpeechRequest(input="ping", model=config.model)
-                )
-                if error is not None:
-                    await self._send_error(websocket, str(error))
-                    return
-
             adapter = self._speech_service._get_tts_adapter()
             if adapter is None or not hasattr(adapter, "build_streaming_spec"):
                 await self._send_error(websocket, "EasyMagpie incremental serving adapter is unavailable.")
@@ -309,6 +323,8 @@ class EasyMagpieStreamingSpeechHandler(OmniStreamingSpeechHandler):
                     self._speech_service._generate_pcm_chunks(observed_generator(), request_id)
                 ) as chunks:
                     async for chunk in chunks:
+                        if not chunk:
+                            continue
                         total_bytes += len(chunk)
                         await websocket.send_bytes(chunk)
                 return total_bytes

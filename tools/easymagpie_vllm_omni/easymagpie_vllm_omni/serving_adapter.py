@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""``/v1/audio/speech`` support for EasyMagpieTTS on vLLM-Omni 0.24+."""
+"""``/v1/audio/speech`` support for EasyMagpieTTS on vLLM-Omni 0.26."""
 from __future__ import annotations
 
 import json
@@ -69,7 +69,7 @@ def _build_adapter_cls() -> type:
             super().__init__(ctx)
             self._tokenizer: Any = None
             self._model_path_cache: str | None = None
-            self._prompt_len_cache: dict[str, int] = {}
+            self._prompt_len_cache: dict[tuple[str, str], int] = {}
             self._model_config_cache: dict[str, Any] | None = None
             self._arch_cache: EasyMagpieOmniArch | None = None
 
@@ -99,18 +99,19 @@ def _build_adapter_cls() -> type:
             self._tokenize()
             return self._tokenizer
 
-        def _prompt_len(self, speaker_id: str) -> int:
-            cached = self._prompt_len_cache.get(speaker_id)
+        def _prompt_len(self, speaker_id: str, context_text: str = _DEFAULT_CONTEXT_TEXT) -> int:
+            key = (speaker_id, context_text)
+            cached = self._prompt_len_cache.get(key)
             if cached is not None:
                 return cached
             from easymagpie_vllm_omni.easymagpie import EasyMagpieTTSForConditionalGeneration
 
             plen = int(
                 EasyMagpieTTSForConditionalGeneration.get_prompt_len(
-                    speaker_id, self._model_path(), tokenize=self._tokenize()
+                    speaker_id, self._model_path(), tokenize=self._tokenize(), context_text=context_text
                 )
             )
-            self._prompt_len_cache[speaker_id] = plen
+            self._prompt_len_cache[key] = plen
             return plen
 
         def _model_config(self) -> dict[str, Any]:
@@ -143,6 +144,9 @@ def _build_adapter_cls() -> type:
             extra = request.extra_params
             if extra is not None and not isinstance(extra, dict):
                 return "extra_params must be a JSON object/dict"
+            context_text = (extra or {}).get("context_text")
+            if context_text is not None and not isinstance(context_text, str):
+                return "context_text must be a string or null"
             return None
 
         async def build(
@@ -154,14 +158,15 @@ def _build_adapter_cls() -> type:
             del sampling_params_list, has_inline_ref_audio  # EasyMagpie needs neither.
             speaker_id = (request.voice or _DEFAULT_SPEAKER).strip()
             extra = request.extra_params or {}
+            context_text = extra.get("context_text") or _DEFAULT_CONTEXT_TEXT
             text_eos_id, text_prefill_num = self._text_stream_metadata()
             text_tokens = self._model_tokenizer().encode(request.input, add_special_tokens=False)
             text_tokens.append(text_eos_id)
 
             prompt = {
-                "prompt_token_ids": [0] * (self._prompt_len(speaker_id) + text_prefill_num),
+                "prompt_token_ids": [0] * (self._prompt_len(speaker_id, context_text) + text_prefill_num),
                 "additional_information": {
-                    "context_text": extra.get("context_text", _DEFAULT_CONTEXT_TEXT),
+                    "context_text": context_text,
                     "text_tokens": text_tokens,
                     "prefill_text_tokens": text_tokens[:text_prefill_num],
                     "text_prefill_num": text_prefill_num,
@@ -216,6 +221,8 @@ def _patch_detection() -> None:
     from vllm_omni.entrypoints.openai import serving_speech as ss
 
     ss._TTS_MODEL_STAGES.add(_TALKER_STAGE)
+    # Let upstream apply request-local max_new_tokens to Stage 0 sampling.
+    ss._SAMPLING_MAX_TOKENS_TTS_MODEL_TYPES.add(MODEL_TYPE)
 
     detect = ss.OmniOpenAIServingSpeech._detect_tts_model_type
     if getattr(detect, "_easymagpie_patched", False):

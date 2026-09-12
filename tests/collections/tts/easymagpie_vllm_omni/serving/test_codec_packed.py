@@ -16,7 +16,7 @@ import pytest
 import torch
 from easymagpie_vllm_omni.codec.config import EasyMagpieCodecConfig
 from easymagpie_vllm_omni.codec.packed import CODEC_STATE_ELEMENTS, CodecStateLayer, PackedEasyMagpieCodec
-from vllm.config import VllmConfig, set_current_vllm_config
+from vllm.config import DeviceConfig, VllmConfig, set_current_vllm_config
 from vllm.forward_context import set_forward_context
 from vllm.v1.attention.backends.mamba1_attn import Mamba1AttentionMetadata
 
@@ -119,7 +119,7 @@ def mixed_metadata(prefill_frames: int, *, device: torch.device | str = "cpu") -
 def test_packed_profile_path_registers_state_layers() -> None:
     torch.manual_seed(11)
     config = tiny_config()
-    vllm_config = VllmConfig()
+    vllm_config = VllmConfig(device_config=DeviceConfig(device="cpu"))
     with set_current_vllm_config(vllm_config):
         packed = PackedEasyMagpieCodec(config, dtype=torch.float32).eval()
     state_layers = [module for module in packed.modules() if isinstance(module, CodecStateLayer)]
@@ -136,7 +136,7 @@ def test_packed_profile_path_registers_state_layers() -> None:
 def test_vllm_state_pages_match_full_decode() -> None:
     torch.manual_seed(17)
     config = tiny_config()
-    vllm_config = VllmConfig()
+    vllm_config = VllmConfig(device_config=DeviceConfig(device="cpu"))
     with set_current_vllm_config(vllm_config):
         full = PackedEasyMagpieCodec(config, dtype=torch.float32, prefix="full").eval()
         packed = PackedEasyMagpieCodec(config, dtype=torch.float32).eval()
@@ -164,7 +164,7 @@ def test_vllm_state_pages_match_full_decode() -> None:
 def test_one_frame_decode_metadata_matches_full_decode() -> None:
     torch.manual_seed(23)
     config = tiny_config()
-    vllm_config = VllmConfig()
+    vllm_config = VllmConfig(device_config=DeviceConfig(device="cpu"))
     with set_current_vllm_config(vllm_config):
         full = PackedEasyMagpieCodec(config, dtype=torch.float32, prefix="full").eval()
         packed = PackedEasyMagpieCodec(config, dtype=torch.float32, prefix="one_frame").eval()
@@ -192,7 +192,7 @@ def test_one_frame_decode_metadata_matches_full_decode() -> None:
 def test_mixed_decode_and_prefill_batch() -> None:
     torch.manual_seed(27)
     config = tiny_config()
-    vllm_config = VllmConfig()
+    vllm_config = VllmConfig(device_config=DeviceConfig(device="cpu"))
     with set_current_vllm_config(vllm_config):
         full = PackedEasyMagpieCodec(config, dtype=torch.float32, prefix="full").eval()
         packed = PackedEasyMagpieCodec(config, dtype=torch.float32, prefix="mixed").eval()

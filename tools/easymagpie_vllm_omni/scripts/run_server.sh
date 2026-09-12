@@ -1,5 +1,5 @@
 #!/bin/bash
-# Requires vLLM / vLLM-Omni 0.24+.
+# Requires vLLM / vLLM-Omni 0.26.0.
 set -e
 
 MODEL="${1:?Usage: run_server.sh <model_dir> [port]}"
@@ -10,7 +10,7 @@ DEPLOY_CONFIG="${EASYMAGPIE_DEPLOY_CONFIG:-${SCRIPT_DIR}/../deploy/easymagpie.ya
 
 echo "Starting EasyMagpieTTS: model=${MODEL} deploy=${DEPLOY_CONFIG} port=${PORT}"
 
-VLLM_PLUGINS=easymagpie_omni vllm serve "$MODEL" \
+exec env VLLM_PLUGINS=easymagpie_omni vllm serve "$MODEL" \
     --deploy-config "$DEPLOY_CONFIG" \
     --host 0.0.0.0 \
     --port "$PORT" \

@@ -11,16 +11,60 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Tests for the vLLM-Omni 0.24 streaming runner compatibility layer."""
+"""Tests for EasyMagpie streaming metadata on vLLM-Omni 0.26."""
 from __future__ import annotations
 
+from types import SimpleNamespace
+
+import pytest
 import torch
 import yaml
 
 from conftest import EASYMAGPIE_ROOT
-from easymagpie_vllm_omni.runner import merge_streaming_additional_information
+from easymagpie_vllm_omni.runner import EasyMagpieGPUARModelRunner, merge_streaming_additional_information
 
 WORKER_CLS = "easymagpie_vllm_omni.runner.EasyMagpieGPUARWorker"
+
+
+@pytest.mark.parametrize("padded,active", [(8, 3), (16, 9), (40, 34), (128, 65)])
+def test_async_output_preserves_distinct_rows_after_contraction_and_slot_reuse(padded, active):
+    runner = object.__new__(EasyMagpieGPUARModelRunner)
+    runner.model = SimpleNamespace(omni_pooler_payload_include_hidden=False)
+    hidden = torch.zeros(padded, 3)
+    for epoch, count in enumerate((active, 1, active)):
+        codes = torch.arange(padded * 2).view(padded, 2) + epoch * 1000
+        snapshot = runner._build_omni_async_snapshot_payload(
+            hidden_states=hidden,
+            staged_hidden_states_cpu=None,
+            multimodal_outputs={"codes": {"audio": codes}},
+        )
+        carrier = snapshot.get("hidden_states", hidden[:0])
+        assert carrier.shape == (padded, 0)
+        for row in range(count):
+            output = runner._build_omni_mm_payload(
+                combined_multimodal_outputs=None,
+                mm_cpu={"codes.audio": codes},
+                rid=f"request-{epoch}-{row}",
+                idx=row,
+                start=row,
+                end=row + 1,
+                audio_sparse_output=False,
+                sparse_mm_index={},
+                hidden_seq_len=carrier.shape[0],
+                scheduled_seq_len=count,
+            )
+            torch.testing.assert_close(output["codes.audio"], codes[row : row + 1])
+
+
+def test_async_payload_retains_requested_hidden_states():
+    runner = object.__new__(EasyMagpieGPUARModelRunner)
+    runner.model = SimpleNamespace(omni_pooler_payload_include_hidden=True)
+    hidden = torch.ones(8, 3)
+    snapshot = runner._build_omni_async_snapshot_payload(
+        hidden_states=hidden, staged_hidden_states_cpu=hidden, multimodal_outputs={}
+    )
+    assert snapshot["hidden_states"] is hidden
+    assert snapshot["staged_hidden_states_cpu"] is hidden
 
 
 def test_streaming_update_preserves_model_state_and_replaces_latest_chunk():

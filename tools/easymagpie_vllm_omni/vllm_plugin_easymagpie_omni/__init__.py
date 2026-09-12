@@ -52,6 +52,11 @@ def register() -> None:
             registry.register_model(_CODEC_ARCH, _CODEC_TARGET)
 
     if omni_available:
+        from easymagpie_vllm_omni.codec_completion import install_codec_completion
+        from easymagpie_vllm_omni.lifecycle import install_membership_shutdown
+
+        install_codec_completion()
+        install_membership_shutdown()
         _register_pipeline()
         _register_serving_adapter()
 

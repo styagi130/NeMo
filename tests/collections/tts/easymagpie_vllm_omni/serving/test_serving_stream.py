@@ -106,7 +106,7 @@ async def test_input_stream_accumulates_tokens_until_first_prefill_is_complete()
 @pytest.mark.asyncio
 async def test_http_adapter_folds_four_text_positions_into_prefill():
     adapter = _build_adapter_cls()(SimpleNamespace(engine_client=None))
-    adapter._prompt_len = lambda _speaker_id: 2
+    adapter._prompt_len = lambda _speaker_id, _context_text="[EN]": 2
     adapter._text_stream_metadata = lambda: (99, 4)
     adapter._model_tokenizer = lambda: SimpleNamespace(encode=lambda *_args, **_kwargs: [10, 11, 12, 13, 14])
     request = SimpleNamespace(
@@ -266,12 +266,30 @@ def test_two_stage_pipeline_exposes_lm_progress_for_stream_pacing():
 
 
 @pytest.mark.asyncio
-async def test_handler_tokenizes_ipa_span_split_across_text_events():
+@pytest.mark.parametrize(
+    "pcm_chunks",
+    [
+        (b"\x01\x02",),
+        (b"", b"\x01\x02"),
+        (b"\x01\x02", b"", b"\x03\x04"),
+        (b"\x01\x02", b""),
+        (b"", b""),
+        (b"\x00\x00",),
+    ],
+    ids=["audio", "leading-empty", "intermediate-empty", "terminal-empty", "all-empty", "silent-audio"],
+)
+async def test_handler_tokenizes_ipa_span_split_across_text_events(pcm_chunks):
     class FakeWebSocket:
         def __init__(self):
             self.received = iter(
                 [
-                    {"type": "session.config", "voice": "eng", "stream_audio": True, "response_format": "pcm"},
+                    {
+                        "type": "session.config",
+                        "model": "easymagpie",
+                        "voice": "eng",
+                        "stream_audio": True,
+                        "response_format": "pcm",
+                    },
                     {"type": "input.text", "text": "x<bo"},
                     {"type": "input.text", "text": "p>a"},
                     {"type": "input.text", "text": "b<eo"},
@@ -296,6 +314,7 @@ async def test_handler_tokenizes_ipa_span_split_across_text_events():
             self.audio_chunks.append(payload)
 
     class FakeEngine:
+        drained = False
         default_sampling_params_list = [
             SamplingParams(max_tokens=20, output_kind=RequestOutputKind.DELTA),
             SamplingParams(max_tokens=20, output_kind=RequestOutputKind.DELTA),
@@ -304,11 +323,13 @@ async def test_handler_tokenizes_ipa_span_split_across_text_events():
         def generate(self, *, prompt, **_kwargs):
             async def outputs():
                 async for chunk in prompt:
-                    count = chunk.sampling_params.max_tokens
+                    tokens = chunk.prompt["additional_information"]["text_token"]
+                    count = chunk.sampling_params.max_tokens if tokens else 0
                     yield SimpleNamespace(
                         stage_id=0,
                         outputs=[SimpleNamespace(token_ids=[1] * count, finish_reason="length")],
                     )
+                self.drained = True
 
             return outputs()
 
@@ -350,23 +371,60 @@ async def test_handler_tokenizes_ipa_span_split_across_text_events():
         _tts_model_type = "easymagpie"
         engine_client = FakeEngine()
 
+        def __init__(self):
+            self.model_checks = []
+            self.generated_chunks = []
+
+        async def _check_model(self, request):
+            self.model_checks.append(request.model)
+
         @staticmethod
         def _get_tts_adapter():
             return FakeAdapter()
 
-        @staticmethod
-        async def _generate_pcm_chunks(generator, _request_id):
+        async def _generate_pcm_chunks(self, generator, _request_id):
             async for _output in generator:
-                yield b"\x01\x02"
+                for chunk in pcm_chunks:
+                    self.generated_chunks.append(chunk)
+                    yield chunk
 
     websocket = FakeWebSocket()
-    handler = EasyMagpieStreamingSpeechHandler(FakeSpeechService())
+    service = FakeSpeechService()
+    handler = EasyMagpieStreamingSpeechHandler(service)
     await handler.handle_session(websocket)
 
     assert websocket.accepted
-    assert websocket.audio_chunks
+    assert service.model_checks == ["easymagpie"]
+    assert service.generated_chunks
+    assert service.engine_client.drained
+    assert websocket.audio_chunks == [chunk for chunk in service.generated_chunks if chunk]
     assert websocket.json_messages[0]["type"] == "audio.start"
     assert websocket.json_messages[-2]["sentence_text"] == "x<bop>ab<eop>y"
     assert websocket.json_messages[-2]["text_tokens"] == 4
     assert websocket.json_messages[-2]["type"] == "audio.done"
+    assert websocket.json_messages[-2]["total_bytes"] == sum(map(len, service.generated_chunks))
+    assert websocket.json_messages[-2]["talker_frames"] > 0
+    assert websocket.json_messages[-2]["error"] is False
     assert websocket.json_messages[-1] == {"type": "session.done", "total_sentences": 1}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("message", ["{", '{"type": "input.text"}', '{"type": "session.config", "model": "wrong"}'])
+async def test_receive_config_rejects_invalid_message_or_model(message):
+    errors = []
+
+    async def receive_text():
+        return message
+
+    async def send_json(payload):
+        errors.append(payload)
+
+    async def check_model(request):
+        return "unknown model"
+
+    handler = EasyMagpieStreamingSpeechHandler(SimpleNamespace(_check_model=check_model))
+    websocket = SimpleNamespace(receive_text=receive_text, send_json=send_json)
+
+    assert await handler._receive_config(websocket) is None
+    assert len(errors) == 1
+    assert errors[0]["type"] == "error"

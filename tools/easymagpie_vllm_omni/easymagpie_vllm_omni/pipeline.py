@@ -70,6 +70,7 @@ EASYMAGPIE_PIPELINE = PipelineConfig(
             model_stage="easymagpie_codec",
             execution_type=StageExecutionType.LLM_GENERATION,
             input_sources=(0,),
+            retains_state_across_chunks=True,
             final_output=True,
             final_output_type="audio",
             engine_output_type="audio",

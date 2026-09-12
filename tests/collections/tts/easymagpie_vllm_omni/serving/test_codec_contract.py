@@ -23,7 +23,7 @@ import torch
 from easymagpie_vllm_omni.codec.config import EasyMagpieCodecConfig
 from easymagpie_vllm_omni.codec.packed import PackedEasyMagpieCodec
 from safetensors.torch import load_file
-from vllm.config import VllmConfig, set_current_vllm_config
+from vllm.config import DeviceConfig, VllmConfig, set_current_vllm_config
 from vllm.forward_context import set_forward_context
 
 CONTRACT_ENV = "EASYMAGPIE_CODEC_CONTRACT"
@@ -47,7 +47,7 @@ def test_packed_decoder_matches_speech_contract() -> None:
     weights = load_file(path / "model.safetensors", device="cpu")
     contract = load_file(path / "contract.safetensors", device="cpu")
 
-    vllm_config = VllmConfig()
+    vllm_config = VllmConfig(device_config=DeviceConfig(device="cpu"))
     with set_current_vllm_config(vllm_config):
         packed = PackedEasyMagpieCodec(config, dtype=torch.float32).eval()
     packed.load_state_dict(weights, strict=True)

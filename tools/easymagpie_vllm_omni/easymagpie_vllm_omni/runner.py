@@ -11,13 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""vLLM-Omni 0.24 streaming-input compatibility classes.
+"""Streaming request metadata propagation for vLLM-Omni 0.26.
 
-vLLM-Omni 0.24 no longer merges a resumed request's
-``additional_information`` into ``model_intermediate_buffer``. Consequently,
-per-chunk EasyMagpie ``text_token`` payloads reach the scheduler but not the
-model runner. The custom runner restores the merge performed by 0.21 while
-preserving model-generated state such as ``decode_offset`` and ``text_tokens``.
+The upstream resume path does not merge ``additional_information`` into
+``model_intermediate_buffer``. Preserve model-generated state while forwarding
+per-chunk EasyMagpie text and conditioning metadata.
 """
 from __future__ import annotations
 
@@ -64,6 +62,24 @@ def merge_streaming_additional_information(
 
 class EasyMagpieGPUARModelRunner(GPUARModelRunner):
     """GPU AR runner that restores streaming chunk metadata propagation."""
+
+    def _build_omni_async_snapshot_payload(
+        self,
+        *,
+        hidden_states: torch.Tensor,
+        staged_hidden_states_cpu: torch.Tensor | None,
+        multimodal_outputs: Any,
+    ) -> dict[str, Any]:
+        payload = super()._build_omni_async_snapshot_payload(
+            hidden_states=hidden_states,
+            staged_hidden_states_cpu=staged_hidden_states_cpu,
+            multimodal_outputs=multimodal_outputs,
+        )
+        # Carry the padded request axis without copying hidden values. Upstream
+        # needs this length to slice per-request codes; an explicit count would
+        # avoid using a temporary (padded_batch, 0) tensor as metadata.
+        payload.setdefault("hidden_states", hidden_states[:, :0])
+        return payload
 
     def _update_streaming_request(self, req_id, new_req_data):
         payload = getattr(new_req_data, "additional_information", None)

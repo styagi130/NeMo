@@ -54,8 +54,9 @@ stages:
     enable_prefix_caching: false
     # Codec chunks are atomic: never split one request's state update across steps.
     enable_chunked_prefill: false
-    max_num_batched_tokens: 512
-    max_model_len: 512
+    # Cover the LM's 4096-token context plus one terminal codec chunk.
+    max_num_batched_tokens: 4104
+    max_model_len: 4104
     devices: "0"
     input_connectors:
       from_stage_0: connector_of_shared_memory

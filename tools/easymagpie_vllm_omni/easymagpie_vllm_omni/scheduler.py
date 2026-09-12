@@ -30,68 +30,36 @@ from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapt
 
 
 class EasyMagpieARAsyncScheduler(OmniARAsyncScheduler):
-    """Forward each chunk's token limit and additional information.
+    """Preserve per-chunk limits, metadata and exact async resume accounting.
 
-    This class also works around a bug in vLLM-Omni's async segment-stop
-    handling that deadlocks paced streaming sessions. On a resumable segment
-    stop, ``OmniARScheduler.update_from_output`` does::
-
-        request.async_tokens_to_discard = 1        # hardcoded
-        request.num_output_placeholders = 0
-
-    i.e. it assumes exactly one async token is in flight and, unlike omni's own
-    *resume* path, it never rolls ``num_computed_tokens`` back for the tokens it
-    is about to discard. Combined with vLLM 0.24's async accounting (a discarded
-    token returns early from ``AsyncScheduler._update_request_with_output``
-    without decrementing ``num_output_placeholders``) this leaves the re-admitted
-    session in an unschedulable state:
-
-    * a leaked placeholder (``placeholders>0`` with ``num_computed==num_tokens``)
-      permanently trips the scheduler's async skip-optimisation, or
-    * ``num_computed_tokens == num_tokens`` with ``placeholders==0`` yields
-      ``num_new_tokens==0``.
-
-    Either way the request is never scheduled again and paced clients hang.
-
-    The fix mirrors omni's resume path: snapshot the *true* number of in-flight
-    async tokens at the moment of the stop, then after ``update_from_output`` set
-    ``async_tokens_to_discard`` to that count (0 when nothing is in flight, so no
-    spurious discard) and roll ``num_computed_tokens`` back by the same amount.
-
-    TODO(upstream): fix ``OmniARScheduler.update_from_output`` directly so the
-    segment-stop branch uses ``async_tokens_to_discard = num_output_placeholders``
-    and ``num_computed_tokens -= num_output_placeholders`` (matching the resume
-    branch), then drop this override.
+    vLLM-Omni 0.26 handles segment stops, but still discards only one outstanding
+    token on resume. Keep that correction and EasyMagpie session metadata here.
     """
 
-    def _update_request_with_output(self, request: Request, new_token_ids):
-        new_token_ids, stopped = super()._update_request_with_output(request, new_token_ids)
-        if stopped:
-            # After super() has decremented the placeholder for the stopping
-            # token, ``num_output_placeholders`` is the number of *other* async
-            # tokens still in flight for this request — the value omni's stop
-            # handler should have used but overwrites with a hardcoded 1. Record
-            # it so update_from_output can restore the correct accounting. Only
-            # tracked while inside update_from_output, so there is no per-step
-            # cost beyond the (rare) segment stops themselves.
-            pending = getattr(self, "_emp_stopped_this_step", None)
-            if pending is not None:
-                pending.append((request, request.num_output_placeholders))
-        return new_token_ids, stopped
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if self.vllm_config.model_config.stage_id == 0 and self.chunk_transfer_adapter is not None:
+            self.chunk_transfer_adapter._send_single_request = MethodType(
+                _send_talker_chunk, self.chunk_transfer_adapter
+            )
 
-    def update_from_output(self, scheduler_output, model_runner_output):
-        self._emp_stopped_this_step = []
-        try:
-            outputs = super().update_from_output(scheduler_output, model_runner_output)
-            for request, snap in self._emp_stopped_this_step:
-                # Only correct resumable stops where omni actually armed a discard.
-                if getattr(request, "async_tokens_to_discard", 0) > 0:
-                    request.async_tokens_to_discard = snap
-                    if snap > 0:
-                        request.num_computed_tokens -= snap
-        finally:
-            self._emp_stopped_this_step = None
-        return outputs
+    def add_request(self, request: Request) -> None:
+        session = self.requests.get(request.request_id)
+        if (
+            self.vllm_config.model_config.stage_id == 0
+            and session is not None
+            and session.resumable
+            and not request.resumable
+            and session.status == RequestStatus.WAITING_FOR_STREAMING_REQ
+        ):
+            # A final input after a segment stopped is normal completion, not
+            # an abort. Free receiver state before flushing the retained tail.
+            session.resumable = False
+            self.finish_requests(session.request_id, RequestStatus.FINISHED_STOPPED)
+            if self.chunk_transfer_adapter is not None:
+                self.chunk_transfer_adapter.save_async(None, session)
+            return
+        super().add_request(request)
 
     def _handle_stopped_request(self, request: Request) -> bool:
         # The input engine queues ``None`` after the final StreamingInput but
@@ -133,6 +101,15 @@ class EasyMagpieARAsyncScheduler(OmniARAsyncScheduler):
             session.num_computed_tokens = session.num_tokens - 1
 
 
+def _send_talker_chunk(adapter: OmniChunkTransferAdapter, task: dict):
+    previous = getattr(adapter, "_easymagpie_send_finish", None)
+    adapter._easymagpie_send_finish = (task["is_finished"], task["is_segment_finished"])
+    try:
+        return OmniChunkTransferAdapter._send_single_request(adapter, task)
+    finally:
+        adapter._easymagpie_send_finish = previous
+
+
 def _codec_payload_frames(info, num_quantizers: int) -> int:
     """Return the number of time-major acoustic rows in a connector payload."""
     codes = info.get("codes", {}) if isinstance(info, dict) else {}
@@ -146,31 +123,51 @@ def _codec_payload_frames(info, num_quantizers: int) -> int:
     raise ValueError(f"invalid native codec payload shape: {tuple(audio.shape)}")
 
 
+def _without_consumed_codec_audio(info):
+    """Copy request metadata without the previous chunk's audio codes."""
+    if not isinstance(info, dict):
+        return info
+    codes = info.get("codes")
+    if not isinstance(codes, dict) or "audio" not in codes:
+        return info
+    return {**info, "codes": {key: value for key, value in codes.items() if key != "audio"}}
+
+
 def _poll_native_codec_chunk_unlocked(adapter: OmniChunkTransferAdapter, request: Request) -> bool:
     """Receive a chunk without resetting the vLLM state-cache position."""
     old_num_computed_tokens = request.num_computed_tokens
+    old_additional_information = request.additional_information
     # Async-chunk prewarm may install one unscheduled placeholder before the
     # first real payload. Only tokens with materialized state are retained.
     old_prompt = list(request.prompt_token_ids or [])[:old_num_computed_tokens]
     old_all_token_ids = list(request._all_token_ids)[:old_num_computed_tokens]
 
+    # vLLM-Omni merges incoming generation payloads into this object. Remove
+    # consumed audio so a control-only boundary cannot inherit and replay it.
+    poll_information = _without_consumed_codec_audio(old_additional_information)
+    request.additional_information = poll_information
     received = OmniChunkTransferAdapter._poll_single_request(adapter, request)
-    if not received:
-        request.prompt_token_ids = old_prompt
-        request._all_token_ids[:] = old_all_token_ids
-        request.num_prompt_tokens = len(old_prompt)
-        request.num_computed_tokens = old_num_computed_tokens
-        request.update_block_hashes()
-        return False
+    if received:
+        frames = _codec_payload_frames(request.additional_information, adapter._easymagpie_num_quantizers)
+        # Empty terminal controls must wake the request for zero-token completion.
+        if frames > 0 or request.request_id in adapter.upstream_exhausted_requests:
+            placeholders = [0] * frames
+            request.prompt_token_ids = old_prompt + placeholders
+            request._all_token_ids[:] = old_all_token_ids + placeholders
+            request.num_prompt_tokens = len(request.prompt_token_ids)
+            request.num_computed_tokens = old_num_computed_tokens
+            request.update_block_hashes()
+            return True
+        adapter._finished_load_reqs.discard(request.request_id)
+    elif request.additional_information is poll_information:
+        request.additional_information = old_additional_information
 
-    frames = _codec_payload_frames(request.additional_information, adapter._easymagpie_num_quantizers)
-    placeholders = [0] * frames
-    request.prompt_token_ids = old_prompt + placeholders
-    request._all_token_ids[:] = old_all_token_ids + placeholders
-    request.num_prompt_tokens = len(request.prompt_token_ids)
+    request.prompt_token_ids = old_prompt
+    request._all_token_ids[:] = old_all_token_ids
+    request.num_prompt_tokens = len(old_prompt)
     request.num_computed_tokens = old_num_computed_tokens
     request.update_block_hashes()
-    return True
+    return False
 
 
 def _poll_native_codec_chunk(adapter: OmniChunkTransferAdapter, request: Request) -> bool:
