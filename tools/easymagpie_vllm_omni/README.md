@@ -106,6 +106,13 @@ feasible batch size, bounded by the codec request and token limits. This adds
 startup work and may retain library caches; measure startup memory as well as
 steady-state performance. Model weights and live request state are unchanged.
 
+### Guarded router copy elision
+
+On the pinned CUDA grouped router, eligible unquantized FP16 gate outputs skip a redundant widening copy.
+The small-expert kernel still uses FP32 sigmoid, bias and top-k; gate output and shared router dtype change
+together. Unsupported dtypes, shapes, backends and specialized GEMMs keep upstream behavior. This does not
+enable the H100 profile or guarantee that every deployment uses the optimization.
+
 ### Quick start — offline synthesis
 
 See the [`offline_demo.ipynb`](../../tutorials/tts/easymagpie_vllm_omni/offline_demo.ipynb) tutorial to check how

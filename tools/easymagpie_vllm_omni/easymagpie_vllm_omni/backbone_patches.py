@@ -19,8 +19,12 @@ from functools import wraps
 
 import torch
 import vllm.v1.attention.backends.mamba_attn as _mamba_attn
+from vllm import envs, platforms
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import ReLUSquaredActivation, get_act_fn
+from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
+from vllm.model_executor.layers.fused_moe.router.grouped_topk_router import GroupedTopKRouter
+from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 from vllm.v1.attention.backends.mamba2_attn import Mamba2AttentionMetadataBuilder
 
 logger = init_logger(__name__)
@@ -162,4 +166,50 @@ def patch_moe_routed_scale(backbone) -> int:
         mixer.register_forward_hook(_scale_output)
         patched += 1
     logger.info("FP16 MoE routed-scale fix installed on %d layers", patched)
+    return patched
+
+
+def patch_moe_router_logit_cast(backbone) -> int:
+    """Elide an exact FP16-to-FP32 copy before the small-expert CUDA router.
+
+    This GateLinear fallback already returns FP16 GEMM results. The selected
+    fused router widens each value before FP32 sigmoid, bias and top-k math.
+    The generic grouped kernel does not, so leave other shapes unchanged.
+    """
+    if not platforms.current_platform.is_cuda() or not envs.VLLM_USE_FUSED_MOE_GROUPED_TOPK:
+        return 0
+
+    patched = 0
+    for layer in backbone.layers:
+        mixer = getattr(layer, "mixer", None)
+        if mixer is None or mixer.__class__.__name__ != "NemotronHMoE":
+            continue
+        gate = getattr(mixer, "gate", None)
+        experts = getattr(mixer, "experts", None)
+        router = getattr(experts, "router", None)
+        config = getattr(experts, "moe_config", None)
+        if (
+            type(gate) is not GateLinear
+            or type(gate.quant_method) is not UnquantizedLinearMethod
+            or gate.out_dtype != torch.float32
+            or gate.weight.dtype != torch.float16
+            or getattr(experts, "is_monolithic", True)
+            or getattr(config, "router_logits_dtype", None) != torch.float32
+            or type(router) is not GroupedTopKRouter
+            or router.scoring_func != "sigmoid"
+            or router.e_score_correction_bias is None
+            or router.num_expert_group != 1
+            or router.topk_group != 1
+            or not 1 < gate.weight.shape[0] <= 128
+            or not 0 < router.top_k <= min(8, gate.weight.shape[0])
+            or any(
+                getattr(gate, f"allow_{name}_gemm", True)
+                for name in ("ll_bf16", "dsv3_router", "fp32_router", "bf16x3_router", "cublas_router")
+            )
+        ):
+            continue
+        gate.out_dtype = torch.float16
+        config.router_logits_dtype = torch.float16
+        patched += 1
+    logger.info("Exact FP16 router-logit copy removed on %d layers", patched)
     return patched

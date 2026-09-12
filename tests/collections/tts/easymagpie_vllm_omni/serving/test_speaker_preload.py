@@ -56,6 +56,7 @@ def _model(tmp_path, monkeypatch, dtype=torch.float16):
         "NemotronHModel",
         "EasyMagpieCodePredictor",
         "patch_shared_expert_activation",
+        "patch_moe_router_logit_cast",
         "patch_moe_routed_scale",
         "patch_mamba_streaming_decode",
         "patch_mamba_prefill_initial_states",
