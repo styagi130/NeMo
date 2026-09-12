@@ -60,6 +60,40 @@ def metadata(frames: int, *, has_initial: bool, device: torch.device | str = "cp
     )
     result.codec_max_query_len = frames
     result.codec_uniform = True
+    result.codec_prefill_uniform = True
+    return result
+
+
+def uniform_metadata(
+    frames: int,
+    *,
+    pages: tuple[int, ...],
+    has_initial: bool,
+    device: torch.device | str,
+) -> Mamba1AttentionMetadata:
+    starts = torch.arange(len(pages) + 1, dtype=torch.int32, device=device) * frames
+    result = Mamba1AttentionMetadata(
+        num_prefills=len(pages),
+        num_prefill_tokens=len(pages) * frames,
+        num_decodes=0,
+        num_decode_tokens=0,
+        num_reqs=len(pages),
+        has_initial_states_p=torch.full((len(pages),), has_initial, dtype=torch.bool, device=device),
+        query_start_loc_p=starts,
+        num_computed_tokens_p=None,
+        state_indices_tensor_p=torch.tensor(pages, dtype=torch.int32, device=device),
+        state_indices_tensor_d=torch.empty((0, 1), dtype=torch.int32, device=device),
+        query_start_loc_d=None,
+        num_accepted_tokens=None,
+        block_idx_last_scheduled_token=None,
+        block_idx_first_scheduled_token_p=None,
+        block_idx_last_computed_token=None,
+        block_idx_last_scheduled_token_prev_step=None,
+        seq_lens=torch.full((len(pages),), frames, dtype=torch.int32, device=device),
+    )
+    result.codec_max_query_len = frames
+    result.codec_uniform = True
+    result.codec_prefill_uniform = True
     return result
 
 
@@ -89,6 +123,7 @@ def decode_metadata(
         seq_lens=torch.full((num_decodes,), 2, dtype=torch.int32, device=device),
     )
     result.codec_uniform = True
+    result.codec_prefill_uniform = False
     return result
 
 
@@ -113,6 +148,35 @@ def mixed_metadata(prefill_frames: int, *, device: torch.device | str = "cpu") -
         seq_lens=torch.tensor([2, prefill_frames], dtype=torch.int32, device=device),
     )
     result.codec_max_query_len = prefill_frames
+    result.codec_uniform = False
+    result.codec_prefill_uniform = True
+    return result
+
+
+def ragged_metadata(lengths: tuple[int, ...], *, device: torch.device | str) -> Mamba1AttentionMetadata:
+    starts = torch.tensor([0, *torch.tensor(lengths).cumsum(0).tolist()], dtype=torch.int32, device=device)
+    result = Mamba1AttentionMetadata(
+        num_prefills=len(lengths),
+        num_prefill_tokens=sum(lengths),
+        num_decodes=0,
+        num_decode_tokens=0,
+        num_reqs=len(lengths),
+        has_initial_states_p=torch.zeros(len(lengths), dtype=torch.bool, device=device),
+        query_start_loc_p=starts,
+        num_computed_tokens_p=None,
+        state_indices_tensor_p=torch.arange(len(lengths), dtype=torch.int32, device=device),
+        state_indices_tensor_d=torch.empty((0, 1), dtype=torch.int32, device=device),
+        query_start_loc_d=None,
+        num_accepted_tokens=None,
+        block_idx_last_scheduled_token=None,
+        block_idx_first_scheduled_token_p=None,
+        block_idx_last_computed_token=None,
+        block_idx_last_scheduled_token_prev_step=None,
+        seq_lens=torch.tensor(lengths, dtype=torch.int32, device=device),
+    )
+    result.codec_max_query_len = max(lengths)
+    result.codec_uniform = False
+    result.codec_prefill_uniform = False
     return result
 
 
@@ -257,3 +321,148 @@ def test_cuda_packed_kernels_preserve_state_across_chunks() -> None:
             pieces.append(streamed(codes[0, frame : frame + 1]))
 
     torch.testing.assert_close(torch.cat(pieces), expected, atol=3e-5, rtol=3e-5)
+
+
+@pytest.mark.parametrize("frames", [2, 4, 6, 8])
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for cuDNN integration")
+def test_cuda_uniform_prefill_batch_matches_separate_decode_and_continuation(frames: int) -> None:
+    torch.manual_seed(30 + frames)
+    device = torch.device("cuda")
+    config = tiny_config()
+    vllm_config = VllmConfig()
+    with set_current_vllm_config(vllm_config):
+        full = PackedEasyMagpieCodec(config, dtype=torch.float32, prefix="full").to(device).eval()
+        packed = PackedEasyMagpieCodec(config, dtype=torch.float32, prefix="uniform").to(device).eval()
+    packed.load_state_dict(full.state_dict(), strict=True)
+
+    state_layers = [module for module in packed.modules() if isinstance(module, CodecStateLayer)]
+    for layer in state_layers:
+        layer.kv_cache = [torch.zeros((2, CODEC_STATE_ELEMENTS), device=device)]
+
+    first = torch.randint(0, config.codebook_size, (2, frames, config.num_stacked_codebooks), device=device)
+    continuation = torch.randint(0, config.codebook_size, first.shape, device=device)
+    initial_metadata = {
+        layer.prefix: uniform_metadata(frames, pages=(0, 1), has_initial=False, device=device)
+        for layer in state_layers
+    }
+    with set_forward_context(initial_metadata, vllm_config):
+        first_actual = packed(first.flatten(0, 1))
+
+    continuation_metadata = {
+        layer.prefix: uniform_metadata(frames, pages=(0, 1), has_initial=True, device=device) for layer in state_layers
+    }
+    with set_forward_context(continuation_metadata, vllm_config):
+        continuation_actual = packed(continuation.flatten(0, 1))
+
+    replacement = torch.randint(0, config.codebook_size, first.shape, device=device)
+    replacement_metadata = {
+        layer.prefix: uniform_metadata(frames, pages=(0, 1), has_initial=False, device=device)
+        for layer in state_layers
+    }
+    with set_forward_context(replacement_metadata, vllm_config):
+        replacement_actual = packed(replacement.flatten(0, 1))
+
+    with set_forward_context(None, vllm_config):
+        expected = [full(torch.cat((first[index], continuation[index]))) for index in range(2)]
+        replacement_expected = torch.cat([full(sequence) for sequence in replacement])
+    split = frames * config.samples_per_frame
+    first_expected = torch.cat([waveform[:split] for waveform in expected])
+    continuation_expected = torch.cat([waveform[split:] for waveform in expected])
+    torch.testing.assert_close(first_actual, first_expected, atol=3e-5, rtol=3e-5)
+    torch.testing.assert_close(continuation_actual, continuation_expected, atol=3e-5, rtol=3e-5)
+    torch.testing.assert_close(replacement_actual, replacement_expected, atol=3e-5, rtol=3e-5)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for cuDNN integration")
+def test_cuda_terminal_padding_preserves_valid_waveform_prefix() -> None:
+    torch.manual_seed(39)
+    device = torch.device("cuda")
+    config = tiny_config()
+    vllm_config = VllmConfig()
+    with set_current_vllm_config(vllm_config):
+        full = PackedEasyMagpieCodec(config, dtype=torch.float32, prefix="full").to(device).eval()
+        packed = PackedEasyMagpieCodec(config, dtype=torch.float32, prefix="terminal").to(device).eval()
+    packed.load_state_dict(full.state_dict(), strict=True)
+
+    state_layers = [module for module in packed.modules() if isinstance(module, CodecStateLayer)]
+    for layer in state_layers:
+        layer.kv_cache = [torch.zeros((2, CODEC_STATE_ELEMENTS), device=device)]
+
+    sequences = [
+        torch.randint(0, config.codebook_size, (frames, config.num_stacked_codebooks), device=device)
+        for frames in (3, 5)
+    ]
+    sequences[0][-1, 1::2] = config.codebook_size
+    padded = [
+        torch.cat((sequence, sequence.new_full((8 - len(sequence), sequence.shape[1]), -1))) for sequence in sequences
+    ]
+    layer_metadata = {
+        layer.prefix: uniform_metadata(8, pages=(0, 1), has_initial=False, device=device) for layer in state_layers
+    }
+    with set_forward_context(layer_metadata, vllm_config):
+        actual = packed(torch.cat(padded)).view(2, 8 * config.samples_per_frame)
+    with set_forward_context(None, vllm_config):
+        expected = [full(sequence) for sequence in sequences]
+
+    first_valid = 2 * config.samples_per_frame + config.samples_per_codec_frame
+    torch.testing.assert_close(actual[0, :first_valid], expected[0][:first_valid], atol=3e-5, rtol=3e-5)
+    torch.testing.assert_close(actual[1, : len(expected[1])], expected[1], atol=3e-5, rtol=3e-5)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for Triton integration")
+def test_cuda_ragged_batch_matches_separate_decode() -> None:
+    torch.manual_seed(31)
+    device = torch.device("cuda")
+    config = tiny_config()
+    vllm_config = VllmConfig()
+    with set_current_vllm_config(vllm_config):
+        full = PackedEasyMagpieCodec(config, dtype=torch.float32, prefix="full").to(device).eval()
+        packed = PackedEasyMagpieCodec(config, dtype=torch.float32, prefix="ragged").to(device).eval()
+    packed.load_state_dict(full.state_dict(), strict=True)
+
+    state_layers = [module for module in packed.modules() if isinstance(module, CodecStateLayer)]
+    for layer in state_layers:
+        layer.kv_cache = [torch.zeros((2, CODEC_STATE_ELEMENTS), device=device)]
+
+    sequences = [
+        torch.randint(0, config.codebook_size, (length, config.num_stacked_codebooks), device=device)
+        for length in (3, 2)
+    ]
+    layer_metadata = {layer.prefix: ragged_metadata((3, 2), device=device) for layer in state_layers}
+    with set_forward_context(layer_metadata, vllm_config):
+        actual = packed(torch.cat(sequences))
+    with set_forward_context(None, vllm_config):
+        expected = torch.cat([full(sequence) for sequence in sequences])
+
+    torch.testing.assert_close(actual, expected, atol=3e-5, rtol=3e-5)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for cuDNN integration")
+def test_cuda_mixed_decode_and_uniform_prefill_batch() -> None:
+    torch.manual_seed(37)
+    device = torch.device("cuda")
+    config = tiny_config()
+    vllm_config = VllmConfig()
+    with set_current_vllm_config(vllm_config):
+        full = PackedEasyMagpieCodec(config, dtype=torch.float32, prefix="full").to(device).eval()
+        packed = PackedEasyMagpieCodec(config, dtype=torch.float32, prefix="mixed").to(device).eval()
+    packed.load_state_dict(full.state_dict(), strict=True)
+
+    state_layers = [module for module in packed.modules() if isinstance(module, CodecStateLayer)]
+    for layer in state_layers:
+        layer.kv_cache = [torch.zeros((2, CODEC_STATE_ELEMENTS), device=device)]
+
+    decode_codes = torch.randint(0, config.codebook_size, (2, config.num_stacked_codebooks), device=device)
+    prefill_codes = torch.randint(0, config.codebook_size, (2, config.num_stacked_codebooks), device=device)
+    first_metadata = {layer.prefix: metadata(1, has_initial=False, device=device) for layer in state_layers}
+    with set_forward_context(first_metadata, vllm_config):
+        packed(decode_codes[:1])
+
+    layer_metadata = {layer.prefix: mixed_metadata(2, device=device) for layer in state_layers}
+    with set_forward_context(layer_metadata, vllm_config):
+        actual = packed(torch.cat((decode_codes[1:], prefill_codes)))
+
+    with set_forward_context(None, vllm_config):
+        decode_expected = full(decode_codes)[config.samples_per_frame :]
+        prefill_expected = full(prefill_codes)
+    torch.testing.assert_close(actual, torch.cat((decode_expected, prefill_expected)), atol=3e-5, rtol=3e-5)

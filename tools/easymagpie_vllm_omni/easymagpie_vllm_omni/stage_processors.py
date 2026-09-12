@@ -33,6 +33,7 @@ logger = init_logger(__name__)
 
 # Base codebook size, excluding control tokens.
 _CODEBOOK_SIZE = 1024
+_CODEC_PADDING = -1
 
 
 def _empty_finished_payload() -> dict[str, Any]:
@@ -403,6 +404,12 @@ def talker2code2wav_async_chunk(
     relative_start = emitted - base_index
     relative_end = new_end - base_index
     code_predictor_codes = torch.stack(buffer[relative_start:relative_end], dim=0).contiguous()
+    if true_finished and context_length < chunk_size:
+        padding = code_predictor_codes.new_full(
+            (chunk_size - context_length, code_predictor_codes.shape[1]),
+            _CODEC_PADDING,
+        )
+        code_predictor_codes = torch.cat((code_predictor_codes, padding), dim=0)
 
     emitted_state[request_id] = new_end
     emitted_chunks_state[request_id] += 1

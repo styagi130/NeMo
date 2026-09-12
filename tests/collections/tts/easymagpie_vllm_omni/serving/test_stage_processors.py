@@ -174,7 +174,27 @@ def test_async_codec_forwards_terminal_audio_eos_row():
     )
 
     assert bool(terminal.meta.finished)
-    torch.testing.assert_close(terminal.codes.audio, torch.tensor([[1, 101], [2, 102], [1025, 777]]))
+    torch.testing.assert_close(
+        terminal.codes.audio,
+        torch.tensor([[1, 101], [2, 102], [1025, 777], [-1, -1]]),
+    )
+
+
+def test_async_codec_pads_short_terminal_chunk_to_steady_size():
+    manager = _manager()
+    manager.config.hf_config.streaming_speech_delay = 0
+    manager.connector.config["extra"]["codec_chunk_frames"] = 4
+    request = _Request()
+    request.resumable = False
+
+    assert talker2code2wav_async_chunk(manager, _output(1), request) is None
+    request.finished = True
+    terminal = talker2code2wav_async_chunk(manager, _output(2), request, is_finished=True)
+
+    torch.testing.assert_close(
+        terminal.codes.audio,
+        torch.tensor([[1, 101], [2, 102], [-1, -1], [-1, -1]]),
+    )
 
 
 def test_async_codec_buffer_drops_emitted_rows():
@@ -319,7 +339,7 @@ def test_async_codec_normal_receiver_cleanup_before_save_preserves_terminal_tail
     manager.connector.put = put
     manager._send_single_request(manager._pending_save_reqs.popleft())
     assert len(sent) == 1
-    torch.testing.assert_close(sent[0].codes.audio, torch.tensor([[1, 101], [2, 102]]))
+    torch.testing.assert_close(sent[0].codes.audio, torch.tensor([[1, 101], [2, 102], [-1, -1], [-1, -1]]))
     assert bool(sent[0].meta.finished)
     for name, state in vars(manager).items():
         if name.startswith("_emp_"):
@@ -433,7 +453,8 @@ def test_late_stream_final_frees_request_and_delivers_codec_tail(monkeypatch, fr
 
     assert sum(bool(payload.meta.finished) for payload in sent) == 1
     rows = [row for payload in sent if payload.codes is not None for row in payload.codes.audio.tolist()]
-    assert rows == [[frame, frame + 100] for frame in range(1, frames + 1)]
+    expected = [[frame, frame + 100] for frame in range(1, frames + 1)]
+    assert rows == expected + [[-1, -1]] * (-frames % 4)
     for name, state in vars(manager).items():
         if name.startswith("_emp_"):
             assert request.external_req_id not in state, name
