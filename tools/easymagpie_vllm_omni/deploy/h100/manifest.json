@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "description": "Historical opt-in EasyMagpie H100 kernel tables; not a new tuning or accuracy claim.",
+  "gpu_name": "NVIDIA H100 80GB HBM3",
+  "versions": {
+    "vllm": "0.26.0",
+    "vllm-omni": "0.26.0",
+    "torch": "2.11.0+cu130",
+    "triton": "3.6.0"
+  },
+  "model_shape": {
+    "hidden_size": 1536,
+    "n_routed_experts": 24,
+    "num_experts_per_tok": 4,
+    "moe_intermediate_size": 768,
+    "mlp_hidden_act": "silu",
+    "n_group": 1,
+    "topk_group": 1,
+    "mamba_num_heads": 64,
+    "mamba_head_dim": 24,
+    "ssm_state_size": 128,
+    "n_groups": 8
+  },
+  "runtime": {
+    "model_dtype": "float16",
+    "mamba_cache_dtype": "float32",
+    "tensor_parallel_size": 1,
+    "quantization": null
+  },
+  "tables": {
+    "E=24,N=768,device_name=NVIDIA_H100_80GB_HBM3.json": "0115d21bde3e198e2168a76e3435fe3db3e2863268efd9f7cabfff424e79fb5b",
+    "headdim=24,dstate=128,device_name=NVIDIA_H100_80GB_HBM3,cache_dtype=float32.json": "b8972b1102a8eed96fbde85f07721d6389202b3bec9ed3ed8eac31949ab6f267"
+  },
+  "vllm_sources": {
+    "vllm/model_executor/layers/fused_moe/fused_moe.py": "a8015d90908883d3dc459e7a508d2de56bfbdff678c5f36e23d0410ef5a04683",
+    "vllm/model_executor/layers/fused_moe/config.py": "f229a423db043aed9f0f7e09d586f82c5a05cbba5871784f0f46500059c745e6",
+    "vllm/model_executor/layers/mamba/ops/mamba_ssm.py": "41c8372327d93452cf235853ad284ad28479936b8f4a6bb17e392ad6ae63d81d"
+  },
+  "provenance": {
+    "snapshot_verified_utc": "2026-09-10T18:51:58Z",
+    "source_image_sha256": "62f539e01cf590bc430a4ff053a00300b912072bcd8ace9a6b83ea6025b1d469",
+    "vllm_source_revision": "ffd46bfab",
+    "runtime_evidence": "Both historical Stage0 replicas logged loading both named tables.",
+    "scope": "The two original table files are retained byte-for-byte; no source or runtime cache is copied.",
+    "limitations": "The Mamba table was modified after its retained five-shape sweep. Full sweep provenance for all sixteen entries is unavailable."
+  },
+  "mamba_measured_effective_batches": [64, 128, 256, 512, 1024],
+  "mamba_table_entries": 16,
+  "mamba_effective_batch_formula": "request_batch * 64",
+  "lookup": "Both readers use nearest available batch keys; larger batches do not imply tuning coverage."
+}

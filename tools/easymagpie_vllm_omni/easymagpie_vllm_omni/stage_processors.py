@@ -290,7 +290,8 @@ def talker2code2wav_async_chunk(
         if requests.get(request_id) is request:
             _cleanup_codec_request(transfer_manager, request_id)
         return None
-    # Queued sends outlive Request status changes; use their captured finish flags.
+    # Queued sends outlive Request status changes; only their captured finish
+    # flags may flush/reset audio state. Live status still handles aborts above.
     send_finish = getattr(transfer_manager, "_easymagpie_send_finish", None)
     if send_finish is None:
         finished = bool(is_finished or request.is_finished())
@@ -300,6 +301,8 @@ def talker2code2wav_async_chunk(
         finished = bool(true_finished or segment_finished)
     if not isinstance(multimodal_output, Mapping) and not finished:
         return None
+    # Sender-owned cleanup runs on admission, not every frame. Receiver
+    # cancellation markers also cover normal finishes, whose audio must flush.
     if requests.get(request_id) is not request:
         for previous_id, previous in list(requests.items()):
             if _is_failed_codec_request(previous):
@@ -355,10 +358,15 @@ def talker2code2wav_async_chunk(
             f"must be a list, got {type(raw_startup_chunks).__name__}"
         )
     startup_chunk_sizes = [int(value) for value in raw_startup_chunks]
-    if chunk_size <= 0 or any(value <= 0 for value in startup_chunk_sizes):
+    raw_busy_chunks = cfg.get("codec_busy_startup_chunk_frames", raw_startup_chunks)
+    if not isinstance(raw_busy_chunks, (list, tuple)):
+        raise ValueError("codec_busy_startup_chunk_frames must be a list")
+    busy_chunk_sizes = [int(value) for value in raw_busy_chunks]
+    if chunk_size <= 0 or any(value <= 0 for value in startup_chunk_sizes + busy_chunk_sizes):
         raise ValueError(
             f"Invalid EasyMagpie codec chunk config: codec_chunk_frames={chunk_size}, "
-            f"codec_startup_chunk_frames={startup_chunk_sizes}"
+            f"codec_startup_chunk_frames={startup_chunk_sizes}, "
+            f"codec_busy_startup_chunk_frames={busy_chunk_sizes}"
         )
     # Track one absolute emission high-water mark across resumable text
     # segments so repeated segment-finish notifications cannot duplicate frames.
@@ -372,6 +380,12 @@ def talker2code2wav_async_chunk(
     emitted = emitted_state[request_id]
     emitted_chunks_state = _persistent_state(transfer_manager, "_emp_emitted_chunks")
     emitted_chunks = emitted_chunks_state[request_id]
+    request_startup_chunks = _persistent_list_state(transfer_manager, "_emp_request_startup_chunks")
+    if request_id not in request_startup_chunks:
+        # Freeze the profile across text segments; only other emitting requests count.
+        busy = any(key != request_id and value > 0 for key, value in emitted_chunks_state.items())
+        request_startup_chunks[request_id] = busy_chunk_sizes if busy else startup_chunk_sizes
+    startup_chunk_sizes = request_startup_chunks[request_id]
 
     if length <= 0:
         if finished:
@@ -438,6 +452,7 @@ def _cleanup_codec_request(transfer_manager: Any, request_id: str) -> None:
         "_emp_requests",
         "_emp_emitted_frames",
         "_emp_emitted_chunks",
+        "_emp_request_startup_chunks",
         "_emp_seen_frames",
         "_emp_request_speech_delay",
         "_emp_frame_buffer_base",

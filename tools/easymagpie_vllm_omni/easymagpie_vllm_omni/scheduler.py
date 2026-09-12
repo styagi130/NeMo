@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import threading
 from copy import copy
+from time import monotonic, sleep
 from types import MethodType
 
 import torch
@@ -39,10 +40,29 @@ class EasyMagpieARAsyncScheduler(OmniARAsyncScheduler):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self._admission_wait_s = _coalesce_wait_s(self.vllm_config, "stage0_admission_coalesce_ms", 50)
+        self._admission_batch_target = _admission_batch_target(self.vllm_config, self.max_num_running_reqs)
+        self._admission_deadline = None
         if self.vllm_config.model_config.stage_id == 0 and self.chunk_transfer_adapter is not None:
             self.chunk_transfer_adapter._send_single_request = MethodType(
                 _send_talker_chunk, self.chunk_transfer_adapter
             )
+
+    def _should_defer_waiting_admission(self) -> bool:
+        # Coalesce only fresh idle-to-active bursts, never running or resumed work.
+        if not self._admission_wait_s or not self.waiting or self.running:
+            self._admission_deadline = None
+            return False
+        if any(request.num_computed_tokens > 0 for request in self.waiting):
+            self._admission_deadline = None
+            return False
+        if len(self.waiting) >= self._admission_batch_target:
+            self._admission_deadline = 0.0
+            return False
+        now = monotonic()
+        if self._admission_deadline is None:
+            self._admission_deadline = now + self._admission_wait_s
+        return now < self._admission_deadline
 
     def add_request(self, request: Request) -> None:
         existing = self.requests.get(request.request_id)
@@ -154,7 +174,8 @@ def _poll_native_codec_chunk_unlocked(adapter: OmniChunkTransferAdapter, request
     received = OmniChunkTransferAdapter._poll_single_request(adapter, request)
     if received:
         frames = _codec_payload_frames(request.additional_information, adapter._easymagpie_num_quantizers)
-        # Empty terminal controls must wake the request for zero-token completion.
+        # An empty terminal payload must wake the scheduler for zero-token
+        # completion; intermediate controls still wait for real codec frames.
         if frames > 0 or request.request_id in adapter.upstream_exhausted_requests:
             placeholders = [0] * frames
             request.prompt_token_ids = old_prompt + placeholders
@@ -177,8 +198,11 @@ def _poll_native_codec_chunk_unlocked(adapter: OmniChunkTransferAdapter, request
 
 def _poll_native_codec_chunk(adapter: OmniChunkTransferAdapter, request: Request) -> bool:
     """Publish connector readiness only after the request payload is coherent."""
-    with adapter._easymagpie_chunk_lock:
-        return _poll_native_codec_chunk_unlocked(adapter, request)
+    with adapter._easymagpie_chunk_ready:
+        received = _poll_native_codec_chunk_unlocked(adapter, request)
+        if received:
+            adapter._easymagpie_chunk_ready.notify_all()
+        return received
 
 
 class EasyMagpieCodecScheduler(OmniGenerationScheduler):
@@ -193,7 +217,10 @@ class EasyMagpieCodecScheduler(OmniGenerationScheduler):
         num_quantizers = int(getattr(config, "num_stacked_codebooks", 0))
         if num_quantizers <= 0:
             raise ValueError("native EasyMagpie codec config has no stacked codebooks")
+        self._codec_startup_wait_s = _coalesce_wait_s(self.vllm_config, "codec_startup_coalesce_ms", 2)
+        self._codec_busy_wait_s = _coalesce_wait_s(self.vllm_config, "codec_busy_coalesce_ms", 4)
         adapter._easymagpie_chunk_lock = threading.Lock()
+        adapter._easymagpie_chunk_ready = threading.Condition(adapter._easymagpie_chunk_lock)
         adapter._easymagpie_num_quantizers = num_quantizers
         adapter._poll_single_request = MethodType(_poll_native_codec_chunk, adapter)
 
@@ -261,6 +288,58 @@ class EasyMagpieCodecScheduler(OmniGenerationScheduler):
             self._easymagpie_stopped_sessions = None
         return outputs
 
+    def _should_coalesce_codec_startup(self) -> bool:
+        if not self._codec_startup_wait_s or self.running:
+            return False
+        adapter = self.chunk_transfer_adapter
+        with adapter._easymagpie_chunk_lock:
+            return any(
+                request.status == RequestStatus.WAITING_FOR_CHUNK
+                and request.num_computed_tokens == 0
+                and request.request_id in adapter._finished_load_reqs
+                for request in self.waiting
+            )
+
+    def _ready_codec_requests(self):
+        ready = self.chunk_transfer_adapter._finished_load_reqs
+        return [request for request in (*self.running, *self.waiting) if request.request_id in ready]
+
+    def _codec_busy_wait_done(self) -> bool:
+        ready = self.chunk_transfer_adapter._finished_load_reqs
+        return any(request.num_computed_tokens == 0 for request in self._ready_codec_requests()) or all(
+            request.request_id in ready for request in self.running
+        )
+
+    def _should_coalesce_codec_busy(self) -> bool:
+        if not self._codec_busy_wait_s or len(self.running) < 2:
+            return False
+        ready = self._ready_codec_requests()
+        return any(request.num_computed_tokens > 0 for request in ready) and not self._codec_busy_wait_done()
+
     def schedule(self, *args, **kwargs):
-        with self.chunk_transfer_adapter._easymagpie_chunk_lock:
+        adapter = self.chunk_transfer_adapter
+        if self._should_coalesce_codec_startup():
+            sleep(self._codec_startup_wait_s)
+        with adapter._easymagpie_chunk_ready:
+            if self._should_coalesce_codec_busy():
+                # Release the payload lock while connector polling fills the batch.
+                adapter._easymagpie_chunk_ready.wait_for(self._codec_busy_wait_done, timeout=self._codec_busy_wait_s)
             return super().schedule(*args, **kwargs)
+
+
+def _admission_batch_target(vllm_config, capacity: int) -> int:
+    connector = getattr(vllm_config.model_config, "stage_connector_config", {})
+    extra = connector.get("extra", {}) if isinstance(connector, dict) else getattr(connector, "extra", {})
+    target = (extra or {}).get("stage0_admission_batch_target", capacity)
+    if type(target) is not int or target <= 0:
+        raise ValueError("stage0_admission_batch_target must be a positive integer")
+    return min(target, capacity)
+
+
+def _coalesce_wait_s(vllm_config, name: str, maximum_ms: int) -> float:
+    connector = getattr(vllm_config.model_config, "stage_connector_config", {})
+    extra = connector.get("extra", {}) if isinstance(connector, dict) else getattr(connector, "extra", {})
+    wait_ms = float((extra or {}).get(name, 0))
+    if not 0 <= wait_ms <= maximum_ms:
+        raise ValueError(f"{name} must be in [0, {maximum_ms}]")
+    return wait_ms / 1000

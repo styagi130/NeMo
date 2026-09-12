@@ -198,11 +198,13 @@ def _scheduler(capacity, retains_state):
     adapter.model_mode = "generation"
     adapter._easymagpie_num_quantizers = 2
     adapter._easymagpie_chunk_lock = threading.Lock()
+    adapter._easymagpie_chunk_ready = threading.Condition(adapter._easymagpie_chunk_lock)
     payloads, loads = {}, []
     adapter.connector = SimpleNamespace(stage_id=1, get=lambda source, target, key: payloads.pop(key, None))
     adapter.load_async = lambda request: loads.append(request.request_id)
 
     scheduler = object.__new__(EasyMagpieCodecScheduler)
+    scheduler._codec_startup_wait_s = scheduler._codec_busy_wait_s = 0
     scheduler.chunk_transfer_adapter = adapter
     scheduler.max_num_running_reqs = capacity
     scheduler.max_num_scheduled_tokens = 4104

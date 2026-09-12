@@ -284,12 +284,96 @@ def test_stateful_codec_emits_only_new_time_major_rows():
     assert manager._emp_frame_buffer_base[request.external_req_id] == 4
 
 
+@pytest.mark.parametrize("busy_chunks", [0, "8", [0], [-1]])
+def test_async_codec_rejects_invalid_busy_startup_ramp(busy_chunks):
+    manager = _manager()
+    manager.connector.config["extra"]["codec_busy_startup_chunk_frames"] = busy_chunks
+    with pytest.raises(ValueError, match="codec_busy_startup_chunk_frames"):
+        talker2code2wav_async_chunk(manager, _output(1), _Request())
+
+
+def test_async_codec_busy_startup_ramp_is_frozen_across_segments_and_cleaned_up():
+    manager = _manager()
+    manager.config.hf_config.streaming_speech_delay = 0
+    manager.connector.config["extra"].update(
+        codec_chunk_frames=4, codec_startup_chunk_frames=[1, 2], codec_busy_startup_chunk_frames=[3, 1]
+    )
+    first, busy = _Request(), _Request()
+    busy.external_req_id = "busy"
+    assert talker2code2wav_async_chunk(manager, _output(1), first) is not None
+    assert talker2code2wav_async_chunk(manager, _output(10), busy) is None
+
+    first.finished, first.resumable = True, False
+    assert talker2code2wav_async_chunk(manager, None, first, is_finished=True) is None
+    assert first.external_req_id not in manager._emp_request_startup_chunks
+
+    # Finishing the other request and a resumable segment must not change the profile.
+    busy.finished = True
+    assert talker2code2wav_async_chunk(manager, _output(11), busy, is_finished=True) is None
+    assert manager._emp_request_startup_chunks[busy.external_req_id] == [3, 1]
+    assert manager._emp_requests[busy.external_req_id] is busy
+    busy.finished = False
+    chunk = talker2code2wav_async_chunk(manager, _output(12), busy)
+    torch.testing.assert_close(chunk.codes.audio, torch.tensor([[10, 110], [11, 111], [12, 112]]))
+    chunk = talker2code2wav_async_chunk(manager, _output(13), busy)
+    torch.testing.assert_close(chunk.codes.audio, torch.tensor([[13, 113]]))
+
+    busy.finished, busy.resumable = True, False
+    assert talker2code2wav_async_chunk(manager, None, busy, is_finished=True) is None
+    assert manager._emp_request_startup_chunks == {}
+    assert manager._emp_emitted_chunks == {}
+    assert manager._emp_requests == {}
+    chunk = talker2code2wav_async_chunk(manager, _output(20), _Request())
+    torch.testing.assert_close(chunk.codes.audio, torch.tensor([[20, 120]]))
+
+
+@pytest.mark.parametrize("other_emitted", [0, 1])
+@pytest.mark.parametrize("configure_busy", [False, True])
+def test_async_codec_busy_selection_requires_another_emitting_request(other_emitted, configure_busy):
+    manager = _manager()
+    manager.config.hf_config.streaming_speech_delay = 0
+    manager.connector.config["extra"].update(codec_chunk_frames=4, codec_startup_chunk_frames=[1, 2])
+    if configure_busy:
+        manager.connector.config["extra"]["codec_busy_startup_chunk_frames"] = [3]
+    manager._emp_emitted_chunks = defaultdict(int, other=other_emitted)
+    request = _Request()
+
+    chunk = talker2code2wav_async_chunk(manager, _output(1), request)
+    if configure_busy and other_emitted:
+        assert chunk is None
+        assert manager._emp_request_startup_chunks[request.external_req_id] == [3]
+    else:
+        torch.testing.assert_close(chunk.codes.audio, torch.tensor([[1, 101]]))
+        # Its own first emission must not switch the request to the busy profile.
+        assert talker2code2wav_async_chunk(manager, _output(2), request) is None
+        chunk = talker2code2wav_async_chunk(manager, _output(3), request)
+        torch.testing.assert_close(chunk.codes.audio, torch.tensor([[2, 102], [3, 103]]))
+
+
+@pytest.mark.parametrize("speech_delay", [0, 2])
+def test_async_codec_terminal_cleans_busy_profile_with_partial_or_no_audio(speech_delay):
+    manager = _manager()
+    manager.config.hf_config.streaming_speech_delay = speech_delay
+    manager.connector.config["extra"].update(codec_chunk_frames=4, codec_busy_startup_chunk_frames=[3])
+    request = _Request()
+    assert talker2code2wav_async_chunk(manager, _output(1), request) is None
+    assert request.external_req_id in manager._emp_request_startup_chunks
+
+    request.finished, request.resumable = True, False
+    terminal = talker2code2wav_async_chunk(manager, None, request, is_finished=True)
+    assert terminal is not None
+    assert manager._emp_request_startup_chunks == {}
+
+
 @pytest.mark.parametrize("late_callback", [False, True])
+@pytest.mark.parametrize("configure_busy", [False, True])
 @pytest.mark.parametrize("status", [RequestStatus.FINISHED_ABORTED, RequestStatus.FINISHED_ERROR])
-def test_async_codec_abort_cleans_sender_state_before_next_request(monkeypatch, late_callback, status):
+def test_async_codec_abort_cleans_sender_state_before_next_request(monkeypatch, late_callback, configure_busy, status):
     manager = _adapter_manager(monkeypatch)
     manager.config.hf_config.streaming_speech_delay = 0
     manager.connector.config["extra"].update(codec_chunk_frames=4, codec_startup_chunk_frames=[1, 2])
+    if configure_busy:
+        manager.connector.config["extra"]["codec_busy_startup_chunk_frames"] = [3]
     aborted = _Request()
     aborted.request_id = "internal-aborted"
     aborted.status = RequestStatus.RUNNING
@@ -310,6 +394,7 @@ def test_async_codec_abort_cleans_sender_state_before_next_request(monkeypatch, 
     first = talker2code2wav_async_chunk(manager, _output(10), current)
     assert first is not None
     torch.testing.assert_close(first.codes.audio, torch.tensor([[10, 110]]))
+    assert manager._emp_request_startup_chunks[current.external_req_id] == [1, 2]
     for name, state in vars(manager).items():
         if name.startswith("_emp_"):
             assert aborted.external_req_id not in state, name
@@ -344,6 +429,31 @@ def test_async_codec_normal_receiver_cleanup_before_save_preserves_terminal_tail
     for name, state in vars(manager).items():
         if name.startswith("_emp_"):
             assert request.external_req_id not in state, name
+
+
+def test_async_codec_defers_other_failed_request_cleanup_until_admission():
+    manager = _manager()
+    manager.config.hf_config.streaming_speech_delay = 0
+    manager.connector.config["extra"].update(codec_startup_chunk_frames=[1], codec_busy_startup_chunk_frames=[3])
+    aborted, active, new = _Request(), _Request(), _Request()
+    active.external_req_id, new.external_req_id = "active", "new"
+    assert talker2code2wav_async_chunk(manager, _output(1), aborted) is not None
+    assert talker2code2wav_async_chunk(manager, _output(2), active) is None
+    aborted.status, aborted.finished = RequestStatus.FINISHED_ABORTED, True
+
+    assert talker2code2wav_async_chunk(manager, _output(3), active) is None
+    assert manager._emp_requests[aborted.external_req_id] is aborted
+    assert talker2code2wav_async_chunk(manager, _output(4), new) is not None
+    assert aborted.external_req_id not in manager._emp_requests
+    assert manager._emp_request_startup_chunks[active.external_req_id] == [3]
+    assert manager._emp_request_startup_chunks[new.external_req_id] == [1]
+
+    # A late callback for an old object must not erase a replacement with its ID.
+    replacement = _Request()
+    assert talker2code2wav_async_chunk(manager, _output(5), replacement) is None
+    assert talker2code2wav_async_chunk(manager, _output(6), aborted) is None
+    assert manager._emp_requests[replacement.external_req_id] is replacement
+    assert manager._emp_frame_buffer[replacement.external_req_id][0].tolist() == [5, 105]
 
 
 @pytest.mark.parametrize("terminal_has_frame", [False, True])
@@ -422,6 +532,7 @@ def test_captured_finish_hook_only_installs_on_stage_zero(monkeypatch, stage_id,
     monkeypatch.setattr(OmniARAsyncScheduler, "__init__", lambda self: initialized.append(self))
     scheduler = object.__new__(EasyMagpieARAsyncScheduler)
     scheduler.vllm_config = SimpleNamespace(model_config=SimpleNamespace(stage_id=stage_id))
+    scheduler.max_num_running_reqs = 64
     adapter = SimpleNamespace() if has_adapter else None
     scheduler.chunk_transfer_adapter = adapter
 
@@ -460,7 +571,7 @@ def test_late_stream_final_frees_request_and_delivers_codec_tail(monkeypatch, fr
     assert sum(bool(payload.meta.finished) for payload in sent) == 1
     rows = [row for payload in sent if payload.codes is not None for row in payload.codes.audio.tolist()]
     expected = [[frame, frame + 100] for frame in range(1, frames + 1)]
-    assert rows == expected + [[-1, -1]] * (-frames % 4)
+    assert rows == expected + [[-1, -1]] * ((-frames) % 4)
     for name, state in vars(manager).items():
         if name.startswith("_emp_"):
             assert request.external_req_id not in state, name

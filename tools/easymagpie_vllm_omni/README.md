@@ -113,6 +113,29 @@ The small-expert kernel still uses FP32 sigmoid, bias and top-k; gate output and
 together. Unsupported dtypes, shapes, backends and specialized GEMMs keep upstream behavior. This does not
 enable the H100 profile or guarantee that every deployment uses the optimization.
 
+### Optional H100 deployment
+
+The complete [H100 bundle](deploy/h100/README.md) provides two LM replicas with capacity 64 each and one
+FP32 codec with capacity 128. Its upstream launcher can enable a private MPS daemon and the separately
+opt-in, compatibility-checked historical kernel tables. The ordinary server and default profile are unchanged.
+
+The H100 profile uses an idle startup ramp `[2,2,2,4]`, a busy ramp `[4,4,4,8]`, then 8 codec frames per
+chunk. Each request keeps its selected ramp across text segments; completion and abort clear it. Idle LM
+admission waits at most 50 ms, codec startup 2 ms, and eligible busy codec batches 4 ms. These waits default
+to zero outside the H100 profile. The optional `stage0_admission_batch_target` defaults to replica capacity
+(64 here); reaching it releases the existing wait without changing capacity. Running and resumed LM work
+bypass admission waiting. Codec waiting releases the payload lock so arrivals can wake the scheduler.
+
+This is a deployment policy, not a TTFA or quality guarantee. Validate the whole installed stack, actual
+worker configuration, full/partial terminal chunks, cancellation, shutdown and matched performance before use.
+
+For historical short-input performance comparisons only, explicitly pass
+`--config deploy/easymagpie_h100_benchmark.yaml` to the H100 launcher. This byte-exact profile from
+`91770235` retains a 64-token LM graph capture cap, 10 ms admission wait, busy ramp `[8]`, and codec
+history/token budgets of 520/1536. It does not establish long-input or quality acceptance. The ordinary
+and default H100 profiles retain their long-safe 4104-frame codec history; see the
+[H100 bundle](deploy/h100/README.md) for the comparison command and placement handling.
+
 ### Quick start — offline synthesis
 
 See the [`offline_demo.ipynb`](../../tutorials/tts/easymagpie_vllm_omni/offline_demo.ipynb) tutorial to check how
