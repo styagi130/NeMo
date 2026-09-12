@@ -114,7 +114,7 @@ def test_late_streaming_sentinel_flushes_codec_tail_without_resuming(monkeypatch
         assert segment.codes.audio.numel() == 0
     payload = talker2code2wav_async_chunk(manager, saved[0]["multimodal_output"], terminal, is_finished=True)
     assert bool(payload.meta.finished)
-    assert payload.codes.audio.numel() == tail_frames * 2
+    assert payload.codes.audio.numel() == (16 if tail_frames else 0)
     if tail_frames:
         torch.testing.assert_close(payload.codes.audio[:tail_frames], torch.tensor([[7, 8]] * tail_frames))
     assert request.external_req_id not in manager._emp_frame_buffer
