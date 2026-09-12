@@ -13,9 +13,90 @@
 # limitations under the License.
 from types import SimpleNamespace
 
+import pytest
 import torch
 from easymagpie_vllm_omni.easymagpie import EasyMagpieTTSForConditionalGeneration
 from torch import nn
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize("stacking", [1, 2])
+def test_phoneme_eos_is_fed_once_then_masked(device, stacking):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    model = EasyMagpieTTSForConditionalGeneration.__new__(EasyMagpieTTSForConditionalGeneration)
+    nn.Module.__init__(model)
+    model.arch = SimpleNamespace(phoneme_stacking_factor=stacking, audio_bos_id=1025)
+    model.has_phoneme = True
+    model.phonemes_delay = 1
+    model.phoneme_bos_id = 10
+    model.phoneme_eos_id = 11
+    model.speech_delay = 99
+    model.embedding_dim = 3
+    model.num_codebooks = 2
+    model._combined_embeddings = torch.zeros(2, 3, device=device)
+    model._dec_text_tokens = torch.zeros(2, dtype=torch.long, device=device)
+    model._dec_text_mask = torch.zeros(2, dtype=torch.long, device=device)
+    model._dec_phoneme_tokens = torch.zeros(2, stacking, dtype=torch.long, device=device)
+    model._dec_phoneme_valid = torch.zeros(2, dtype=torch.long, device=device)
+    model._dec_audio_codes = torch.zeros(2, 2, dtype=torch.long, device=device)
+    model._dec_audio_valid = torch.zeros(2, dtype=torch.long, device=device)
+    input_ids = torch.zeros(1, dtype=torch.long, device=device)
+
+    _, _, update = model._preprocess_decode(
+        input_ids,
+        0,
+        input_ids.device,
+        {
+            "decode_offset": 2,
+            "last_phoneme_token": torch.tensor([[3] * (stacking - 1) + [model.phoneme_eos_id]], device=device),
+        },
+    )
+
+    assert model._dec_phoneme_valid[0].item() == 1
+    assert update["phoneme_ended"].item() is True
+
+    model._preprocess_decode(
+        input_ids,
+        1,
+        input_ids.device,
+        {
+            "decode_offset": 3,
+            "last_phoneme_token": torch.full((1, stacking), 3, device=device),
+            "phoneme_ended": update["phoneme_ended"],
+        },
+    )
+
+    assert model._dec_phoneme_valid[1].item() == 0
+    assert update["phoneme_ended"].device == input_ids.device
+
+    # A new request reuses the EOS request's physical slot with independent state.
+    _, _, fresh = model._preprocess_decode(input_ids, 0, input_ids.device, {"decode_offset": 1})
+    assert model._dec_phoneme_valid[0].item() == 1
+    assert model._dec_phoneme_tokens[0].tolist() == [model.phoneme_bos_id] * stacking
+    assert fresh["phoneme_ended"].item() is False
+    assert update["phoneme_ended"].item() is True
+    assert "phoneme_ended" in model.gpu_resident_buffer_keys
+
+
+def test_two_stage_output_copies_codes_once_and_uses_async_output():
+    model = EasyMagpieTTSForConditionalGeneration.__new__(EasyMagpieTTSForConditionalGeneration)
+    nn.Module.__init__(model)
+    model._single_stage_audio = False
+    model._out_codes = torch.tensor([[1, 2], [3, 4]])
+    hidden = torch.zeros(2, 3)
+
+    output = model.make_omni_output(hidden)
+
+    assert set(output.multimodal_outputs) == {"codes"}
+    torch.testing.assert_close(output.multimodal_outputs["codes"]["audio"], model._out_codes)
+    assert model.use_async_omni_output
+    assert model.eager_omni_postprocess_before_async_output
+
+    model._single_stage_audio = True
+    output = model.make_omni_output(hidden)
+    assert set(output.multimodal_outputs) == {"model_outputs"}
+    torch.testing.assert_close(output.multimodal_outputs["model_outputs"], model._out_codes)
 
 
 def test_text_prefill_embeddings_add_phoneme_bos_at_position_three():
