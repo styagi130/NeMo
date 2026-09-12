@@ -34,6 +34,7 @@ from easymagpie_vllm_omni.backbone_patches import (
     patch_mamba_prefill_initial_states,
     patch_mamba_streaming_decode,
     patch_moe_routed_scale,
+    patch_moe_router_logit_cast,
     patch_shared_expert_activation,
 )
 from easymagpie_vllm_omni.config import EasyMagpieOmniArch
@@ -175,6 +176,7 @@ class EasyMagpieTTSForConditionalGeneration(
         # ignoring the checkpoint's mlp_hidden_act. Restore the configured
         # activation (no-op when the backbone has no MoE layers).
         patch_shared_expert_activation(self.backbone)
+        patch_moe_router_logit_cast(self.backbone)
         # vLLM's FusedMoE defers routed_scaling_factor to the decoder layer in
         # FP16, but NemotronH's decoder layer never compensates, so the MoE
         # output is under-scaled by routed_scaling_factor. Restore it (no-op in
