@@ -422,7 +422,13 @@ def test_late_stream_final_frees_request_and_delivers_codec_tail(monkeypatch, fr
     scheduler.add_request(final)
 
     assert request.status == RequestStatus.FINISHED_STOPPED
-    assert not request.resumable
+    # Queued sender tasks retain the resumable segment; only the final copy closes it.
+    assert request.resumable
+    terminal = manager._pending_save_reqs[-1]["request"]
+    assert terminal is not request
+    assert terminal.request_id == request.request_id
+    assert terminal.is_finished() and not terminal.resumable
+    assert all(task["request"] is request for task in list(manager._pending_save_reqs)[:-1])
     _assert_stream_freed(scheduler, request)
     assert request.num_computed_tokens == before_computed
     assert list(request.output_token_ids) == before_tokens

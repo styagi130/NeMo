@@ -25,7 +25,11 @@ from easymagpie_vllm_omni.scheduler import (
     EasyMagpieCodecScheduler,
     _poll_native_codec_chunk,
 )
-from vllm.v1.request import RequestStatus
+from easymagpie_vllm_omni.stage_processors import talker2code2wav_async_chunk
+from vllm import SamplingParams
+from vllm.v1.core.sched.request_queue import FCFSRequestQueue
+from vllm.v1.core.sched.scheduler import Scheduler
+from vllm.v1.request import Request, RequestStatus
 from vllm_omni.core.sched.omni_ar_scheduler import OmniARAsyncScheduler
 from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler
 from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import OmniChunkTransferAdapter
@@ -57,6 +61,93 @@ def test_empty_streaming_queue_remains_resumable_while_waiting(monkeypatch):
 
     assert scheduler._handle_stopped_request(request) is False
     assert request.resumable is True
+
+
+@pytest.mark.parametrize("tail_frames", [0, 1, 3])
+def test_late_streaming_sentinel_flushes_codec_tail_without_resuming(monkeypatch, tail_frames):
+    scheduler = object.__new__(EasyMagpieARAsyncScheduler)
+    scheduler.vllm_config = SimpleNamespace(model_config=SimpleNamespace(stage_id=0))
+    request = Request("late-close", [0], SamplingParams(max_tokens=35), None, resumable=True)
+    request.external_req_id = request.request_id
+    request.status = RequestStatus.WAITING_FOR_STREAMING_REQ
+    request.streaming_queue = deque()
+    scheduler.requests = {request.request_id: request}
+    scheduler.running = []
+    scheduler.waiting = FCFSRequestQueue()
+    scheduler.skipped_waiting = FCFSRequestQueue([request])
+    scheduler.num_waiting_for_streaming_input = 1
+    saved = []
+    scheduler.chunk_transfer_adapter = SimpleNamespace(
+        save_async=lambda multimodal_output, request: saved.append(
+            {"multimodal_output": multimodal_output, "request": request}
+        )
+    )
+    monkeypatch.setattr(OmniARAsyncScheduler, "finish_requests", Scheduler.finish_requests)
+    monkeypatch.setattr(scheduler, "_free_request", lambda req, **kwargs: scheduler.requests.pop(req.request_id))
+
+    manager = SimpleNamespace(
+        config=SimpleNamespace(hf_config=SimpleNamespace(streaming_speech_delay=0)),
+        connector=SimpleNamespace(config={"extra": {"codec_chunk_frames": 8}}),
+        code_prompt_token_ids=defaultdict(list),
+    )
+    # Hold a segment payload as if the asynchronous sender had not consumed it yet.
+    frame = {"audio_codes": torch.tensor([[7, 8]])}
+    for _ in range(max(0, tail_frames - 1)):
+        assert talker2code2wav_async_chunk(manager, frame, request) is None
+
+    sentinel = Request(request.request_id, [0], SamplingParams(max_tokens=1), None, resumable=False)
+    scheduler.add_request(sentinel)
+
+    assert request.status == RequestStatus.FINISHED_STOPPED
+    assert scheduler.num_waiting_for_streaming_input == 0
+    assert not scheduler.requests and not scheduler.running
+    assert not scheduler.waiting and not scheduler.skipped_waiting
+    assert len(saved) == 1
+    terminal = saved[0]["request"]
+    assert terminal.is_finished() and not terminal.resumable
+    # Closing must not turn queued segment callbacks into premature terminal flushes.
+    assert request.resumable
+    segment = talker2code2wav_async_chunk(manager, frame if tail_frames else None, request, is_finished=True)
+    if tail_frames:
+        assert segment is None
+    else:
+        assert segment.codes.audio.numel() == 0
+    payload = talker2code2wav_async_chunk(manager, saved[0]["multimodal_output"], terminal, is_finished=True)
+    assert bool(payload.meta.finished)
+    assert payload.codes.audio.numel() == tail_frames * 2
+    if tail_frames:
+        torch.testing.assert_close(payload.codes.audio[:tail_frames], torch.tensor([[7, 8]] * tail_frames))
+    assert request.external_req_id not in manager._emp_frame_buffer
+
+
+@pytest.mark.parametrize("kind", ["new", "running", "resume", "abort"])
+def test_late_close_override_leaves_other_admissions_unchanged(monkeypatch, kind):
+    scheduler = object.__new__(EasyMagpieARAsyncScheduler)
+    scheduler.vllm_config = SimpleNamespace(model_config=SimpleNamespace(stage_id=0))
+    request = Request(
+        "request",
+        [0],
+        SamplingParams(max_tokens=1),
+        None,
+        resumable=kind == "resume",
+        abort_immediately=kind == "abort",
+    )
+    status = RequestStatus.RUNNING if kind == "running" else RequestStatus.WAITING_FOR_STREAMING_REQ
+    scheduler.requests = (
+        {}
+        if kind == "new"
+        else {request.request_id: SimpleNamespace(status=status, resumable=True, request_id=request.request_id)}
+    )
+    if kind == "abort":
+        monkeypatch.setattr(
+            scheduler, "finish_requests", lambda *args: pytest.fail("abort must be delegated upstream")
+        )
+    forwarded = []
+    monkeypatch.setattr(OmniARAsyncScheduler, "add_request", lambda self, req: forwarded.append(req))
+
+    scheduler.add_request(request)
+
+    assert forwarded == [request]
 
 
 @pytest.mark.parametrize("outstanding", [0, 1, 2, 4])

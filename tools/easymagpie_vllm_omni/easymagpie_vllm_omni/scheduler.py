@@ -20,6 +20,7 @@ Configure it on a single-stage deployment with::
 from __future__ import annotations
 
 import threading
+from copy import copy
 from types import MethodType
 
 import torch
@@ -44,20 +45,24 @@ class EasyMagpieARAsyncScheduler(OmniARAsyncScheduler):
             )
 
     def add_request(self, request: Request) -> None:
-        session = self.requests.get(request.request_id)
+        existing = self.requests.get(request.request_id)
         if (
             self.vllm_config.model_config.stage_id == 0
-            and session is not None
-            and session.resumable
+            and existing is not None
+            and existing.resumable
+            and existing.status == RequestStatus.WAITING_FOR_STREAMING_REQ
             and not request.resumable
-            and session.status == RequestStatus.WAITING_FOR_STREAMING_REQ
+            and not request.abort_immediately
         ):
-            # A final input after a segment stopped is normal completion, not
-            # an abort. Free receiver state before flushing the retained tail.
-            session.resumable = False
-            self.finish_requests(session.request_id, RequestStatus.FINISHED_STOPPED)
+            # Unlike cancellation, a late input sentinel must flush the codec
+            # tail even though no further model output will drive save_async.
+            self.finish_requests(existing.request_id, RequestStatus.FINISHED_STOPPED)
             if self.chunk_transfer_adapter is not None:
-                self.chunk_transfer_adapter.save_async(None, session)
+                # Pending sender tasks still reference the resumable segment.
+                # Only this final callback may flush and release its codec state.
+                terminal = copy(existing)
+                terminal.resumable = False
+                self.chunk_transfer_adapter.save_async(multimodal_output=None, request=terminal)
             return
         super().add_request(request)
 
