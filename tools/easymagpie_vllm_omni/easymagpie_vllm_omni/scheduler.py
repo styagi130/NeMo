@@ -20,6 +20,7 @@ Configure it on a single-stage deployment with::
 from __future__ import annotations
 
 import threading
+from copy import copy
 from importlib.metadata import version
 from time import monotonic, sleep
 from types import MethodType
@@ -142,6 +143,26 @@ class EasyMagpieARAsyncScheduler(OmniARAsyncScheduler):
         if getattr(request, "resumable", False) and streaming_queue and streaming_queue[0] is None:
             request.resumable = False
         return super()._handle_stopped_request(request)
+
+    def add_request(self, request: Request) -> None:
+        existing = self.requests.get(request.request_id)
+        if (
+            existing is not None
+            and existing.status == RequestStatus.WAITING_FOR_STREAMING_REQ
+            and not request.resumable
+            and not request.abort_immediately
+        ):
+            # Unlike cancellation, a late input sentinel must flush the codec
+            # tail even though no further model output will drive save_async.
+            self.finish_requests(existing.request_id, RequestStatus.FINISHED_STOPPED)
+            if self.chunk_transfer_adapter is not None:
+                # Pending sender tasks still reference the resumable segment.
+                # Only this final callback may flush and release its codec state.
+                terminal = copy(existing)
+                terminal.resumable = False
+                self.chunk_transfer_adapter.save_async(multimodal_output=None, request=terminal)
+            return
+        super().add_request(request)
 
     def _update_request_as_session(self, session: Request, update: StreamingUpdate) -> None:
         outstanding_async_tokens = getattr(session, "num_output_placeholders", 0)
@@ -356,10 +377,7 @@ class EasyMagpieCodecScheduler(OmniGenerationScheduler):
         if not self._codec_busy_wait_s or len(self.running) < 2:
             return False
         ready = self._ready_codec_requests()
-        return (
-            any(request.num_computed_tokens > 0 for request in ready)
-            and not self._codec_busy_wait_done()
-        )
+        return any(request.num_computed_tokens > 0 for request in ready) and not self._codec_busy_wait_done()
 
     def schedule(self, *args, **kwargs):
         adapter = self.chunk_transfer_adapter
