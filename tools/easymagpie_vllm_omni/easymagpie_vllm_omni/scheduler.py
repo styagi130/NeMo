@@ -20,7 +20,9 @@ Configure it on a single-stage deployment with::
 """
 from __future__ import annotations
 
+import os
 import threading
+from collections import Counter
 from copy import copy
 from types import MethodType
 
@@ -40,10 +42,141 @@ class EasyMagpieARAsyncScheduler(OmniARAsyncScheduler):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self.phase_admission_enabled = os.environ.get("EASYMAGPIE_PHASE_ADMISSION", "0") == "1"
+        self.phase_admission_phase = "mixed"
+        self.phase_admission_force_decode = False
+        self.phase_admission_throttled = False
+        self.phase_admission_counts = Counter()
+        if self.phase_admission_enabled and getattr(self, "_easymagpie_phase_hooks_version", None) != 1:
+            raise RuntimeError("phase admission requires the version-1 scheduler eligibility hooks")
+        self.admission_decode_fence = None
+        if os.environ.get("EASYMAGPIE_ADMISSION_DECODE_FENCE", "0") == "1":
+            from .admission_fence import AdmissionDecodeFence
+
+            self.admission_decode_fence = AdmissionDecodeFence(self)
         if self.vllm_config.model_config.stage_id == 0 and self.chunk_transfer_adapter is not None:
             self.chunk_transfer_adapter._send_single_request = MethodType(
                 _send_talker_chunk, self.chunk_transfer_adapter
             )
+
+    def schedule(self, throttle_prefills: bool = False):
+        if not getattr(self, "phase_admission_enabled", False):
+            return super().schedule(throttle_prefills)
+        self.phase_admission_throttled = throttle_prefills
+        fence = getattr(self, "admission_decode_fence", None)
+        try:
+            output = super().schedule(throttle_prefills)
+        except BaseException:
+            if fence is not None:
+                fence.clear("schedule_errors")
+            raise
+        phase = self.phase_admission_phase
+        self.phase_admission_counts[f"{phase}_steps"] += 1
+        self.phase_admission_counts[f"{phase}_requests"] += len(output.num_scheduled_tokens)
+        self.phase_admission_counts[f"{phase}_tokens"] += output.total_num_scheduled_tokens
+        if not output.num_scheduled_tokens:
+            self.phase_admission_counts[f"{phase}_empty_steps"] += 1
+        # An admission attempt cannot indefinitely prevent existing streams from decoding.
+        self.phase_admission_force_decode = phase == "prefill"
+        if fence is not None:
+            fence.after_schedule(self, output)
+        return output
+
+    def _should_defer_waiting_admission(self) -> bool:
+        parent_defer = super()._should_defer_waiting_admission()
+        if not getattr(self, "phase_admission_enabled", False):
+            return parent_defer
+        self.phase_admission_phase = "mixed"
+        unsupported = (
+            self.phase_admission_throttled
+            or self.num_spec_tokens != 0
+            or self.num_sampled_tokens_per_step != 1
+            or self.parallel_config.pipeline_parallel_size != 1
+            or self.connector is not None
+            or self.ec_connector is not None
+            or self.vllm_config.model_config.stage_id != 0
+        )
+        if unsupported:
+            self.phase_admission_counts["unsupported_fallback_steps"] += 1
+            fence = getattr(self, "admission_decode_fence", None)
+            if fence is not None:
+                fence.clear("released_unsupported")
+            return parent_defer
+
+        def has_work(request):
+            return (
+                request.status == RequestStatus.RUNNING
+                and self.current_step + 1 >= request.next_decode_eligible_step
+                and request.num_tokens_with_spec + request.num_output_placeholders > request.num_computed_tokens
+                and not (
+                    request.num_output_placeholders > 0
+                    and request.num_computed_tokens + 2 - request.num_output_placeholders
+                    >= request.num_prompt_tokens + request.max_tokens
+                )
+            )
+
+        running_prefill = False
+        running_decode = False
+        for request in self.running:
+            if has_work(request):
+                if self._phase_request_is_prefill(request):
+                    running_prefill = True
+                else:
+                    running_decode = True
+        admission_space = len(self.running) + self.num_waiting_for_streaming_input < self.max_num_running_reqs
+        waiting_prefill = admission_space and bool(self.waiting or self.skipped_waiting) and not parent_defer
+        fence = getattr(self, "admission_decode_fence", None)
+        fence_decode = fence.select(self, has_work, waiting_prefill) if fence is not None else False
+        if running_decode and (self.phase_admission_force_decode or fence_decode):
+            self.phase_admission_phase = "decode"
+        elif running_prefill or waiting_prefill:
+            self.phase_admission_phase = "prefill"
+        else:
+            self.phase_admission_phase = "decode"
+        return parent_defer
+
+    def _phase_request_is_prefill(self, request: Request) -> bool:
+        pending_tokens = request.num_tokens_with_spec + request.num_output_placeholders - request.num_computed_tokens
+        return request.is_prefill_chunk or pending_tokens > 1
+
+    def _is_running_request_eligible(self, request: Request) -> bool:
+        phase = getattr(self, "phase_admission_phase", "mixed")
+        if not getattr(self, "phase_admission_enabled", False) or phase == "mixed":
+            return True
+        return self._phase_request_is_prefill(request) == (phase == "prefill")
+
+    def _can_schedule_waiting_requests(self) -> bool:
+        return not getattr(self, "phase_admission_enabled", False) or self.phase_admission_phase != "decode"
+
+    def phase_admission_status(self) -> dict:
+        return {
+            "enabled": self.phase_admission_enabled,
+            "phase": self.phase_admission_phase,
+            "force_decode_next": self.phase_admission_force_decode,
+            "counts": dict(self.phase_admission_counts),
+            "decode_fence": (
+                self.admission_decode_fence.status()
+                if getattr(self, "admission_decode_fence", None) is not None
+                else {"enabled": False}
+            ),
+        }
+
+    def shutdown(self):
+        fence = getattr(self, "admission_decode_fence", None)
+        try:
+            result = super().shutdown()
+        except BaseException:
+            if fence is not None:
+                fence.clear("shutdown_error_releases")
+                try:
+                    fence.write("shutdown_error")
+                except Exception:
+                    pass  # Preserve the original shutdown failure.
+            raise
+        if fence is not None:
+            fence.clear("shutdown_releases")
+            fence.write("shutdown")
+        return result
 
     def add_request(self, request: Request) -> None:
         existing = self.requests.get(request.request_id)
@@ -330,3 +463,49 @@ class EasyMagpieCodecScheduler(OmniGenerationScheduler):
     def schedule(self, *args, **kwargs):
         with self.chunk_transfer_adapter._easymagpie_chunk_lock:
             return super().schedule(*args, **kwargs)
+
+
+def _poll_fenced_codec_chunk(adapter, request):
+    """Do not materialize later chunk or terminal metadata during a live step."""
+    with adapter._easymagpie_chunk_lock:
+        if request.num_in_flight_tokens > 0:
+            return False
+        return _poll_native_codec_chunk_unlocked(adapter, request)
+
+
+def _process_fenced_codec_chunks(adapter, waiting_queue, running_queue, scheduler_requests=None):
+    adapter._codec_async_process_pending_chunks(waiting_queue, running_queue, scheduler_requests=scheduler_requests)
+    # The regular adapter parks requests still awaiting payloads. A request with
+    # a final chunk already materialized is otherwise kept visible and could be
+    # zero-token-finished by another schedule() before its PCM is delivered.
+    # Reuse its existing parking deque: it counts toward retained-slot capacity
+    # and restore_queues() restores it after this scheduling decision.
+    parked = adapter.waiting_for_chunk_running_requests
+    for request in list(running_queue):
+        if request.num_in_flight_tokens > 0:
+            running_queue.remove(request)
+            parked.append(request)
+
+
+class EasyMagpieAsyncCodecScheduler(EasyMagpieCodecScheduler):
+    """Opt-in overlap between different requests with one step per live stream.
+
+    A request's payload, terminal flags and state pages stay stable until its
+    preceding output is settled. Other streams can run while PCM copies finish.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        adapter = self.chunk_transfer_adapter
+        if adapter._active_window:
+            raise ValueError("the async native codec fence currently requires active_stream_window=0")
+        adapter._codec_async_process_pending_chunks = adapter.process_pending_chunks
+        adapter.process_pending_chunks = MethodType(_process_fenced_codec_chunks, adapter)
+        adapter._poll_single_request = MethodType(_poll_fenced_codec_chunk, adapter)
+
+    def update_from_output(self, scheduler_output, model_runner_output):
+        # Base update decrements the counter before deciding whether to finish.
+        # Keep polling blocked until that entire decision, including segment
+        # resume bookkeeping, has finished.
+        with self.chunk_transfer_adapter._easymagpie_chunk_lock:
+            return super().update_from_output(scheduler_output, model_runner_output)

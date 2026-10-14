@@ -20,6 +20,7 @@ the model definition, weight names, or scheduler integration.
 """
 from __future__ import annotations
 
+import os
 from collections.abc import Iterable
 from dataclasses import dataclass, replace
 from typing import Any
@@ -131,14 +132,36 @@ class PackedHalfSnake(nn.Module):
         self.snake_channels = channels // 2
         # Preserve the NeMo checkpoint shape.
         self.alpha = nn.Parameter(torch.ones(1, self.snake_channels, 1))
+        # Freeze the arithmetic choice before CUDA graph capture. The retained
+        # SGLang eager decoder evaluates these as separate PyTorch operations;
+        # Triton's fused sin/div/add can round differently in FP32.
+        self.sglang_activation = os.environ.get("EASYMAGPIE_VLLM_CODEC_SGLANG_ACTIVATION", "0").lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+        self.sglang_activation_fused = os.environ.get(
+            "EASYMAGPIE_VLLM_CODEC_SGLANG_ACTIVATION_FUSED", "0"
+        ).lower() in ("1", "true", "yes", "on")
 
     def forward(self, inputs: torch.Tensor, residual: torch.Tensor | None = None) -> torch.Tensor:
-        if inputs.is_cuda:
+        if (
+            inputs.is_cuda
+            and self.sglang_activation
+            and self.sglang_activation_fused
+            and inputs.dtype == self.alpha.dtype == torch.float32
+            and (residual is None or residual.dtype == torch.float32)
+        ):
+            from easymagpie_vllm_omni.codec.kernels import packed_half_snake_sglang
+
+            return packed_half_snake_sglang(inputs, self.alpha, residual)
+        if inputs.is_cuda and not self.sglang_activation:
             from easymagpie_vllm_omni.codec.kernels import packed_half_snake
 
             return packed_half_snake(inputs, self.alpha, residual)
         if residual is not None:
-            inputs = inputs + residual
+            inputs = residual + inputs if self.sglang_activation else inputs + residual
         snake_in = inputs[:, : self.snake_channels]
         alpha = self.alpha.reshape(1, -1)
         snake_out = snake_in + torch.sin(alpha * snake_in).square() / (alpha + 1e-9)
@@ -401,9 +424,12 @@ class PackedCausalConvTranspose1d(CodecStateLayer):
         dtype: torch.dtype,
         prefix: str,
     ) -> None:
+        import os
+
         super().__init__(time_factor=time_factor, dtype=dtype, prefix=prefix)
         self.in_channels = in_channels
         self.stride = stride
+        self._use_uniform_cudnn = os.environ.get("EASYMAGPIE_VLLM_CODEC_CUDNN_TRANSPOSE", "0") == "1"
         self.conv = nn.ConvTranspose1d(
             in_channels,
             out_channels,
@@ -423,6 +449,55 @@ class PackedCausalConvTranspose1d(CodecStateLayer):
         state.copy_(joined[-1:])
         return self.activation(outputs)
 
+    def _uniform_cuda(
+        self,
+        inputs: torch.Tensor,
+        metadata: Mamba1AttentionMetadata,
+        *,
+        is_decode: bool,
+    ) -> torch.Tensor:
+        """Apply batched cuDNN transpose convolution to equal-length requests.
+
+        Gather and update the same request-owned state pages as the packed
+        kernel. One input history row produces exactly the overlap discarded
+        by the causal crop; no padded samples enter persistent state.
+        """
+        from easymagpie_vllm_omni.codec.kernels import gather_packed_state_inputs, update_packed_state
+
+        inputs = inputs.contiguous()
+        if is_decode:
+            state_indices = self._decode_state_indices(metadata)
+            query_start_loc = state_indices
+            has_initial = state_indices
+        else:
+            state_indices = metadata.state_indices_tensor_p
+            query_start_loc = metadata.query_start_loc_p
+            has_initial = metadata.has_initial_states_p
+            if state_indices is None or query_start_loc is None or has_initial is None:
+                raise RuntimeError("incomplete codec prefill metadata")
+        joined = gather_packed_state_inputs(
+            inputs,
+            self.kv_cache[0],
+            state_indices,
+            has_initial,
+            history=1,
+            is_decode=is_decode,
+        )
+        outputs = self.conv(joined.transpose(1, 2))[:, :, self.stride : -self.stride]
+        outputs = outputs.transpose(1, 2).contiguous()
+        update_packed_state(
+            inputs,
+            self.kv_cache[0],
+            query_start_loc,
+            state_indices,
+            has_initial,
+            channels=self.in_channels,
+            history=1,
+            time_factor=self.time_factor,
+            is_decode=is_decode,
+        )
+        return outputs.reshape(-1, self.conv.out_channels)
+
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         metadata = self._metadata()
         if metadata is None:
@@ -433,6 +508,12 @@ class PackedCausalConvTranspose1d(CodecStateLayer):
             raise RuntimeError(f"codec metadata describes {expected_rows} rows, got {inputs.shape[0]}")
         if inputs.is_cuda:
             from easymagpie_vllm_omni.codec.kernels import packed_causal_conv_transpose1d
+
+            if self._use_uniform_cudnn and getattr(metadata, "codec_uniform", False):
+                if metadata.num_decodes and metadata.num_prefills:
+                    raise NotImplementedError("uniform codec batches cannot mix prefill and decode")
+                outputs = self._uniform_cuda(inputs, metadata, is_decode=bool(metadata.num_decodes))
+                return self.activation(outputs)
 
             parts = []
             decode_rows = metadata.num_decode_tokens * self.time_factor

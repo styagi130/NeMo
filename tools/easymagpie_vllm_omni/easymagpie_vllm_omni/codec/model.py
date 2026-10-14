@@ -81,6 +81,14 @@ class EasyMagpieCodecForConditionalGeneration(nn.Module):
             dtype=vllm_config.model_config.dtype,
             prefix=prefix,
         )
+        from easymagpie_vllm_omni.codec.cuda_graph import CodecCudaGraphs, codec_graphs_enabled
+
+        self._codec_graphs = CodecCudaGraphs(self.codec, vllm_config) if codec_graphs_enabled() else None
+        from easymagpie_vllm_omni.codec.uniform_groups import CodecUniformGroups, uniform_groups_enabled
+
+        self._codec_groups = (
+            CodecUniformGroups(self.codec, vllm_config, self._codec_graphs) if uniform_groups_enabled() else None
+        )
         self.have_multimodal_outputs = True
         self.has_preprocess = False
         self.has_postprocess = False
@@ -103,6 +111,21 @@ class EasyMagpieCodecForConditionalGeneration(nn.Module):
         if model:
             return Path(str(model)) / path
         return path
+
+    def prewarm_codec_graphs(self, batch_sizes, frame_sizes=(2, 6, 8), metadata_template=None):
+        """Warm codec graph shapes after state-cache binding and before service."""
+        if self._codec_graphs is None:
+            return self.codec_graph_status()
+        return self._codec_graphs.prewarm(batch_sizes, frame_sizes, metadata_template)
+
+    def codec_graph_status(self):
+        status = (
+            {"enabled": False, "entries": 0, "captures": 0, "replays": 0, "fallbacks_by_reason": {}}
+            if self._codec_graphs is None
+            else self._codec_graphs.status()
+        )
+        status["uniform_groups"] = {"enabled": False} if self._codec_groups is None else self._codec_groups.status()
+        return status
 
     def embed_input_ids(self, input_ids: torch.Tensor, **_: Any) -> torch.Tensor:
         return torch.zeros((input_ids.shape[0], 1), dtype=torch.float32, device=input_ids.device)
@@ -236,7 +259,12 @@ class EasyMagpieCodecForConditionalGeneration(nn.Module):
                 "EasyMagpie native codec requires one scheduled placeholder per model frame: "
                 f"got {input_ids.numel()} placeholders and {codes.shape[0]} code frames"
             )
-        packed_audio = self.codec(codes)
+        groups = getattr(self, "_codec_groups", None)
+        graphs = getattr(self, "_codec_graphs", None)
+        if groups is not None:
+            packed_audio = groups.run(codes, frame_counts)
+        else:
+            packed_audio = self.codec(codes) if graphs is None else graphs.run(codes)
         outputs: list[torch.Tensor] = []
         offset = 0
         for frames, valid_samples in zip(frame_counts, valid_sample_counts, strict=True):

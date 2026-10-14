@@ -1,0 +1,245 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>EasyMagpie vLLM-Omni: validated optimization inventory</title>
+  <style>
+    :root { color-scheme: light; }
+    body { margin: 2.5rem auto; padding: 0 1.25rem; max-width: 1180px;
+      font: 16px/1.6 system-ui, sans-serif; color: #182c3c; }
+    h1, h2 { line-height: 1.25; }
+    h2 { margin-top: 2rem; }
+    a { color: #07629c; }
+    table { width: 100%; border-collapse: collapse; font-size: .9rem; }
+    th, td { padding: .7rem; border: 1px solid #cbd5df; text-align: left; vertical-align: top; }
+    th { background: #edf3f7; }
+    code { font-size: .85em; overflow-wrap: anywhere; }
+    .scroll { overflow-x: auto; }
+    .note { padding: 1rem; background: #f0f5f8; border-left: 4px solid #5383a0; }
+    .metrics td:not(:first-child), .metrics th:not(:first-child) { text-align: right; white-space: nowrap; }
+    .source { white-space: normal; min-width: 10rem; }
+  </style>
+</head>
+<body>
+<h1>EasyMagpie vLLM-Omni: validated optimization inventory</h1>
+<p>This inventory describes the selected implementation measured on 14 October 2026:
+<code>source-admission-lookahead-variant</code>. It combines the earlier native code-predictor changes
+with the selected SGLang-inspired scheduling, input preparation, feedback and FP32 codec changes.
+The four-decode admission policy is a vLLM experiment; it is not an exact copy of SGLang's scheduler.</p>
+<p><strong>The selected implementation exceeded the historical SGLang throughput reference at C64 and C128.
+TTFA still trails SGLang, and C128 still has frequent playback underruns.</strong>
+The measured results apply to the complete configuration below. They do not assign a speedup to every individual feature.</p>
+<p>Use the <a href="README.md">README</a>, <a href="scripts/run_optimized_server.sh">optimized launcher</a>
+and <a href="deploy/h100_optimized128.yaml">H100 capacity-128 profile</a> for deployment.
+The <a href="scripts/apply_runtime_patches.py">runtime patch installer</a> checks the supported upstream files
+against the <a href="runtime_patches/manifest.json">runtime manifest</a>.</p>
+
+<h2>Changes applied</h2>
+<p>Every row below is part of the selected implementation. Feature flags are opt-in; all 21 flags listed
+in the table are enabled by the optimized launcher. The local-transformer changes apply directly to its implementation.</p>
+<div class="scroll"><table>
+<thead><tr><th>Optimization</th><th>Behavior and purpose</th><th>Selection</th><th>Source</th></tr></thead>
+<tbody>
+<tr><td>1. Incremental local transformer</td><td>Generate one audio codebook position at a time using per-layer K/V scratch.
+Earlier positions in the current frame are reused instead of recomputing the complete prefix for every codebook.
+The scratch is local to one frame and each position is written before being read, including graph-padded rows.</td>
+<td>Direct implementation change</td><td class="source"><a href="easymagpie_vllm_omni/local_transformer.py">local_transformer.py</a></td></tr>
+<tr><td>2. Respect CUDA graph dispatch</td><td>Remove the predictor's forced <code>FULL</code> override during
+<code>PIECEWISE</code> execution so vLLM's existing graph wrapper can capture and replay the dense predictor subgraph.</td>
+<td>Direct implementation change</td><td><a href="easymagpie_vllm_omni/local_transformer.py">local_transformer.py</a></td></tr>
+<tr><td>3. Separate prefill and decode admission</td><td>Choose prefill or decode work for a scheduling step,
+with decode service after a prefill attempt. Running-request eligibility and waiting admission use small upstream hooks.
+Unsupported scheduler modes retain the parent behavior.</td><td><code>EASYMAGPIE_PHASE_ADMISSION=1</code></td>
+<td><a href="easymagpie_vllm_omni/scheduler.py">scheduler.py</a>; <a href="runtime_patches/runtime.patch">runtime.patch</a></td></tr>
+<tr><td>4. Bounded four-decode admission window</td><td>After a complete, cold 71-token prefill, protect at most four
+successful decode scheduling opportunities before admitting more prefill work. New arrivals cannot extend the window.
+Cancellation, preemption, resume, lost eligibility, empty steps and shutdown release protected owners.
+Four schedules account for async lookahead; they do not guarantee four completed audio frames.</td>
+<td><code>EASYMAGPIE_ADMISSION_DECODE_FENCE=1</code></td>
+<td><a href="easymagpie_vllm_omni/admission_fence.py">admission_fence.py</a></td></tr>
+<tr><td>5. Persistent GPU decode state</td><td>Keep text position, audio/phoneme feedback, delay transitions and sticky EOS
+in request-owned GPU slots. Stage and commit the active rows together inside the model forward.
+Unique inactive slots make padded graph writes deterministic; incompatible requests use the existing path.</td>
+<td><code>EASYMAGPIE_DEVICE_DECODE_STATE=1</code></td>
+<td><a href="easymagpie_vllm_omni/device_decode_state.py">device_decode_state.py</a></td></tr>
+<tr><td>6. Retain live decode leases</td><td>Retain GPU slots for live requests during prefill-only or temporarily
+unscheduled steps. Request object identity protects against request-ID reuse. Changed offsets or text reseed state;
+capacity fallback retains the ordinary request feedback.</td><td><code>EASYMAGPIE_DDS_RETAIN_LIVE_LEASES=1</code></td>
+<td><a href="easymagpie_vllm_omni/device_decode_state.py">device_decode_state.py</a>;
+<a href="easymagpie_vllm_omni/runner.py">runner.py</a></td></tr>
+<tr><td>7. Complete-batch decode preprocessing</td><td>Eligible single-token decode batches update their metadata together
+and clear one embedding span, avoiding per-request tensor-copy launches. The hook runs after generic connector,
+position and input-buffer setup; a failed guard falls back for the whole batch.</td>
+<td><code>EASYMAGPIE_BATCHED_DECODE_INPUTS=1</code></td>
+<td><a href="easymagpie_vllm_omni/runner.py">runner.py</a>; <a href="runtime_patches/runtime.patch">runtime.patch</a></td></tr>
+<tr><td>8. CPU query-offset vector</td><td>Read the existing CPU int32 offset buffer once into a Python list instead of
+extracting individual tensor scalars in the preparation loops. Shape, dtype and capacity guards preserve fallback behavior.</td>
+<td><code>EASYMAGPIE_CPU_QUERY_VECTOR=1</code></td><td><a href="easymagpie_vllm_omni/runner.py">runner.py</a></td></tr>
+<tr><td>9. Pooled request-routing uploads</td><td>Reuse four pinned staging buffers for row-to-slot routing rather than
+constructing synchronous CUDA tensors each step. Completion events prevent reuse while an upload is in flight;
+busy or unsupported cases fall back.</td><td><code>EASYMAGPIE_DDS_ROUTING_POOL=1</code></td>
+<td><a href="easymagpie_vllm_omni/dds_routing_pool.py">dds_routing_pool.py</a></td></tr>
+<tr><td>10. Pooled query-dispatch indices</td><td>Reuse four pairs of pinned/device buffers for prefill and decode row
+indices. Ownership extends through the final model-forward consumer, including cross-stream ordering, so the next
+step cannot overwrite indices still in use.</td><td><code>EASYMAGPIE_QUERY_DISPATCH_POOL=1</code></td>
+<td><a href="easymagpie_vllm_omni/query_dispatch_pool.py">query_dispatch_pool.py</a></td></tr>
+<tr><td>11. Owned batched feedback snapshots</td><td>Clone audio, phoneme and EOS feedback by batch, then give requests
+views that retain their immutable source allocation. Certified views avoid redundant per-row clones without aliasing
+graph scratch or mutable decode slots.</td><td><code>EASYMAGPIE_BATCHED_OWNED_FEEDBACK=1</code></td>
+<td><a href="easymagpie_vllm_omni/feedback_snapshot.py">feedback_snapshot.py</a></td></tr>
+<tr><td>12. Batched feedback merge</td><td>Validate a complete feedback batch once, split/unbind its owning tensors,
+and update request metadata together. This removes repeated per-view certification and generic per-row postprocessing;
+partial, reordered or incompatible batches keep the existing path.</td><td><code>EASYMAGPIE_BATCHED_FEEDBACK_MERGE=1</code></td>
+<td><a href="easymagpie_vllm_omni/batched_feedback.py">batched_feedback.py</a></td></tr>
+<tr><td>13. Prefill-aware graph dispatch</td><td>Prepare query indices on the CPU, separate decode rows from final
+prefill positions, and avoid acoustic-code prediction for large prefill-only profiling batches.
+The final prefill position still supplies the phoneme state needed by the first decode.</td>
+<td><code>EASYMAGPIE_PREFILL_GRAPHS=1</code></td>
+<td><a href="easymagpie_vllm_omni/easymagpie.py">easymagpie.py</a></td></tr>
+<tr><td>14. Mamba prefill graph islands</td><td>Prewarm and freeze the cold 71-token Mamba path for request batches
+1 through 8 across all 14 Mamba layers: 112 graph entries. Capture occurs after ordinary worker warmup and cache
+binding, before traffic. Unsupported metadata uses the normal path.</td><td><code>EASYMAGPIE_MAMBA_PREFILL_ISLANDS=1</code></td>
+<td><a href="easymagpie_vllm_omni/mamba_prefill_islands.py">mamba_prefill_islands.py</a>;
+<a href="easymagpie_vllm_omni/runner.py">runner.py</a></td></tr>
+<tr><td>15. Static prefill metadata</td><td>Retain graph-compatible constant metadata for a captured cold-prefill shape;
+refresh request routing without copying unchanged metadata tensors on every replay.</td>
+<td><code>EASYMAGPIE_MAMBA_STATIC_PREFILL_METADATA=1</code></td>
+<td><a href="easymagpie_vllm_omni/mamba_prefill_islands.py">mamba_prefill_islands.py</a></td></tr>
+<tr><td>16. Sender CPU frame fast path</td><td>Reuse completed contiguous CPU int64 acoustic-code rows without repeated
+detach/conversion/reshape operations. Zero-frame filtering, FIFO order, per-request chunk accounting and terminal flushing remain intact.</td>
+<td><code>EASYMAGPIE_SENDER_CPU_FRAME_FASTPATH=1</code></td>
+<td><a href="easymagpie_vllm_omni/stage_processors.py">stage_processors.py</a></td></tr>
+<tr><td>17. Uniform codec grouping</td><td>Group requests by their actual frame count so equal-length chunks can share
+codec execution. Preserve output request order, original state-page indices and each request's exact history.
+This does not pad extra acoustic frames into persistent state.</td><td><code>EASYMAGPIE_VLLM_CODEC_UNIFORM_GROUPS=1</code></td>
+<td><a href="easymagpie_vllm_omni/codec/uniform_groups.py">codec/uniform_groups.py</a></td></tr>
+<tr><td>18. FP32 codec CUDA graphs</td><td>Capture equal-frame codec work, preserving history across capture and
+ordering replay across streams. The selected startup prewarms 192 entries: batches 1–64 for 2, 6 and 8 frames,
+then freezes the graph cache. Engine capacity is 128; groups above 64 use fallback, not a warmed batch-128 codec graph.</td>
+<td><code>EASYMAGPIE_VLLM_CODEC_CUDA_GRAPHS=1</code></td>
+<td><a href="easymagpie_vllm_omni/codec/cuda_graph.py">codec/cuda_graph.py</a>;
+<a href="easymagpie_vllm_omni/optimized_workers.py">optimized_workers.py</a></td></tr>
+<tr><td>19. Shared codec metadata validation</td><td>Check shared metadata once for the same object instead of repeating
+the same validation for every codec layer. Distinct metadata objects still receive their full compatibility checks.</td>
+<td><code>EASYMAGPIE_VLLM_CODEC_SHARED_METADATA_GUARD=1</code></td>
+<td><a href="easymagpie_vllm_omni/codec/cuda_graph.py">codec/cuda_graph.py</a></td></tr>
+<tr><td>20. Batched cuDNN transpose convolutions</td><td>Use cuDNN transpose convolution for uniform codec groups.
+Gather and update the same request-owned history pages and retain the causal overlap crop.
+The packed path remains available for other layouts.</td><td><code>EASYMAGPIE_VLLM_CODEC_CUDNN_TRANSPOSE=1</code></td>
+<td><a href="easymagpie_vllm_omni/codec/packed.py">codec/packed.py</a></td></tr>
+<tr><td>21. Fused SGLang-compatible HalfSnake activation</td><td>Fuse residual addition, periodic activation and
+LeakyReLU into one FP32 Triton kernel using SGLang's operand order, libdevice sine and rounded division.
+Floating-point contraction is disabled to retain the validated arithmetic behavior.</td>
+<td><code>EASYMAGPIE_VLLM_CODEC_SGLANG_ACTIVATION=1</code><br>
+<code>EASYMAGPIE_VLLM_CODEC_SGLANG_ACTIVATION_FUSED=1</code></td>
+<td><a href="easymagpie_vllm_omni/codec/kernels.py">codec/kernels.py</a>;
+<a href="easymagpie_vllm_omni/codec/packed.py">codec/packed.py</a></td></tr>
+<tr><td>22. Async codec scheduling with per-request fencing</td><td>Allow different requests to advance while a PCM
+copy is outstanding. A request's chunk, terminal flags and state pages remain stable until its previous output settles.
+The scheduler parks in-flight requests to prevent premature completion or another update of the same stream.</td>
+<td>Async codec scheduler in the profile; selected with <code>EASYMAGPIE_CODEC_ASYNC_D2H=1</code></td>
+<td><a href="easymagpie_vllm_omni/scheduler.py">scheduler.py</a>;
+<a href="easymagpie_vllm_omni/pipeline.py">pipeline.py</a></td></tr>
+<tr><td>23. Async batched PCM transfer</td><td>Copy an owned waveform batch into pinned CPU memory on a separate CUDA
+stream. Defer consumption until the completion event, retain source storage through the transfer, and preserve
+per-request slicing and terminal trimming.</td><td><code>EASYMAGPIE_CODEC_ASYNC_D2H=1</code></td>
+<td><a href="easymagpie_vllm_omni/codec_async_output.py">codec_async_output.py</a>;
+<a href="easymagpie_vllm_omni/runner.py">runner.py</a></td></tr>
+<tr><td>24. Reproducible startup and deployment</td><td>Package the two required upstream hooks, 21 feature switches,
+capacity/graph settings and worker startup policy. Codec graph warmup finishes before serving; the codec worker freezes
+the Python GC generation after warmup. Startup uses the measured TF32 policy.</td><td>Optimized launcher/profile/workers</td>
+<td><a href="scripts/run_optimized_server.sh">run_optimized_server.sh</a>;
+<a href="deploy/h100_optimized128.yaml">h100_optimized128.yaml</a>;
+<a href="easymagpie_vllm_omni/optimized_workers.py">optimized_workers.py</a></td></tr>
+</tbody></table></div>
+
+<h2>Selected configuration</h2>
+<div class="scroll"><table><tbody>
+<tr><th>Hardware and concurrency</th><td>One standalone H100 80 GB; MPS enabled with active thread percentage 100.
+Talker and codec each allow 128 active sequences. Client concurrency is 64 or 128; it is distinct from active capacity
+and from the codec's warmed graph batch sizes.</td></tr>
+<tr><th>Model and precision</th><td>Local NIM 170k export, voice <code>eng</code>.
+FP16 talker with deliberate FP32 parameters, FP32 Mamba state and FP32 codec.
+cuDNN TF32 enabled; CUDA matmul TF32 disabled. FP32 tensor dtype does not mean cuDNN TF32 is disabled.</td></tr>
+<tr><th>Streaming chunks</th><td>2 frames, then 6 frames, then 8-frame steady chunks; 1,764 samples/frame at 22,050 Hz.
+Speech delay 5, phoneme delay 3, text prefill 4. Cold voice conditioning produces 71 prefill tokens.</td></tr>
+<tr><th>Talker allocation</th><td>4 GiB KV budget; max model length 4,096; max batched tokens 4,096;
+async scheduling and chunked prefill enabled, prefix caching disabled.</td></tr>
+<tr><th>Codec allocation</th><td>256 MiB state budget; max model length and batched tokens 4,104;
+async scheduling enabled, chunked prefill and prefix caching disabled.
+The outer stage remains eager while the plugin replays its explicit codec graphs.</td></tr>
+<tr><th>Graph coverage</th><td>Mamba cold-prefill islands: 14 layers × batches 1–8 = 112 entries.
+Codec: batches 1–64 × frame counts 2/6/8 = 192 entries. The talker compilation profile separately includes
+decode buckets through 128 and larger token-count buckets through 4,096.</td></tr>
+<tr><th>Measured software</th><td>vLLM 0.26, vLLM-Omni 0.26, PyTorch 2.11.0+cu130 and Triton 3.6.
+The runtime patch is bound to exact upstream source hashes; a version label alone is insufficient.</td></tr>
+<tr><th>Benchmark workload</th><td>Inflight replenishment; 128 corpus entries requested 32 times each = 4,096 requests/round.
+Same model hashes, corpus, client, chunk schedule and CPU affinity across the compared runs.
+Server affinity: <code>0,24,1,25,2,26,3,27,4,28,5,29,6,30,7,31</code>;
+client: <code>8,32,9,33,10,34,11,35</code>. These CPU numbers are host-specific.</td></tr>
+</tbody></table></div>
+
+<h2>Retained branch behavior</h2>
+<p>The branch already had the native stateful two-stage codec, GPU-resident feedback keys, omission of backbone
+hidden states from the inter-stage payload, speaker/assembled-prefill caching, full-text tokenization once per request,
+async talker scheduling, compiled code prediction, streaming lifecycle handling, packed codec state kernels,
+and an FP32 codec default. Those are part of the serving path but are not new optimizations in this port.
+The new work extends their batching, ownership and graph execution; it does not replace the tokenizer or add a new HTTP API.</p>
+
+<h2>Measured results</h2>
+<div class="scroll"><table class="metrics"><thead><tr><th>Run</th><th>Requests</th><th>RTFx</th>
+<th>Mean TTFA</th><th>P90</th><th>P95</th><th>Responses with underruns</th></tr></thead><tbody>
+<tr><td>vLLM C64, two independent startups</td><td>8,192</td><td>329.22×</td><td>123.73 ms</td><td>149.38 ms</td><td>158.36 ms</td><td>0 (0%)</td></tr>
+<tr><td>SGLang Default 8 C64, historical</td><td>4,096</td><td>291.11×</td><td>74.78 ms</td><td>99.05 ms</td><td>109.31 ms</td><td>244 (5.96%)</td></tr>
+<tr><td>vLLM C128, original round</td><td>4,096</td><td>418.54×</td><td>210.99 ms</td><td>263.42 ms</td><td>277.32 ms</td><td>2,721 (66.43%)</td></tr>
+<tr><td>vLLM C128, after extra full warmup</td><td>4,096</td><td>415.68×</td><td>221.11 ms</td><td>281.47 ms</td><td>310.44 ms</td><td>2,563 (62.57%)</td></tr>
+<tr><td>SGLang Default 8 C128, historical</td><td>4,096</td><td>398.56×</td><td>111.38 ms</td><td>136.74 ms</td><td>147.38 ms</td><td>2,635 (64.33%)</td></tr>
+</tbody></table></div>
+<p>All rows have zero request errors. C64 vLLM RTFx is the median of 324.65× and 333.79×; its TTFA values pool
+the 8,192 raw responses. Other rows are one round each. The final C128 round followed an extra 4,096-request C128
+workload on the same server; that workload is excluded from its metrics. Diagnostic cohorts and two standard warmup
+batches were excluded from every measured round.</p>
+<p>RTFx is total emitted audio duration divided by measured wall time. TTFA is client-observed time to first audio,
+with inclusive percentile interpolation. Playback starts at first PCM with no extra reserve; an underrun counts a later
+interval in which the playback buffer empties before more audio arrives. It is not a packet-loss count. The final C128
+maximum buffer deficit was 123.495 ms.</p>
+<p class="note">The longer C128 warmup did not improve throughput or TTFA in this repeat. C64 throughput is 13.1%
+above its historical SGLang reference; warmed C128 throughput is 4.3% above its reference. TTFA remains substantially
+larger. These historical comparisons are not interleaved trials and provide no variance estimate. Successful request
+completion and two exact diagnostic transcriptions in the latest C128 run do not establish full audio-quality equivalence.</p>
+
+<h2>Experiments excluded from this selection</h2>
+<ul>
+<li>Whole-backbone prefill graphs: a validated alternative, but slower in the retained serving trial than the selected Mamba islands.</li>
+<li>Three-decode admission window: measured below the selected four-schedule window.</li>
+<li>Pinned codec-group indices and a blocking payload-completion event: validated alternatives whose single serving trials did not establish an improvement over the selected source.</li>
+<li>Compiled SGLang codec and its fused history adapter: not served. Retained-cache checks passed, but the fresh-cache run failed a warm-history numerical tolerance; the gate was not relaxed.</li>
+<li>Channels-last codec weights: failed the retained PCM numerical acceptance checks.</li>
+<li>Tmpfs stage transport: the serving trial missed required lifecycle close receipts and did not improve throughput.</li>
+<li>Codec coalescing delay, sender-priority variants and diagnostic instrumentation: not enabled in this profile.</li>
+</ul>
+
+<h2>Evidence identity</h2>
+<p>The retained benchmark artifact set is <code>vllm_default8_port_20261013</code>; selected source:
+<code>source-admission-lookahead-variant</code>, containing 49 bound source files including two runtime overlays.
+The repository patch was prepared against Speech commit <code>2a47b428b41827ed4a32529eb5e82936b1e6e609</code>.
+The table records original evidence hashes so the measured source can be distinguished from subsequent packaging,
+documentation and formatting changes. Evidence identifiers below are archival names, not deployment dependencies.</p>
+<div class="scroll"><table><thead><tr><th>Artifact identifier</th><th>SHA-256</th></tr></thead><tbody>
+<tr><td>admission-lookahead-validation/source-manifest.json</td><td><code>4f3b6fe0755de7c36509a048708ce5849dede48a29067de9a4e8cbf5e8e45118</code></td></tr>
+<tr><td>validated-port-admission-lookahead-complete/repository-plugin.patch</td><td><code>8e28b6744c45d9d9f52f58edfdf93ef5b6c1b13a6056e3acffdecf2b23952825</code></td></tr>
+<tr><td>validated-port-admission-lookahead-complete/runtime.patch</td><td><code>11b2ecb2116a999c64a23409583950a083f0af8ed0e6aad5e11722c1a154304f</code></td></tr>
+<tr><td>MATCH.json</td><td><code>46ba7ea037b6ab96efd56ac16f4e0112955958b1384022c0d00754a1cb71cb8b</code></td></tr>
+<tr><td>C128.json</td><td><code>4486607515fca77f5c25bb053961be26bfb6c63bb05deaa0e7e37c65325f8bac</code></td></tr>
+<tr><td>C128-WARMED.json</td><td><code>b7c98ae1ccf26d06920a5a3a8c5abd397a76190cd659e7d1b25f228540dea217</code></td></tr>
+<tr><td>warmed-repeat-c128/status.json</td><td><code>22987cfcae3299d3e6314287194d5cbbfd2c5a107d316ced663f246c106424a4</code></td></tr>
+<tr><td>Measured container image</td><td><code>a2e12072a7769c375724c3e85cb5de97d37bc306bb32efc180eb96e989e39593</code></td></tr>
+<tr><td>Local NIM FP32 codec weights</td><td><code>c04aec11cd4b2de521ef1b531415da80c21a7663c1de0db18705f7467da7a0bf</code></td></tr>
+</tbody></table></div>
+<p>The selected serving runs passed source/runtime identity checks, startup checks, completion/disconnect canaries,
+raw arrival-trace audits, post-run worker checks, diagnostic transcription and cleanup/admission-shutdown checks.
+The completion/disconnect canary used cohorts of 16; it was not a C128 cancellation stress test. The C128 workload
+itself exercised concurrency 128. Required repository checks for the commit are recorded separately from these retained GPU measurements.</p>
+</body>
+</html>

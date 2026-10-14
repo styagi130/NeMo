@@ -19,7 +19,8 @@ placeholder and one code row per newly generated acoustic frame.
 """
 from __future__ import annotations
 
-from collections import defaultdict
+import os
+from collections import Counter, defaultdict
 from collections.abc import Mapping
 from typing import Any
 
@@ -35,6 +36,26 @@ logger = init_logger(__name__)
 # Base codebook size, excluding control tokens.
 _CODEBOOK_SIZE = 1024
 _CODEC_PADDING = -1
+_SENDER_FRAME_FASTPATH = os.environ.get("EASYMAGPIE_SENDER_CPU_FRAME_FASTPATH", "0") == "1"
+_SENDER_FRAME_COUNTS = Counter()
+
+
+def sender_frame_status():
+    return {"enabled": _SENDER_FRAME_FASTPATH, **dict(_SENDER_FRAME_COUNTS)}
+
+
+def _owned_cpu_integer_frame(tensor):
+    # The selected sender receives an already-completed owning CPU snapshot.
+    # Reusing a row preserves the same storage as the old detach/view chain.
+    return (
+        type(tensor) is torch.Tensor
+        and tensor.device.type == "cpu"
+        and tensor.dtype == torch.long
+        and not tensor.requires_grad
+        and tensor.ndim in (1, 2)
+        and tensor.shape[-1] <= 64
+        and tensor.is_contiguous()
+    )
 
 
 def _empty_finished_payload() -> dict[str, Any]:
@@ -201,6 +222,15 @@ def _extract_last_frame(multimodal_output: OmniPayload | dict[str, Any]) -> torc
     audio_codes = _extract_audio_codes(multimodal_output)
     if not isinstance(audio_codes, torch.Tensor) or audio_codes.numel() == 0:
         return None
+    if _SENDER_FRAME_FASTPATH and _owned_cpu_integer_frame(audio_codes):
+        frame = audio_codes[-1] if audio_codes.ndim == 2 else audio_codes
+        if audio_codes.ndim == 2 and not any(frame.tolist()):
+            _SENDER_FRAME_COUNTS["zero_rows"] += 1
+            return None
+        _SENDER_FRAME_COUNTS["extracted_rows"] += 1
+        return frame
+    if _SENDER_FRAME_FASTPATH:
+        _SENDER_FRAME_COUNTS["extract_fallbacks"] += 1
     if audio_codes.ndim == 2:
         frame = audio_codes[-1]
         if frame.numel() == 0 or not bool(frame.any().item()):
@@ -342,7 +372,13 @@ def talker2code2wav_async_chunk(
             # ``multimodal_output`` is already a CPU snapshot. Keep it as a
             # tensor so codec chunks can be assembled with a single stack
             # instead of a Python list round-trip.
-            frame_row = frame.detach().to(device="cpu", dtype=torch.long).reshape(-1).contiguous()
+            if _SENDER_FRAME_FASTPATH and _owned_cpu_integer_frame(frame) and frame.ndim == 1:
+                frame_row = frame
+                _SENDER_FRAME_COUNTS["reused_rows"] += 1
+            else:
+                frame_row = frame.detach().to(device="cpu", dtype=torch.long).reshape(-1).contiguous()
+                if _SENDER_FRAME_FASTPATH:
+                    _SENDER_FRAME_COUNTS["row_fallbacks"] += 1
             frame_buffer[request_id].append(frame_row)
             # Keep the framework buffer populated too (some connector bookkeeping
             # counts active requests by its non-empty per-request lists).

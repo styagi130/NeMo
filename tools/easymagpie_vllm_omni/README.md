@@ -20,6 +20,19 @@ compatible waveform lists into one CPU transfer before upstream output handling.
 It preserves request order and waveform shapes; unsupported payloads use upstream
 handling unchanged. Stage capacities and streaming chunk sizes are unaffected.
 
+Stage 0 predicts codebooks incrementally within each audio frame. Each transformer
+layer caches that frame's keys and values and evaluates only the current position;
+the cache does not carry state between frames or requests. Sampling still uses
+fresh, pre-drawn Gumbel noise, and vLLM selects the CUDA graph mode. Changing the
+projection shapes can change floating-point results and sampled codes. The codec
+continues to run in FP32.
+
+The EasyMagpie runner batches resident decode feedback and text metadata after
+assigning request rows. Startup delays, phoneme EOS, streamed text offsets and
+request-owned feedback retain their existing semantics. Partial or nonresident
+feedback uses the individual-request path; prepared metadata is cleared after
+each batch, including failures.
+
 ### Convert a NeMo checkpoint
 
 This step converts the EasyMagpie LM, precomputes the text-embedding lookup,
@@ -75,6 +88,51 @@ better kernels; for an explicit sweep, run `python scripts/tune_mamba_ssu.py --m
 EasyMagpie audio is watermarked with [Perth](https://github.com/resemble-ai/perth) after native codec decoding and before float
 PCM leaves the vLLM-Omni codec stage. Pass `NEMOTRON_TTS_PERTH_WATERMARK=0` to disable it.
 
+### Optimized H100 profile
+
+The opt-in [H100 profile](deploy/h100_optimized128.yaml) enables the measured
+request scheduling, resident decode state, batched feedback, Mamba prefill graphs,
+codec graphs and asynchronous PCM output. See [the complete optimization inventory](OPTIMIZATIONS.html)
+for every applied change, retained behavior and benchmark limitations.
+
+Install the two pinned runtime hooks once, then launch from this directory:
+
+```bash
+python scripts/apply_runtime_patches.py --check
+python scripts/apply_runtime_patches.py
+bash scripts/run_optimized_server.sh /absolute/path/to/converted_model 8091
+```
+
+The installer requires vLLM **0.26.0** and vLLM-Omni **0.26.0** and verifies the
+exact upstream file hashes before changing either file. Reapplying a fully installed
+patch is a no-op; incompatible or partially patched runtimes are rejected. The
+optimized launcher verifies installation and does not modify the runtime at startup.
+Install from the checkout when using these scripts; the runtime patch and deployment
+files are repository assets, not Python wheel package data.
+
+The profile sets both engine capacities to **128**, FP32 codec parameters and SSM
+state, FP16 talker parameters with deliberate FP32 exceptions, and chunk sizes
+**2, 6, then 8 frames**. It enables cuDNN TF32 and disables matmul TF32; unset
+`NVIDIA_TF32_OVERRIDE`. Before accepting traffic, the workers warm 112 Mamba prefill
+graphs (14 layers × batches 1–8 at 71 tokens) and 192 codec graphs (batches 1–64 ×
+2/6/8 frames). Codec batches above 64 use the existing eager fallback, even though
+the codec can retain 128 active streams. Unsupported prefill shapes also retain
+their normal fallback.
+
+The benchmark used a standalone H100 with MPS at 100% and separate server/client
+CPU sets. This launcher does not configure host MPS, CPU affinity or model weights.
+It exports the selected optimization flags with defaults of `1`; explicit environment
+overrides and `EASYMAGPIE_DEPLOY_CONFIG` remain available for controlled comparisons.
+Keep persistent compilation caches and run a representative workload before timing.
+
+The measured source reached a two-run C64 median of **329.22× RTFx** with zero
+underruns across 8,192 requests. C128 after an additional 4,096-request warmup reached
+**415.68×**, mean TTFA **221.11 ms**, P90 **281.47 ms**, P95 **310.44 ms**, and
+2,563 affected responses out of 4,096 (62.57%) under immediate playback with no
+buffer reserve. These are measurements of the retained benchmark deployment,
+not a guarantee for other checkpoints, hosts or deployment layouts. Higher C128
+throughput did not resolve latency or streaming underruns.
+
 ### Standalone serving image
 
 Build from the Speech repository root; the image installs this entire package on
@@ -85,6 +143,17 @@ docker build -f tools/easymagpie_vllm_omni/Dockerfile -t easymagpie-omni .
 docker run --rm --gpus all --ipc=host -p 8091:8091 \
   -v /absolute/path/to/converted_model:/model:ro easymagpie-omni /model 8091
 ```
+
+The image also installs the checked runtime hooks. To select the optimized profile:
+
+```bash
+docker run --rm --gpus all --ipc=host -p 8091:8091 \
+  -v /absolute/path/to/converted_model:/model:ro --entrypoint bash \
+  easymagpie-omni /opt/easymagpie/scripts/run_optimized_server.sh /model 8091
+```
+
+For an existing MPS setup, also pass its pipe directory and environment into the
+container using the same user as the MPS server.
 
 The image builds pinned Cairo bindings with builder-only native prerequisites and aligns `nixl-cu13` with
 the base's NIXL 1.3.1 packages; the final install must pass `pip check`. This does not validate optional NIXL

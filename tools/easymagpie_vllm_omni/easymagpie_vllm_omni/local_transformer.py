@@ -19,8 +19,7 @@ import torch
 from easymagpie_vllm_omni.config import EasyMagpieOmniArch
 from torch import nn
 from vllm.compilation.decorators import support_torch_compile
-from vllm.config import CUDAGraphMode, VllmConfig
-from vllm.forward_context import get_forward_context, is_forward_context_available
+from vllm.config import VllmConfig
 
 # Default top-k width for audio-codebook sampling. Because ``torch.topk``'s ``k``
 # shapes tensors inside the captured graph, this becomes a capture-time constant.
@@ -31,7 +30,7 @@ _MIN_SAMPLING_TEMPERATURE = 1e-4
 
 
 class EasyMagpieLTSelfAttention(nn.Module):
-    """Bias-free causal self-attention without a KV cache."""
+    """Bias-free causal attention with full-prefix and single-position paths."""
 
     def __init__(self, d_model: int, n_heads: int) -> None:
         super().__init__()
@@ -53,6 +52,25 @@ class EasyMagpieLTSelfAttention(nn.Module):
         attn = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True, scale=self.scale)
         attn = attn.transpose(1, 2).contiguous().view(b, t, -1)
         return self.o_net(attn)
+
+    def forward_step(
+        self, x: torch.Tensor, key_cache: torch.Tensor, value_cache: torch.Tensor, position: int
+    ) -> torch.Tensor:
+        """Append one position and attend only to this frame's initialized prefix."""
+        batch = x.shape[0]
+        qkv = self.qkv_net(x).reshape(batch, 1, 3, self.n_heads, self.d_head)
+        q, k, v = (part.transpose(1, 2) for part in qkv.unbind(dim=2))
+        key_cache[:, :, position : position + 1, :].copy_(k)
+        value_cache[:, :, position : position + 1, :].copy_(v)
+        # The query is the newest position. All cached keys are causal; SDPA's
+        # is_causal=True would instead align a length-one query to position zero.
+        attn = torch.nn.functional.scaled_dot_product_attention(
+            q,
+            key_cache[:, :, : position + 1, :],
+            value_cache[:, :, : position + 1, :],
+            scale=self.scale,
+        )
+        return self.o_net(attn.transpose(1, 2).reshape(batch, 1, -1))
 
 
 class EasyMagpieLTFeedForward(nn.Module):
@@ -107,6 +125,12 @@ class EasyMagpieLTLayer(nn.Module):
         x = x + self.pos_ff(self.norm_pos_ff(x))
         return x
 
+    def forward_step(
+        self, x: torch.Tensor, key_cache: torch.Tensor, value_cache: torch.Tensor, position: int
+    ) -> torch.Tensor:
+        x = x + self.self_attention.forward_step(self.norm_self(x), key_cache, value_cache, position)
+        return x + self.pos_ff(self.norm_pos_ff(x))
+
 
 class EasyMagpieLocalTransformer(nn.Module):
     """Causal transformer stack with learnable positional embeddings.
@@ -139,6 +163,28 @@ class EasyMagpieLocalTransformer(nn.Module):
         x = inputs_embeds + pos_emb.unsqueeze(0)
         for layer in self.layers:
             x = layer(x)
+        return self.norm_out(x)
+
+    def allocate_frame_cache(self, inputs_embeds: torch.Tensor, num_positions: int) -> list[torch.Tensor]:
+        """Allocate frame-local K/V scratch, whose addresses are retained by CUDA graphs.
+
+        No request state survives the call. Each position is written before it
+        is read, so graph replay, row reordering and padded batches need no
+        cache clearing or request-slot lifecycle hooks.
+        """
+        return [
+            inputs_embeds.new_empty(
+                2, inputs_embeds.shape[0], layer.self_attention.n_heads, num_positions, layer.self_attention.d_head
+            )
+            for layer in self.layers
+        ]
+
+    def forward_step(self, inputs_embeds: torch.Tensor, cache: list[torch.Tensor], position: int) -> torch.Tensor:
+        """Transform the current position using this frame's per-layer K/V cache."""
+        pos_emb = self.position_embeddings(self._positions[position : position + 1])
+        x = inputs_embeds + pos_emb.unsqueeze(0)
+        for layer, layer_cache in zip(self.layers, cache):
+            x = layer.forward_step(x, layer_cache[0], layer_cache[1], position)
         return self.norm_out(x)
 
 
@@ -188,17 +234,16 @@ class EasyMagpieCodeLoop(nn.Module):
             ``[num_tokens, num_codebooks]`` int64 sampled codes.
         """
         cp = self._predictor_ref[0]
-        num_tokens = dec_hidden.shape[0]
         n = self.num_codebooks
 
-        buf = dec_hidden.new_zeros(num_tokens, n, self.lt_hidden)
-        buf[:, 0, :] = cp.local_transformer_in_projection(dec_hidden)
+        current = cp.local_transformer_in_projection(dec_hidden).unsqueeze(1)
+        cache = cp.local_transformer.allocate_frame_cache(current, n)
 
         forbidden = cp.forbidden_mask
         codes: list[torch.Tensor] = []
         for k in range(n):
-            hidden = cp.local_transformer(buf[:, : k + 1, :])
-            row = cp.local_transformer_audio_out_projection(hidden[:, k, :])
+            hidden = cp.local_transformer.forward_step(current, cache, k)
+            row = cp.local_transformer_audio_out_projection(hidden[:, 0, :])
             logits = cp.local_transformer_out_projections[k](row)
             logits = logits.masked_fill(forbidden, float("-inf")) / temperature
             vals, idxs = torch.topk(logits, self.top_k, dim=-1)
@@ -207,7 +252,7 @@ class EasyMagpieCodeLoop(nn.Module):
             codes.append(code_k)
             if k + 1 < n:
                 emb = cp.audio_in_projection(cp.audio_embeddings[k](code_k))
-                buf[:, k + 1, :] = cp.local_transformer_in_projection(emb)
+                current = cp.local_transformer_in_projection(emb).unsqueeze(1)
         return torch.stack(codes, dim=1)
 
 
@@ -353,18 +398,6 @@ class EasyMagpieCodePredictor(nn.Module):
         noise.log_().neg_().log_().neg_()
 
         self._temperature_buf.fill_(max(float(self.temperature), _MIN_SAMPLING_TEMPERATURE))
-        if not is_forward_context_available():
-            return self._code_loop(in_buf, noise, self._temperature_buf)
-
-        # This dense submodel has no attention split points, so its independently
-        # compiled graph must not inherit PIECEWISE mode from a mixed
-        # prefill/decode pass through the outer hybrid model.
-        ctx = get_forward_context()
-        runtime_mode = ctx.cudagraph_runtime_mode
-        if runtime_mode != CUDAGraphMode.PIECEWISE:
-            return self._code_loop(in_buf, noise, self._temperature_buf)
-        ctx.cudagraph_runtime_mode = CUDAGraphMode.FULL
-        try:
-            return self._code_loop(in_buf, noise, self._temperature_buf)
-        finally:
-            ctx.cudagraph_runtime_mode = runtime_mode
+        # Respect vLLM's graph dispatcher. Forcing FULL here bypasses the
+        # PIECEWISE wrapper that captures this unsplit dense subgraph.
+        return self._code_loop(in_buf, noise, self._temperature_buf)

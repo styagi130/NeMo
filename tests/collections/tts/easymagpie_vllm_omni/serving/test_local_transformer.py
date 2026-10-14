@@ -103,8 +103,8 @@ def test_generate_codes_deterministic_with_seed():
 @pytest.mark.unit
 @pytest.mark.parametrize("outer_mode", [None, CUDAGraphMode.NONE, CUDAGraphMode.FULL, CUDAGraphMode.PIECEWISE])
 @pytest.mark.parametrize("raise_from_loop", [False, True], ids=["success", "failure"])
-def test_generate_codes_uses_full_cudagraph_mode_and_restores_outer_mode(monkeypatch, outer_mode, raise_from_loop):
-    """Check context selection/restoration, not numerical equivalence or CUDA replay."""
+def test_generate_codes_preserves_dispatcher_mode_on_success_and_failure(monkeypatch, outer_mode, raise_from_loop):
+    """Keep the dispatcher mode: forcing FULL bypasses its PIECEWISE wrapper."""
     cp, arch = _build_predictor(ARCH_PROFILES["equal_dims"])
     outer_context = SimpleNamespace(cudagraph_runtime_mode=outer_mode)
     observed_modes = []
@@ -133,8 +133,7 @@ def test_generate_codes_uses_full_cudagraph_mode_and_restores_outer_mode(monkeyp
     else:
         cp.generate_codes(dec_hidden)
 
-    expected = CUDAGraphMode.FULL if outer_mode == CUDAGraphMode.PIECEWISE else outer_mode
-    assert observed_modes == [expected]
+    assert observed_modes == [outer_mode]
     assert outer_context.cudagraph_runtime_mode == outer_mode
 
 

@@ -23,6 +23,7 @@ its HF architecture or an explicit ``pipeline: …`` deployment setting.
   EasyMagpie LM in isolation; select it with ``pipeline: easymagpie_lm``.
 """
 from vllm_omni.config.stage_config import PipelineConfig, StageExecutionType, StagePipelineConfig
+from .codec_async_output import codec_async_output_enabled
 
 _PROC = "easymagpie_vllm_omni.stage_processors"
 
@@ -77,7 +78,11 @@ EASYMAGPIE_PIPELINE = PipelineConfig(
             engine_output_type="audio",
             model_arch="EasyMagpieCodecForConditionalGeneration",
             model_subdir="codec_native",
-            scheduler_cls="easymagpie_vllm_omni.scheduler.EasyMagpieCodecScheduler",
+            scheduler_cls=(
+                "easymagpie_vllm_omni.scheduler.EasyMagpieAsyncCodecScheduler"
+                if codec_async_output_enabled()
+                else "easymagpie_vllm_omni.scheduler.EasyMagpieCodecScheduler"
+            ),
             # Sync mode uses one placeholder per frame; the connector carries codes.
             sync_process_input_func=f"{_PROC}.talker2code2wav_token_only",
             sampling_constraints={"detokenize": True},

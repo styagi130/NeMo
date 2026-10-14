@@ -22,7 +22,76 @@ tile sizes and fusing HalfSnake are separate performance work.
 from __future__ import annotations
 
 import torch
+from triton.language.extra.cuda import libdevice
 from vllm.triton_utils import tl, triton
+
+
+@triton.jit
+def _packed_half_snake_sglang_kernel(
+    input_ptr,
+    residual_ptr,
+    alpha_ptr,
+    output_ptr,
+    numel,
+    channels: tl.constexpr,
+    snake_channels: tl.constexpr,
+    HAS_RESIDUAL: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < numel
+    channel = offsets % channels
+    values = tl.load(input_ptr + offsets, mask=mask, other=0.0)
+    if HAS_RESIDUAL:
+        # Match SGLang's residual + hidden operand order before activation.
+        values = tl.load(residual_ptr + offsets, mask=mask, other=0.0) + values
+    alpha = tl.load(alpha_ptr + channel, mask=mask & (channel < snake_channels), other=1.0)
+    sine = libdevice.sin(alpha * values)
+    periodic = values + libdevice.div_rn(sine * sine, alpha + 1.0e-9)
+    leaky = tl.where(values > 0.0, values, values * 0.01)
+    tl.store(output_ptr + offsets, tl.where(channel < snake_channels, periodic, leaky), mask=mask)
+
+
+def packed_half_snake_sglang(
+    inputs: torch.Tensor,
+    alpha: torch.Tensor,
+    residual: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Experimental FP32 fusion of the retained SGLang eager operation order.
+
+    This explicitly selects libdevice sin, rounded division and unfused
+    arithmetic. Exact GPU parity remains a validation gate.
+    """
+    if not inputs.is_cuda or inputs.dtype != torch.float32 or alpha.dtype != torch.float32:
+        raise ValueError("SGLang arithmetic fusion requires FP32 CUDA inputs and alpha")
+    if inputs.ndim != 2 or alpha.numel() != inputs.shape[1] // 2 or alpha.device != inputs.device:
+        raise ValueError("invalid packed HalfSnake input/alpha layout")
+    if residual is not None and (
+        residual.dtype != torch.float32 or residual.shape != inputs.shape or residual.device != inputs.device
+    ):
+        raise ValueError("residual must match FP32 CUDA inputs")
+    inputs = inputs.contiguous()
+    alpha = alpha.contiguous()
+    if residual is not None:
+        residual = residual.contiguous()
+    outputs = torch.empty_like(inputs)
+    if not inputs.numel():
+        return outputs
+    block = 256
+    _packed_half_snake_sglang_kernel[(triton.cdiv(inputs.numel(), block),)](
+        inputs,
+        inputs if residual is None else residual,
+        alpha,
+        outputs,
+        inputs.numel(),
+        inputs.shape[1],
+        alpha.numel(),
+        HAS_RESIDUAL=residual is not None,
+        BLOCK=block,
+        enable_fp_fusion=False,
+        enable_reflect_ftz=False,
+    )
+    return outputs
 
 
 @triton.jit

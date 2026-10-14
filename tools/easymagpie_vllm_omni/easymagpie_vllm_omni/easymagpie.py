@@ -42,6 +42,8 @@ from easymagpie_vllm_omni.backbone_patches import (
 from easymagpie_vllm_omni.codec.encoder import EasyMagpieCodecEncoder
 from easymagpie_vllm_omni.codec.encoder_config import EasyMagpieCodecEncoderConfig
 from easymagpie_vllm_omni.config import EasyMagpieOmniArch
+from easymagpie_vllm_omni.device_decode_state import DeviceDecodeState
+from easymagpie_vllm_omni.feedback_snapshot import attach_feedback_snapshot, owned_feedback_outputs
 from easymagpie_vllm_omni.local_transformer import EasyMagpieCodePredictor
 from easymagpie_vllm_omni.multimodal import (
     EasyMagpieDummyInputsBuilder,
@@ -322,6 +324,28 @@ class EasyMagpieTTSForConditionalGeneration(
         # for that combo (see :meth:`_load_known_speaker_embedding`), then never
         # again. Raw-reference embeddings are owned by vLLM's multimodal cache.
         self._prefill_cache: dict[tuple, torch.Tensor] = {}
+        self._max_decode_batch_size = vllm_config.scheduler_config.max_num_seqs
+        self._prefill_graphs_enabled = os.environ.get("EASYMAGPIE_PREFILL_GRAPHS", "0") == "1"
+        self._batched_owned_feedback_enabled = os.environ.get("EASYMAGPIE_BATCHED_OWNED_FEEDBACK", "0") == "1"
+        self._batched_decode_inputs_enabled = os.environ.get("EASYMAGPIE_BATCHED_DECODE_INPUTS", "0") == "1"
+        self._retain_live_decode_leases = os.environ.get("EASYMAGPIE_DDS_RETAIN_LIVE_LEASES", "0") == "1"
+        self._batched_feedback_merge_enabled = os.environ.get("EASYMAGPIE_BATCHED_FEEDBACK_MERGE", "0") == "1"
+        self._prepared_query_dispatch = None
+        self._query_dispatch_pool = None
+        if os.environ.get("EASYMAGPIE_QUERY_DISPATCH_POOL", "0") == "1":
+            from .query_dispatch_pool import QueryDispatchPool
+
+            self._query_dispatch_pool = QueryDispatchPool(
+                self._combined_embeddings.device, self._max_decode_batch_size
+            )
+        self._device_decode_state = None
+        if os.environ.get("EASYMAGPIE_DEVICE_DECODE_STATE", "0") == "1":
+            self._device_decode_state = DeviceDecodeState(
+                self,
+                capacity=self._max_decode_batch_size,
+                text_capacity=vllm_config.model_config.max_model_len,
+                max_tokens=max_num_tokens,
+            )
 
     # ------------------------------------------------------------------
     # Embedding helpers
@@ -551,6 +575,12 @@ class EasyMagpieTTSForConditionalGeneration(
         if attn_metadata is None:
             return None, 0, None
 
+        prepared = getattr(self, "_prepared_query_dispatch", None)
+        if prepared is not None:
+            pool = getattr(self, "_query_dispatch_pool", None)
+            if pool is not None:
+                pool.before_forward()
+            return prepared
         max_query_len, start_loc = self._select_query_layout(attn_metadata)
 
         # Decode-only batch (or layout unavailable) -> run the LT on every token.
@@ -574,6 +604,30 @@ class EasyMagpieTTSForConditionalGeneration(
                 decode_token_indices, (0, padded_num_requests - num_requests)
             )
         return decode_token_indices, num_requests, prefill_last_indices
+
+    def prepare_query_dispatch(self, starts, counts, device):
+        """Use the runner's CPU schedule for mixed-batch row selection."""
+        self._prepared_query_dispatch = None
+        pool = getattr(self, "_query_dispatch_pool", None)
+        if pool is not None:
+            pool.begin_step()
+        if not any(count > 1 for count in counts):
+            return
+        decode = [start for start, count in zip(starts, counts, strict=True) if count == 1]
+        prefill = [start + count - 1 for start, count in zip(starts, counts, strict=True) if count > 1]
+        num_decode = len(decode)
+        if self.vllm_config.compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
+            sizes = self.vllm_config.compilation_config.cudagraph_capture_sizes
+            index = bisect.bisect_left(sizes, num_decode)
+            if index < len(sizes):
+                decode += [0] * (sizes[index] - num_decode)
+        uploaded = pool.try_upload(decode, prefill, device) if pool is not None else None
+        if uploaded is None:
+            uploaded = (
+                torch.tensor(decode, dtype=torch.long, device=device),
+                torch.tensor(prefill, dtype=torch.long, device=device),
+            )
+        self._prepared_query_dispatch = (uploaded[0], num_decode, uploaded[1])
 
     # ------------------------------------------------------------------
     # forward
@@ -608,12 +662,27 @@ class EasyMagpieTTSForConditionalGeneration(
         logits_index = kwargs.get("logits_index")
 
         decode_idx, num_req, prefill_last_idx = self._get_query_dispatch()
+        large_prefill_dummy = (
+            getattr(self, "_prefill_graphs_enabled", False)
+            and get_forward_context().attn_metadata is None
+            and num_tokens > self._max_decode_batch_size
+        )
+        device_state = getattr(self, "_device_decode_state", None)
+        decode_state_context = None
+        if device_state is not None and not large_prefill_dummy:
+            rows = device_state.row_indices[:num_tokens] if decode_idx is None else decode_idx[:num_req]
+            if rows.numel():
+                decode_state_context = device_state.stage(self, rows)
 
         if decode_idx is not None:
             # Acoustic prediction is skipped on prefill rows. Clear their shared
             # scratch slots so a prior request cannot leak a fake codec frame.
             self._out_codes[:num_tokens].zero_()
-        if decode_idx is None:
+        if large_prefill_dummy:
+            # These metadata-free profiling rows are prefill-only: a real decode
+            # cannot exceed max_num_seqs. Avoid compiling the predictor at B4096.
+            pass
+        elif decode_idx is None:
             # Warm-up or decode-only batches exercise the full decode path.
             self._assemble_decode_embeddings(combined, slice(0, num_tokens))
         elif num_req > 0:
@@ -626,6 +695,13 @@ class EasyMagpieTTSForConditionalGeneration(
             intermediate_tensors=intermediate_tensors,
             inputs_embeds=combined,
         )
+
+        if large_prefill_dummy:
+            self._sample_stop[:num_tokens].zero_()
+            pool = getattr(self, "_query_dispatch_pool", None)
+            if pool is not None:
+                pool.complete_forward()
+            return hidden_states
 
         # Sample codes (local transformer) only where needed.
         if decode_idx is None:
@@ -646,6 +722,9 @@ class EasyMagpieTTSForConditionalGeneration(
             if self.has_phoneme:
                 self._predict_phonemes(hidden_states, valid)
 
+        if decode_state_context is not None:
+            device_state.commit(self, decode_state_context)
+
         # The final prefetched text position predicts the phoneme consumed by the
         # first decode step. It does not need an acoustic-code prediction.
         if self.has_phoneme and prefill_last_idx is not None and prefill_last_idx.numel() > 0:
@@ -659,7 +738,14 @@ class EasyMagpieTTSForConditionalGeneration(
         else:
             self._sample_stop[:num_tokens].copy_(self._token_stop[:num_tokens])
 
+        pool = getattr(self, "_query_dispatch_pool", None)
+        if pool is not None:
+            pool.complete_forward()
         return hidden_states
+
+    def query_dispatch_pool_status(self):
+        pool = getattr(self, "_query_dispatch_pool", None)
+        return pool.status() if pool is not None else {"enabled": False}
 
     def _flag_audio_eos(self, codes: torch.Tensor, idx) -> None:
         """Flag decode positions whose newly sampled frame ends speech.
@@ -767,6 +853,8 @@ class EasyMagpieTTSForConditionalGeneration(
         hidden = model_outputs
         num_tokens = int(hidden.shape[0])
         audio_codes = self._out_codes[:num_tokens].clone()
+        if getattr(self, "_batched_owned_feedback_enabled", False):
+            attach_feedback_snapshot(self, audio_codes)
         if self._single_stage_audio:
             # Drainable client key (see ``self._single_stage_audio`` in __init__):
             # ``model_outputs`` is remapped to the ``audio`` modality and drained
@@ -1421,6 +1509,10 @@ class EasyMagpieTTSForConditionalGeneration(
         device: torch.device,
         info_dict: dict[str, Any],
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
+        prepared = getattr(self, "_prepared_decode_updates", {}).pop(start, None)
+        if prepared is not None:
+            return input_ids, self._decode_zero_embedding, prepared
+
         decode_offset = int(info_dict.get("decode_offset", 0) or 0)
         info_update: dict[str, Any] = {"decode_offset": decode_offset + 1}
 
@@ -1517,6 +1609,133 @@ class EasyMagpieTTSForConditionalGeneration(
         inputs_embeds_out = torch.zeros((1, self.embedding_dim), device=device, dtype=self._combined_embeddings.dtype)
         return input_ids, inputs_embeds_out, info_update
 
+    @torch.no_grad()
+    def prepare_decode_batch(
+        self,
+        rows: list[tuple[int, dict[str, Any]]],
+        device: torch.device,
+        *,
+        request_keys=None,
+        live_request_keys=None,
+    ) -> None:
+        """Batch decode-channel updates after the runner has resolved row order.
+
+        Metadata stays on the host; owned feedback stays on its current device.
+        Partial feedback and nonresident tensors retain the single-row path.
+        Results are consumed once by ``preprocess`` and cleared by the runner
+        after every batch, including failed preparation.
+        """
+        self.clear_decode_batch()
+        device_state = getattr(self, "_device_decode_state", None)
+        if device_state is not None and request_keys is not None:
+            self._prepared_decode_updates = device_state.prepare(
+                rows, request_keys, self, _merge_streaming_text_chunk, live_request_keys=live_request_keys
+            )
+            if not hasattr(self, "_decode_zero_embedding"):
+                self._decode_zero_embedding = self._combined_embeddings.new_zeros(1, self.embedding_dim)
+            # Unsupported rows use the existing single-request path. Their row
+            # slots remain inactive, so captured state updates leave them alone.
+            return
+        eligible = []
+        for start, info in rows:
+            if isinstance(info.get("additional_information"), dict):
+                continue
+            widths = {"last_audio_codes": self.num_codebooks}
+            if self.has_phoneme:
+                widths["last_phoneme_token"] = self.arch.phoneme_stacking_factor
+            if any(
+                isinstance(info.get(key), torch.Tensor)
+                and info[key].numel() > 0
+                and (info[key].device != device or info[key].dtype != torch.long or info[key].numel() < width)
+                for key, width in widths.items()
+            ):
+                continue
+            ended = info.get("phoneme_ended", False)
+            if isinstance(ended, torch.Tensor) and (
+                ended.device != device or ended.dtype != torch.bool or ended.numel() != 1
+            ):
+                continue
+            eligible.append((start, info))
+        if len(eligible) < 2:
+            return
+
+        if not hasattr(self, "_decode_zero_embedding"):
+            self._decode_zero_embedding = self._combined_embeddings.new_zeros(1, self.embedding_dim)
+            self._decode_bool_constants = torch.tensor([False, True], device=device)
+
+        metadata, audio, phonemes, ended_flags, updates = [], [], [], [], []
+        for start, info in eligible:
+            offset = int(info.get("decode_offset", 0) or 0)
+            update = {"decode_offset": offset + 1}
+            text_tokens = info.get("text_tokens") or []
+            incoming = info.get("text_token") or []
+            if incoming:
+                text_tokens, appended = _merge_streaming_text_chunk(
+                    text_tokens, incoming, info.get("text_token_start")
+                )
+                if appended:
+                    update["text_tokens"] = text_tokens
+            text_valid = offset < len(text_tokens)
+            text_token = int(text_tokens[offset]) if text_valid else 0
+
+            last_audio = info.get("last_audio_codes")
+            has_audio = isinstance(last_audio, torch.Tensor) and last_audio.numel() > 0
+            audio_mode = 0 if offset < self.speech_delay else 1
+            if offset > self.speech_delay and has_audio:
+                audio_mode = 2
+            audio.append(
+                last_audio.reshape(-1)[: self.num_codebooks] if audio_mode == 2 else self._dec_audio_codes[start]
+            )
+            phoneme_mode = 0
+            if self.has_phoneme:
+                last_phoneme = info.get("last_phoneme_token")
+                if offset == self.phonemes_delay:
+                    phoneme_mode = 1
+                elif offset > self.phonemes_delay and isinstance(last_phoneme, torch.Tensor) and last_phoneme.numel():
+                    phoneme_mode = 2
+                phonemes.append(
+                    last_phoneme.reshape(-1)[: self.arch.phoneme_stacking_factor]
+                    if phoneme_mode == 2
+                    else self._dec_phoneme_tokens[start]
+                )
+                ended = info.get("phoneme_ended", False)
+                ended_flags.append(
+                    ended.reshape(())
+                    if isinstance(ended, torch.Tensor)
+                    else self._decode_bool_constants[int(bool(ended))]
+                )
+            metadata.append((start, text_token, int(text_valid), audio_mode, phoneme_mode))
+            updates.append(update)
+
+        # One metadata upload replaces the per-request scalar writes. Feedback
+        # stacks own their data before any destination row is overwritten.
+        meta = torch.tensor(metadata, device=device, dtype=torch.long)
+        indices, text, text_valid, audio_mode, phoneme_mode = meta.unbind(dim=1)
+        self._dec_text_tokens.index_copy_(
+            0, indices, torch.where(text_valid.bool(), text, self._dec_text_tokens[indices])
+        )
+        self._dec_text_mask.index_copy_(0, indices, text_valid)
+        audio_codes = torch.stack(audio)
+        audio_codes = torch.where(audio_mode[:, None] == 1, self.arch.audio_bos_id, audio_codes)
+        self._dec_audio_codes.index_copy_(0, indices, audio_codes)
+        self._dec_audio_valid.index_copy_(0, indices, (audio_mode > 0).long())
+
+        if self.has_phoneme:
+            previous_ended = torch.stack(ended_flags)
+            phoneme_tokens = torch.stack(phonemes)
+            phoneme_tokens = torch.where(phoneme_mode[:, None] == 1, self.phoneme_bos_id, phoneme_tokens)
+            self._dec_phoneme_tokens.index_copy_(0, indices, phoneme_tokens)
+            self._dec_phoneme_valid.index_copy_(0, indices, ((phoneme_mode > 0) & ~previous_ended).long())
+            ended = previous_ended | ((phoneme_mode == 2) & (phoneme_tokens == self.phoneme_eos_id).any(dim=1))
+            for index, update in enumerate(updates):
+                update["phoneme_ended"] = ended[index]
+
+        self._prepared_decode_updates = {start: update for (start, _), update in zip(eligible, updates, strict=True)}
+
+    def clear_decode_batch(self) -> None:
+        """Discard host preparation results before request rows can be reused."""
+        self._prepared_decode_updates: dict[int, dict[str, Any]] = {}
+
     def postprocess(self, hidden_states: torch.Tensor, multimodal_outputs: Optional[dict[str, Any]] = None, **_: Any):
         """Stash the last frame's codes (and phoneme) for the next decode step."""
         if hidden_states.numel() == 0:
@@ -1540,10 +1759,19 @@ class EasyMagpieTTSForConditionalGeneration(
             elif "codes.audio" in mm:
                 audio_codes = mm.get("codes.audio")
         if isinstance(audio_codes, torch.Tensor) and audio_codes.numel() > 0:
+            if getattr(self, "_batched_owned_feedback_enabled", False):
+                owned = owned_feedback_outputs(audio_codes, last)
+                if owned is not None:
+                    return owned
             out["last_audio_codes"] = audio_codes[last : last + 1].detach()
         if self.has_phoneme:
             # The runner takes an owning copy before the next model invocation.
             out["last_phoneme_token"] = self._dec_phoneme_tokens[last : last + 1].detach()
+        device_state = getattr(self, "_device_decode_state", None)
+        if device_state is not None and self.has_phoneme:
+            ended = device_state.ended_for_row(last)
+            if ended is not None:
+                out["phoneme_ended"] = ended
         return out
 
     # ------------------------------------------------------------------

@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "description": "Validated EasyMagpie complete-batch preprocessing and phase-admission scheduler hooks. Apply offline before starting workers.",
+  "distributions": {
+    "vllm": "0.26.0",
+    "vllm-omni": "0.26.0"
+  },
+  "patch": "runtime.patch",
+  "patch_sha256": "11b2ecb2116a999c64a23409583950a083f0af8ed0e6aad5e11722c1a154304f",
+  "files": [
+    {
+      "path": "vllm/v1/core/sched/scheduler.py",
+      "distribution": "vllm",
+      "original_sha256": "2ed2a550b6558b2495eda845a97ae38bcf0225027b9e25fbf00fc3880c1d3941",
+      "patched_sha256": "a63ec66e9e42f5d72a79cd2a8691a8cf01e623f91b989c1501cffd630eb24b60"
+    },
+    {
+      "path": "vllm_omni/worker/gpu_model_runner.py",
+      "distribution": "vllm-omni",
+      "original_sha256": "32bc388cfa7a91db0e0fc4decb7a3f3cbe22067a7507b51ad8eed4e4044eff15",
+      "patched_sha256": "9c2ae3ca5f924aeee994acbe6fb12495c754f161a9587cac8ec7f33539fdec99"
+    }
+  ],
+  "provenance": {
+    "validation": "validated-port-admission-lookahead-complete/validation.json",
+    "validation_sha256": "0c574efc1f22cec354bad0ebcf66913c8ee08a216440f33c56cc3e5eb040adcd",
+    "validated_source": "source-admission-lookahead-variant",
+    "scope": "Two runtime files only; no experimental codec, transport or event patches."
+  }
+}
