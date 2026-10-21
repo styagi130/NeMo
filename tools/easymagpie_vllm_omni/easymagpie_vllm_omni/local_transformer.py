@@ -15,6 +15,8 @@
 """Autoregressive intra-frame codebook predictor for EasyMagpieTTS."""
 from __future__ import annotations
 
+import os
+
 import torch
 from easymagpie_vllm_omni.config import EasyMagpieOmniArch
 from torch import nn
@@ -54,12 +56,21 @@ class EasyMagpieLTSelfAttention(nn.Module):
         return self.o_net(attn)
 
     def forward_step(
-        self, x: torch.Tensor, key_cache: torch.Tensor, value_cache: torch.Tensor, position: int
+        self, x: torch.Tensor, key_cache: torch.Tensor | list, value_cache: torch.Tensor | list, position: int
     ) -> torch.Tensor:
         """Append one position and attend only to this frame's initialized prefix."""
         batch = x.shape[0]
         qkv = self.qkv_net(x).reshape(batch, 1, 3, self.n_heads, self.d_head)
         q, k, v = (part.transpose(1, 2) for part in qkv.unbind(dim=2))
+        if isinstance(key_cache, list):
+            # Frame-local functional prefixes remove mutable cache copies from
+            # the captured codebook loop. The same QKV/SDPA/projections run.
+            key_cache.append(k)
+            value_cache.append(v)
+            attn = torch.nn.functional.scaled_dot_product_attention(
+                q, torch.cat(key_cache, dim=2), torch.cat(value_cache, dim=2), scale=self.scale
+            )
+            return self.o_net(attn.transpose(1, 2).reshape(batch, 1, -1))
         key_cache[:, :, position : position + 1, :].copy_(k)
         value_cache[:, :, position : position + 1, :].copy_(v)
         # The query is the newest position. All cached keys are causal; SDPA's
@@ -156,6 +167,10 @@ class EasyMagpieLocalTransformer(nn.Module):
         self.register_buffer("_positions", torch.arange(max_len), persistent=False)
         self.layers = nn.ModuleList([EasyMagpieLTLayer(d_model, d_ffn, n_heads) for _ in range(n_layers)])
         self.norm_out = nn.Identity()
+        value = os.environ.get("EASYMAGPIE_LOCAL_KV_PREFIX_LIST", "0")
+        if value not in ("0", "1"):
+            raise ValueError("EASYMAGPIE_LOCAL_KV_PREFIX_LIST must be 0 or 1")
+        self.prefix_list_enabled = value == "1"
 
     def forward(self, inputs_embeds: torch.Tensor) -> torch.Tensor:
         seq_len = inputs_embeds.shape[1]
@@ -165,13 +180,15 @@ class EasyMagpieLocalTransformer(nn.Module):
             x = layer(x)
         return self.norm_out(x)
 
-    def allocate_frame_cache(self, inputs_embeds: torch.Tensor, num_positions: int) -> list[torch.Tensor]:
+    def allocate_frame_cache(self, inputs_embeds: torch.Tensor, num_positions: int) -> list:
         """Allocate frame-local K/V scratch, whose addresses are retained by CUDA graphs.
 
         No request state survives the call. Each position is written before it
         is read, so graph replay, row reordering and padded batches need no
         cache clearing or request-slot lifecycle hooks.
         """
+        if self.prefix_list_enabled:
+            return [([], []) for _ in self.layers]
         return [
             inputs_embeds.new_empty(
                 2, inputs_embeds.shape[0], layer.self_attention.n_heads, num_positions, layer.self_attention.d_head

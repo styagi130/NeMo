@@ -1,12 +1,12 @@
 {
   "schema_version": 1,
-  "description": "Validated EasyMagpie complete-batch preprocessing and phase-admission scheduler hooks. Apply offline before starting workers.",
+  "description": "Validated EasyMagpie complete-batch preprocessing, phase-admission scheduler and opt-in per-runner snapshot event hooks. Apply offline before starting workers.",
   "distributions": {
     "vllm": "0.26.0",
     "vllm-omni": "0.26.0"
   },
   "patch": "runtime.patch",
-  "patch_sha256": "11b2ecb2116a999c64a23409583950a083f0af8ed0e6aad5e11722c1a154304f",
+  "patch_sha256": "4d516687ecb78cf24f7578918f4ad90117db533857713f3282413b7f830e4bc1",
   "files": [
     {
       "path": "vllm/v1/core/sched/scheduler.py",
@@ -19,12 +19,23 @@
       "distribution": "vllm-omni",
       "original_sha256": "32bc388cfa7a91db0e0fc4decb7a3f3cbe22067a7507b51ad8eed4e4044eff15",
       "patched_sha256": "9c2ae3ca5f924aeee994acbe6fb12495c754f161a9587cac8ec7f33539fdec99"
+    },
+    {
+      "path": "vllm_omni/worker/gpu_ar_model_runner.py",
+      "distribution": "vllm-omni",
+      "original_sha256": "05477aa1f68d7eae27ad7c80e2c3bc36f4ad2d4bc6c59606333ad0c8c17e43b5",
+      "patched_sha256": "cc36f22194b4c34ea36adebb5b033512a0132fc557f2c3ac74fba9641d50e29a"
     }
   ],
   "provenance": {
     "validation": "validated-port-admission-lookahead-complete/validation.json",
     "validation_sha256": "0c574efc1f22cec354bad0ebcf66913c8ee08a216440f33c56cc3e5eb040adcd",
     "validated_source": "source-admission-lookahead-variant",
-    "scope": "Two runtime files only; no experimental codec, transport or event patches."
+    "scope": "Three runtime files. Original two preprocessing/admission hooks plus a default-off per-runner CPU snapshot event policy; no CUDA event monkeypatching or added copies/synchronization.",
+    "snapshot_event": {
+      "upstream_distribution": "vllm-omni==0.26.0",
+      "upstream_wheel_sha256": "ed12206b31a64685511854bd7cba18efe91d0dbfdbc8433beda718dcf556f601",
+      "behavior": "_omni_snapshot_blocking_event defaults false; true changes only the existing payload copy-completion event to blocking=True. CPU-only payloads create no event; wait/source ownership unchanged."
+    }
   }
 }

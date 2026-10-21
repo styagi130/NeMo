@@ -74,6 +74,22 @@ def merge_streaming_additional_information(
 class EasyMagpieGPUARModelRunner(GPUARModelRunner):
     """GPU AR runner that restores streaming chunk metadata propagation."""
 
+    def load_model(self, *args, **kwargs):
+        result = super().load_model(*args, **kwargs)
+        self._bulk_fresh_prefill_inputs = None
+        value = os.environ.get("EASYMAGPIE_BULK_FRESH_PREFILL_INPUTS", "0")
+        if value not in ("0", "1"):
+            raise ValueError("EASYMAGPIE_BULK_FRESH_PREFILL_INPUTS must be 0 or 1")
+        if value == "1":
+            from .bulk_fresh_prefill_inputs import BulkFreshInputs
+            from .easymagpie import EasyMagpieTTSForConditionalGeneration
+
+            model = self.get_model()
+            if type(model) is not EasyMagpieTTSForConditionalGeneration:
+                raise TypeError("bulk fresh input preparation requires the EasyMagpie talker")
+            self._bulk_fresh_prefill_inputs = BulkFreshInputs(self, model)
+        return result
+
     def _query_starts_cpu(self, count: int, site: str) -> list[int]:
         """Read the existing CPU int32 buffer once; return a fresh Python list."""
         host = self.query_start_loc.cpu
@@ -127,6 +143,12 @@ class EasyMagpieGPUARModelRunner(GPUARModelRunner):
                 prepare(rows, device)
 
     def _try_complete_decode_preprocess(self, input_ids, inputs_embeds, counts) -> bool:
+        if self._try_complete_q1_preprocess(input_ids, inputs_embeds, counts):
+            return True
+        fresh = getattr(self, "_bulk_fresh_prefill_inputs", None)
+        return fresh is not None and fresh.try_prepare(input_ids, inputs_embeds, counts)
+
+    def _try_complete_q1_preprocess(self, input_ids, inputs_embeds, counts) -> bool:
         """Consume an eligible DDS batch without per-row tensor copy launches.
 
         Called by the isolated pinned-runtime hook after the base runner has

@@ -19,7 +19,7 @@ patched installation. ``--check`` only checks compatibility; ``--verify`` only
 accepts an already patched installation. ``--site-packages`` selects an offline
 installation containing both packages and their distribution metadata.
 
-All input/output hashes are checked before replacing either file. Ordinary
+All input/output hashes are checked before replacing any file. Ordinary
 write errors roll back completed replacements. An interrupted process can leave
 a partial installation: subsequent calls reject it; reinstall the pinned
 packages before retrying. Do not run another package installer concurrently.
@@ -43,7 +43,7 @@ class PatchError(RuntimeError):
 
 
 def apply_runtime_patches(site_packages=None, *, check=False, verify=False):
-    """Check or install both runtime files, returning their verified hashes."""
+    """Check or install all validated runtime files, returning their verified hashes."""
     if check and verify:
         raise PatchError('Choose only one of check and verify.')
     manifest, patches = _load_bundle()
@@ -90,7 +90,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     modes = parser.add_mutually_exclusive_group()
     modes.add_argument('--check', action='store_true', help='Validate compatibility without changing files.')
-    modes.add_argument('--verify', action='store_true', help='Require both files to be already patched; never write.')
+    modes.add_argument('--verify', action='store_true', help='Require all files to be already patched; never write.')
     parser.add_argument('--site-packages', type=Path, help='Offline package root, including .dist-info metadata.')
     args = parser.parse_args()
     try:
@@ -111,9 +111,13 @@ def _load_bundle():
     if manifest.get('distributions') != {'vllm': '0.26.0', 'vllm-omni': '0.26.0'}:
         raise PatchError('Unsupported runtime distribution versions in manifest.')
     files = manifest.get('files', [])
-    expected = {'vllm/v1/core/sched/scheduler.py': 'vllm', 'vllm_omni/worker/gpu_model_runner.py': 'vllm-omni'}
+    expected = {
+        'vllm/v1/core/sched/scheduler.py': 'vllm',
+        'vllm_omni/worker/gpu_model_runner.py': 'vllm-omni',
+        'vllm_omni/worker/gpu_ar_model_runner.py': 'vllm-omni',
+    }
     if len(files) != len(expected) or {row['path']: row['distribution'] for row in files} != expected:
-        raise PatchError('Manifest must describe exactly the two validated runtime files.')
+        raise PatchError('Manifest must describe exactly the three validated runtime files.')
     for row in files:
         for key in ('original_sha256', 'patched_sha256'):
             if not re.fullmatch(r'[0-9a-f]{64}', row[key]):

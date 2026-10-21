@@ -309,7 +309,7 @@ class CodecCudaGraphs:
             return output
 
     @torch.no_grad()
-    def prewarm(self, batch_sizes, frame_sizes=(2, 6, 8), metadata_template=None, *, freeze=True):
+    def prewarm(self, batch_sizes, frame_sizes=(2, 6, 8), metadata_template=None, *, freeze=True, descending=False):
         """Capture exact shapes without advancing any live codec state pages.
 
         Run after cache binding and before service. Graph misses use the unchanged
@@ -319,12 +319,12 @@ class CodecCudaGraphs:
         if not self.layers or any(not layer.kv_cache[0].is_cuda for layer in self.layers):
             raise RuntimeError("codec graph prewarm requires bound CUDA state pages")
         device = self.layers[0].kv_cache[0].device
-        batches = sorted(set(int(batch) for batch in batch_sizes))
-        frames_list = sorted(set(int(frames) for frames in frame_sizes))
+        batches = sorted(set(int(batch) for batch in batch_sizes), reverse=descending)
+        frames_list = sorted(set(int(frames) for frames in frame_sizes), reverse=descending)
         if any(batch < 1 for batch in batches) or any(frames < 1 for frames in frames_list):
             raise ValueError("codec graph warmup shapes must be positive")
         capacity = min(layer.kv_cache[0].shape[0] for layer in self.layers)
-        if batches and batches[-1] > capacity:
+        if batches and max(batches) > capacity:
             raise ValueError(f"codec graph warmup exceeds cache capacity {capacity}")
         if len(batches) * len(frames_list) > self.max_entries:
             raise ValueError("codec graph warmup exceeds entry limit")

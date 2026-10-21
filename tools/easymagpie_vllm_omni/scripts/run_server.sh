@@ -10,7 +10,13 @@ DEPLOY_CONFIG="${EASYMAGPIE_DEPLOY_CONFIG:-${SCRIPT_DIR}/../deploy/easymagpie.ya
 
 echo "Starting EasyMagpieTTS: model=${MODEL} deploy=${DEPLOY_CONFIG} port=${PORT}"
 
+SERVING_ARGS=()
+if [[ -n "${EASYMAGPIE_SERVED_MODEL_NAME:-}" ]]; then
+    SERVING_ARGS+=(--served-model-name "$EASYMAGPIE_SERVED_MODEL_NAME")
+fi
+
 exec env VLLM_PLUGINS=easymagpie_omni vllm serve "$MODEL" \
+    "${SERVING_ARGS[@]}" \
     --deploy-config "$DEPLOY_CONFIG" \
     --host 0.0.0.0 \
     --port "$PORT" \

@@ -21,7 +21,16 @@ import pytest
 EASYMAGPIE_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(EASYMAGPIE_ROOT))
 SERVING_AVAILABLE = all(importlib.util.find_spec(name) is not None for name in ('torch', 'vllm', 'vllm_omni'))
-CPU_ONLY_FILES = {'test_dds_routing_pool.py', 'test_query_dispatch_pool.py', 'test_optimized_workers.py'}
+CPU_ONLY_FILES = {
+    'test_dds_routing_pool.py',
+    'test_query_dispatch_pool.py',
+    'test_optimized_workers.py',
+    'test_c256_launcher.py',
+    'test_api_switch.py',
+    'test_pooled_publication.py',
+    'test_pooled_publication_v11.py',
+    'test_pooled_publication_v2.py',
+}
 collect_ignore = (
     []
     if SERVING_AVAILABLE

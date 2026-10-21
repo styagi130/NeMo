@@ -130,6 +130,7 @@ class PackedHalfSnake(nn.Module):
     def __init__(self, channels: int) -> None:
         super().__init__()
         self.snake_channels = channels // 2
+        self.fp16_exact_fused = os.environ.get("EASYMAGPIE_VLLM_CODEC_FP16_ACTIVATION_FUSED", "0") == "1"
         # Preserve the NeMo checkpoint shape.
         self.alpha = nn.Parameter(torch.ones(1, self.snake_channels, 1))
         # Freeze the arithmetic choice before CUDA graph capture. The retained
@@ -146,6 +147,30 @@ class PackedHalfSnake(nn.Module):
         ).lower() in ("1", "true", "yes", "on")
 
     def forward(self, inputs: torch.Tensor, residual: torch.Tensor | None = None) -> torch.Tensor:
+        if (
+            self.fp16_exact_fused
+            and self.sglang_activation
+            and self.sglang_activation_fused
+            and inputs.is_cuda
+            and inputs.dtype == self.alpha.dtype == torch.float16
+            and inputs.ndim == 2
+            and inputs.shape[1] == 2 * self.alpha.numel()
+            and inputs.is_contiguous()
+            and self.alpha.is_contiguous()
+            and inputs.device == self.alpha.device
+            and (
+                residual is None
+                or (
+                    residual.dtype == torch.float16
+                    and residual.device == inputs.device
+                    and residual.shape == inputs.shape
+                    and residual.is_contiguous()
+                )
+            )
+        ):
+            from easymagpie_vllm_omni.codec.fp16_activation import packed_half_snake_fp16
+
+            return packed_half_snake_fp16(inputs, self.alpha, residual)
         if (
             inputs.is_cuda
             and self.sglang_activation

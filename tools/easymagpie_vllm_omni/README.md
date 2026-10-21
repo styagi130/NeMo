@@ -25,7 +25,7 @@ layer caches that frame's keys and values and evaluates only the current positio
 the cache does not carry state between frames or requests. Sampling still uses
 fresh, pre-drawn Gumbel noise, and vLLM selects the CUDA graph mode. Changing the
 projection shapes can change floating-point results and sampled codes. The codec
-continues to run in FP32.
+runs in FP32 in the default and C128 profiles; the opt-in C256 profile uses FP16.
 
 The EasyMagpie runner batches resident decode feedback and text metadata after
 assigning request rows. Startup delays, phoneme EOS, streamed text offsets and
@@ -95,7 +95,7 @@ request scheduling, resident decode state, batched feedback, Mamba prefill graph
 codec graphs and asynchronous PCM output. See [the complete optimization inventory](OPTIMIZATIONS.html)
 for every applied change, retained behavior and benchmark limitations.
 
-Install the two pinned runtime hooks once, then launch from this directory:
+Install the pinned runtime hooks once, then launch from this directory:
 
 ```bash
 python scripts/apply_runtime_patches.py --check
@@ -104,9 +104,12 @@ bash scripts/run_optimized_server.sh /absolute/path/to/converted_model 8091
 ```
 
 The installer requires vLLM **0.26.0** and vLLM-Omni **0.26.0** and verifies the
-exact upstream file hashes before changing either file. Reapplying a fully installed
+exact upstream file hashes before changing files. Reapplying a fully installed
 patch is a no-op; incompatible or partially patched runtimes are rejected. The
 optimized launcher verifies installation and does not modify the runtime at startup.
+When upgrading a runtime that has only the earlier two hooks installed, rebuild
+the serving image or reinstall the pinned vLLM/vLLM-Omni packages before applying
+the current three-hook bundle. The installer deliberately rejects mixed patch states.
 Install from the checkout when using these scripts; the runtime patch and deployment
 files are repository assets, not Python wheel package data.
 
@@ -132,6 +135,34 @@ underruns across 8,192 requests. C128 after an additional 4,096-request warmup r
 buffer reserve. These are measurements of the retained benchmark deployment,
 not a guarantee for other checkpoints, hosts or deployment layouts. Higher C128
 throughput did not resolve latency or streaming underruns.
+
+### C256 H100 profile
+
+After installing the runtime hooks above, launch the opt-in
+[C256 deployment](deploy/h100_optimized256.yaml):
+
+```bash
+bash scripts/run_c256_server.sh /absolute/path/to/converted_model 8091
+```
+
+One talker and one codec share the GPU, each with capacity 256. The profile uses
+FP16 codec weights/history, FP32 SSM state, TF32 off, startup chunks 2/6/8, 112 Mamba
+prefill graphs and 384 codec graphs (batches 1–128 × 2/6/8 frames). It adds bounded
+deadline scheduling, prefill/allocation shortcuts, local KV prefix lists, native
+bulk chunk assembly, leased/shared buffers, and earlier HTTP admission/output.
+The served model name is `easymagpie`.
+
+The native builder requires a C++17 compiler (`CXX`, default `c++`). The launcher
+compiles it into `EASYMAGPIE_NATIVE_CACHE_DIR` or `$XDG_CACHE_HOME/easymagpie/native`
+and creates a unique shared-publication namespace for each server.
+
+Validation on 2026-10-21: **212.82 ms P95 TTFA / 416.49× RTFx**, 4,096 measured
+requests, zero failures, 20 responses with underruns. This single H100 run used
+MPS at 100%, 16 server and six client physical CPU cores, and 512 rolling warmup
+completions before measurement. RTFx counts all audio arriving in the measured
+window. Host affinity/MPS remain external to the launcher.
+
+For Docker, use `/opt/easymagpie/scripts/run_c256_server.sh` as the launcher.
 
 ### Standalone serving image
 
@@ -168,7 +199,11 @@ next chunk still count toward its capacity. This prevents parked streams from
 being re-admitted with already-decoded history as a new chunk.
 Container caches and uploaded speaker samples default to writable `/tmp` paths.
 Override the cache variables with writable persistent mounts when reusing compilation caches.
-The launcher uses `exec` for signal forwarding; graceful shutdown still needs runtime validation.
+The launcher uses `exec` for signal forwarding. The C256 validation container exited
+with code zero and released its GPU allocations, but the pinned upstream engine manager
+force-reaped one remaining worker during shutdown. Fully graceful worker shutdown and
+in-process engine reuse remain unqualified. Shared publication files must only be removed
+after both stages have stopped.
 
 
 ### Quick start — offline synthesis

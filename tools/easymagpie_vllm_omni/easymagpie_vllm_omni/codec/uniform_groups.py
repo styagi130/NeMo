@@ -13,6 +13,7 @@ import os
 from collections import Counter
 
 import torch
+from easymagpie_vllm_omni.buffer_leases import BufferLeasePool, leased_buffers_enabled
 from easymagpie_vllm_omni.codec.packed import CodecStateLayer
 from vllm.forward_context import get_forward_context, set_forward_context
 
@@ -31,6 +32,7 @@ class CodecUniformGroups:
         self.group_calls = 0
         self.frames_histogram = Counter()
         self.fallbacks = Counter()
+        self._scratch_pool = BufferLeasePool(24) if leased_buffers_enabled() else None
 
     def status(self):
         return {
@@ -41,6 +43,7 @@ class CodecUniformGroups:
             "fallbacks_by_reason": dict(self.fallbacks),
             "preserves_request_order": True,
             "pads_frames": False,
+            "scratch_buffers": self._scratch_pool.status() if self._scratch_pool is not None else None,
         }
 
     def _decode(self, codes):
@@ -57,27 +60,61 @@ class CodecUniformGroups:
         return sum(frame_counts[metadata.num_decodes :]) == metadata.num_prefill_tokens
 
     @staticmethod
-    def _group_metadata(metadata, members, frames, device):
+    def _group_metadata(metadata, members, frames, device, pool=None, leases=None):
+        def scratch(count, dtype):
+            lease = pool.acquire(count, dtype=dtype, device=device)
+            leases.append(lease)
+            return lease.tensor
+
         parts, initials = [], []
         if metadata.num_decodes:
             indices = metadata.state_indices_tensor_d
             if indices.ndim == 2:
                 indices = indices[:, 0]
             parts.append(indices)
-            initials.append(torch.ones(metadata.num_decodes, dtype=torch.bool, device=device))
+            initials.append(
+                torch.ones(metadata.num_decodes, dtype=torch.bool, device=device)
+                if pool is None
+                else scratch(metadata.num_decodes, torch.bool).fill_(True)
+            )
         if metadata.num_prefills:
             parts.append(metadata.state_indices_tensor_p)
             initials.append(metadata.has_initial_states_p)
-        select = torch.tensor(members, dtype=torch.long, device=device)
-        routing = parts[0] if len(parts) == 1 else torch.cat(parts)
-        has_initial = initials[0] if len(initials) == 1 else torch.cat(initials)
+        if pool is None:
+            select = torch.tensor(members, dtype=torch.long, device=device)
+            routing = parts[0] if len(parts) == 1 else torch.cat(parts)
+            has_initial = initials[0] if len(initials) == 1 else torch.cat(initials)
+        else:
+            select = scratch(len(members), torch.long)
+            select.copy_(torch.tensor(members, dtype=torch.long))
+            routing = (
+                parts[0]
+                if len(parts) == 1
+                else torch.cat(parts, out=scratch(sum(x.numel() for x in parts), parts[0].dtype))
+            )
+            has_initial = (
+                initials[0]
+                if len(initials) == 1
+                else torch.cat(initials, out=scratch(sum(x.numel() for x in initials), torch.bool))
+            )
         grouped = copy.copy(metadata)
         grouped.num_prefills = grouped.num_reqs = len(members)
         grouped.num_prefill_tokens = len(members) * frames
         grouped.num_decodes = grouped.num_decode_tokens = 0
-        grouped.state_indices_tensor_p = routing.index_select(0, select)
-        grouped.has_initial_states_p = has_initial.index_select(0, select)
-        grouped.query_start_loc_p = torch.arange(len(members) + 1, dtype=torch.int32, device=device) * frames
+        if pool is None:
+            grouped.state_indices_tensor_p = routing.index_select(0, select)
+            grouped.has_initial_states_p = has_initial.index_select(0, select)
+            grouped.query_start_loc_p = torch.arange(len(members) + 1, dtype=torch.int32, device=device) * frames
+        else:
+            grouped.state_indices_tensor_p = torch.index_select(
+                routing, 0, select, out=scratch(len(members), routing.dtype)
+            )
+            grouped.has_initial_states_p = torch.index_select(
+                has_initial, 0, select, out=scratch(len(members), torch.bool)
+            )
+            query = scratch(len(members) + 1, torch.int32)
+            torch.arange(len(members) + 1, out=query)
+            grouped.query_start_loc_p = query.mul_(frames)
         grouped.state_indices_tensor_d = None
         grouped.query_start_loc_d = None
         grouped.codec_uniform = grouped.codec_prefill_uniform = True
@@ -111,17 +148,38 @@ class CodecUniformGroups:
                 self.group_calls += 1
                 self.frames_histogram[frames] += 1
                 return self._decode(codes)
-            grouped_codes = torch.cat([codes[offsets[i] : offsets[i + 1]] for i in members], dim=0)
-            replacements = {}
-            grouped_raw = {}
-            for layer in self.layers:
-                original = raw[layer.prefix]
-                identity = id(original)
-                if identity not in replacements:
-                    replacements[identity] = self._group_metadata(original, members, frames, codes.device)
-                grouped_raw[layer.prefix] = replacements[identity]
-            with set_forward_context(grouped_raw, self.vllm_config):
-                pcm = self._decode(grouped_codes)
+            leases = []
+            try:
+                segments = [codes[offsets[i] : offsets[i + 1]] for i in members]
+                if self._scratch_pool is None:
+                    grouped_codes = torch.cat(segments, dim=0)
+                else:
+                    lease = self._scratch_pool.acquire(
+                        len(members) * frames * codes.shape[1], dtype=codes.dtype, device=codes.device
+                    )
+                    leases.append(lease)
+                    grouped_codes = torch.cat(
+                        segments, dim=0, out=lease.tensor.view(len(members) * frames, codes.shape[1])
+                    )
+                replacements = {}
+                grouped_raw = {}
+                for layer in self.layers:
+                    original = raw[layer.prefix]
+                    identity = id(original)
+                    if identity not in replacements:
+                        replacements[identity] = self._group_metadata(
+                            original, members, frames, codes.device, self._scratch_pool, leases
+                        )
+                    grouped_raw[layer.prefix] = replacements[identity]
+                with set_forward_context(grouped_raw, self.vllm_config):
+                    pcm = self._decode(grouped_codes)
+            finally:
+                if leases:
+                    ready = torch.cuda.Event()
+                    ready.record(torch.cuda.current_stream(codes.device))
+                    for lease in leases:
+                        lease.ready_after(ready)
+                        lease.release()
             samples = frames * self.codec.config.samples_per_frame
             for row, member in enumerate(members):
                 outputs[member] = pcm[row * samples : (row + 1) * samples]

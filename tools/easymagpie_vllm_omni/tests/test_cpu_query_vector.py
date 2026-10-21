@@ -34,6 +34,7 @@ def runner_class(path, enabled=False):
         '_query_starts_cpu',
         '_maybe_run_batch_preprocess',
         '_try_complete_decode_preprocess',
+        '_try_complete_q1_preprocess',
         'get_prepost_status',
     }
     methods = [n for n in original.body if isinstance(n, ast.FunctionDef) and n.name in names]

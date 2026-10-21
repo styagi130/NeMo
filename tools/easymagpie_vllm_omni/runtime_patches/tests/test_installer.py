@@ -72,7 +72,7 @@ class InstallerTests(unittest.TestCase):
             after = f'# fixture {index}\nvalue = 2\nhook = True\n# end\n'
             self.originals[name], self.updated[name] = before.encode(), after.encode()
             path = self.site / name
-            path.parent.mkdir(parents=True)
+            path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(before.encode())
             row['original_sha256'] = digest(before.encode())
             row['patched_sha256'] = digest(after.encode())
@@ -130,6 +130,15 @@ class InstallerTests(unittest.TestCase):
                 with self.assertRaisesRegex(installer.PatchError, 'Partially patched'):
                     installer.apply_runtime_patches(self.site)
                 self.assertEqual(self.contents(), before)
+
+    def test_previous_two_hook_installation_rejected_without_writes(self):
+        for name in list(self.originals)[:2]:
+            (self.site / name).write_bytes(self.updated[name])
+        before = self.contents()
+        for flags in ({}, {'check': True}, {'verify': True}):
+            with self.assertRaisesRegex(installer.PatchError, 'Partially patched'):
+                installer.apply_runtime_patches(self.site, **flags)
+            self.assertEqual(self.contents(), before)
 
     def test_missing_file_does_not_touch_other(self):
         name = list(self.originals)[1]
@@ -194,7 +203,7 @@ class InstallerTests(unittest.TestCase):
     def test_manifest_cannot_add_or_redirect_targets(self):
         self.manifest['files'][0]['path'] = '../elsewhere.py'
         self.save_manifest()
-        with self.assertRaisesRegex(installer.PatchError, 'exactly the two'):
+        with self.assertRaisesRegex(installer.PatchError, 'exactly the three'):
             installer.apply_runtime_patches(self.site)
         self.assert_original()
 
@@ -296,7 +305,7 @@ class RetainedRuntimeTests(unittest.TestCase):
                 original = (upstream / row['path']).read_bytes()
                 self.assertEqual(digest(original), row['original_sha256'])
                 target = site / row['path']
-                target.parent.mkdir(parents=True)
+                target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_bytes(original)
             command = [sys.executable, str(SCRIPT), '--site-packages', str(site)]
             result = subprocess.run([*command, '--verify'], capture_output=True, text=True)

@@ -26,3 +26,6 @@ easymagpie_omni = "vllm_plugin_easymagpie_omni:register"
 
 [tool.setuptools.packages.find]
 include = ["easymagpie_vllm_omni*", "vllm_plugin_easymagpie_omni*"]
+
+[tool.setuptools.package-data]
+easymagpie_vllm_omni = ["chunk_builder.cpp"]

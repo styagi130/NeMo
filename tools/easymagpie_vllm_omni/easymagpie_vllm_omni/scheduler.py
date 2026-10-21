@@ -58,8 +58,45 @@ class EasyMagpieARAsyncScheduler(OmniARAsyncScheduler):
             self.chunk_transfer_adapter._send_single_request = MethodType(
                 _send_talker_chunk, self.chunk_transfer_adapter
             )
+            from .bulk_sender import install_bulk_sender
+
+            install_bulk_sender(self)
+        self.empty_prefix_planner = None
+        self.q1_no_growth_allocator = None
+        self.deadline_decode_policy = None
+        if self.vllm_config.model_config.stage_id == 0:
+            if _enabled("EASYMAGPIE_EMPTY_PREFIX_PLANNER"):
+                from .empty_prefix_planner import Planner
+
+                self.empty_prefix_planner = Planner(
+                    self.kv_cache_manager, shadow=_enabled("EASYMAGPIE_EMPTY_PREFIX_PLANNER_SHADOW")
+                )
+            if _enabled("EASYMAGPIE_Q1_NO_GROWTH_ALLOCATOR"):
+                from .q1_no_growth_allocator import NoGrowthAllocator
+
+                self.q1_no_growth_allocator = NoGrowthAllocator(self.kv_cache_manager)
+            if _enabled("EASYMAGPIE_DEADLINE_DECODE_MICROBATCH"):
+                from .deadline_decode_microbatch import create_policy
+
+                self.deadline_decode_policy = create_policy(self)
 
     def schedule(self, throttle_prefills: bool = False):
+        policy = getattr(self, "deadline_decode_policy", None)
+        if policy is None:
+            return self._schedule_admission(throttle_prefills)
+        policy.clear_plan()
+        try:
+            output = self._schedule_admission(throttle_prefills)
+            policy.observe(self, output)
+            return output
+        except BaseException:
+            policy.force_full = True
+            policy.counts["schedule_errors"] += 1
+            raise
+        finally:
+            policy.clear_plan()
+
+    def _schedule_admission(self, throttle_prefills: bool = False):
         if not getattr(self, "phase_admission_enabled", False):
             return super().schedule(throttle_prefills)
         self.phase_admission_throttled = throttle_prefills
@@ -83,6 +120,13 @@ class EasyMagpieARAsyncScheduler(OmniARAsyncScheduler):
         return output
 
     def _should_defer_waiting_admission(self) -> bool:
+        result = self._select_admission_phase()
+        policy = getattr(self, "deadline_decode_policy", None)
+        if policy is not None:
+            policy.choose(self, self._phase_running_eligible)
+        return result
+
+    def _select_admission_phase(self) -> bool:
         parent_defer = super()._should_defer_waiting_admission()
         if not getattr(self, "phase_admission_enabled", False):
             return parent_defer
@@ -140,6 +184,11 @@ class EasyMagpieARAsyncScheduler(OmniARAsyncScheduler):
         return request.is_prefill_chunk or pending_tokens > 1
 
     def _is_running_request_eligible(self, request: Request) -> bool:
+        allowed = self._phase_running_eligible(request)
+        policy = getattr(self, "deadline_decode_policy", None)
+        return allowed if policy is None else policy.allow(self, request, allowed)
+
+    def _phase_running_eligible(self, request: Request) -> bool:
         phase = getattr(self, "phase_admission_phase", "mixed")
         if not getattr(self, "phase_admission_enabled", False) or phase == "mixed":
             return True
@@ -162,6 +211,29 @@ class EasyMagpieARAsyncScheduler(OmniARAsyncScheduler):
         }
 
     def shutdown(self):
+        error = None
+        try:
+            return self._shutdown_admission()
+        except BaseException as exc:
+            error = exc
+            raise
+        finally:
+            # Restore only our own instance delegates after the native sender
+            # and scheduler have drained. No global allocator methods change.
+            for name in ("deadline_decode_policy", "q1_no_growth_allocator", "empty_prefix_planner"):
+                helper = getattr(self, name, None)
+                if helper is not None:
+                    try:
+                        helper.close()
+                    except BaseException as exc:
+                        if error is not None:
+                            error.add_note(f"{name} cleanup failed: {exc!r}")
+                        else:
+                            error = exc
+            if error is not None:
+                raise error
+
+    def _shutdown_admission(self):
         fence = getattr(self, "admission_decode_fence", None)
         try:
             result = super().shutdown()
@@ -176,6 +248,10 @@ class EasyMagpieARAsyncScheduler(OmniARAsyncScheduler):
         if fence is not None:
             fence.clear("shutdown_releases")
             fence.write("shutdown")
+        bulk = getattr(self, "bulk_sender", None)
+        policy = getattr(bulk, "deadline_policy", None)
+        if policy is not None:
+            policy.close()
         return result
 
     def add_request(self, request: Request) -> None:
@@ -247,6 +323,13 @@ def _send_talker_chunk(adapter: OmniChunkTransferAdapter, task: dict):
         return OmniChunkTransferAdapter._send_single_request(adapter, task)
     finally:
         adapter._easymagpie_send_finish = previous
+
+
+def _enabled(name: str) -> bool:
+    value = os.environ.get(name, "0")
+    if value not in ("0", "1"):
+        raise ValueError(name + " must be 0 or 1")
+    return value == "1"
 
 
 def _codec_payload_frames(info, num_quantizers: int) -> int:
@@ -360,6 +443,9 @@ class EasyMagpieCodecScheduler(OmniGenerationScheduler):
         adapter._easymagpie_num_quantizers = num_quantizers
         adapter._poll_single_request = MethodType(_poll_native_codec_chunk, adapter)
         self._easymagpie_reset_on_update: set[str] = set()
+        from .pooled_publication import install_pooled_publication
+
+        install_pooled_publication(adapter, role="receiver")
 
     def _update_request_as_session(self, session: Request, update: StreamingUpdate) -> None:
         """Resume a text chunk, or reset Stage 1 for a new dialogue reply.

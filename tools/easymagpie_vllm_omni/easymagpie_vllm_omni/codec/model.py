@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
@@ -75,6 +76,11 @@ class EasyMagpieCodecForConditionalGeneration(nn.Module):
             # paths may deserialize a generic PretrainedConfig first.
             config = EasyMagpieCodecConfig(**config.to_dict())
         self.config = config
+        from easymagpie_vllm_omni.codec.payload_validity import flag
+
+        self._batched_payload_validity = flag() == "1"
+        self._payload_counts = Counter()
+        self._payload_fallbacks = Counter()
         self.vllm_config = vllm_config
         self.codec = PackedEasyMagpieCodec(
             config,
@@ -112,11 +118,11 @@ class EasyMagpieCodecForConditionalGeneration(nn.Module):
             return Path(str(model)) / path
         return path
 
-    def prewarm_codec_graphs(self, batch_sizes, frame_sizes=(2, 6, 8), metadata_template=None):
+    def prewarm_codec_graphs(self, batch_sizes, frame_sizes=(2, 6, 8), metadata_template=None, *, descending=False):
         """Warm codec graph shapes after state-cache binding and before service."""
         if self._codec_graphs is None:
             return self.codec_graph_status()
-        return self._codec_graphs.prewarm(batch_sizes, frame_sizes, metadata_template)
+        return self._codec_graphs.prewarm(batch_sizes, frame_sizes, metadata_template, descending=descending)
 
     def codec_graph_status(self):
         status = (
@@ -130,6 +136,16 @@ class EasyMagpieCodecForConditionalGeneration(nn.Module):
     def embed_input_ids(self, input_ids: torch.Tensor, **_: Any) -> torch.Tensor:
         return torch.zeros((input_ids.shape[0], 1), dtype=torch.float32, device=input_ids.device)
 
+    def codec_payload_status(self):
+        return {
+            "enabled": self._batched_payload_validity,
+            "counts": dict(self._payload_counts),
+            "fallbacks": dict(self._payload_fallbacks),
+            "retained_payloads": 0,
+            "retained_requests": 0,
+            "retained_tensors": 0,
+        }
+
     def compute_logits(self, hidden_states: Any, sampling_metadata: Any = None) -> None:
         return None
 
@@ -139,6 +155,22 @@ class EasyMagpieCodecForConditionalGeneration(nn.Module):
         device: torch.device,
         request_token_spans: list[tuple[int, int]] | None = None,
     ) -> tuple[torch.Tensor, list[int], list[int], list[str]]:
+        batched = False
+        if getattr(self, "_batched_payload_validity", False):
+            from easymagpie_vllm_omni.codec.payload_validity import payload_batch_reason
+
+            # An override may define other padding/control rules; retain it.
+            native = EasyMagpieCodecForConditionalGeneration._valid_sample_count
+            reason = (
+                "validity_override"
+                if type(self) is not EasyMagpieCodecForConditionalGeneration
+                or getattr(self._valid_sample_count, "__func__", None) is not native
+                else payload_batch_reason(self, runtime_infos, device, request_token_spans)
+            )
+            batched = reason is None
+            if not batched:
+                self._payload_counts["native_calls"] += 1
+                self._payload_fallbacks[reason] += 1
         q = self.config.num_stacked_codebooks
         packed: list[torch.Tensor] = []
         frame_counts: list[int] = []
@@ -175,13 +207,21 @@ class EasyMagpieCodecForConditionalGeneration(nn.Module):
                 )
             packed.append(rows)
             frame_counts.append(int(rows.shape[0]))
-            valid_sample_counts.append(self._valid_sample_count(rows))
+            valid_sample_counts.append(0 if batched else self._valid_sample_count(rows))
             request_ids.append(_chunk_request_id(info, index))
         if not packed:
             empty = torch.empty((0, q), dtype=torch.long, device=device)
             return empty, [], [], []
         if all(rows.device.type == "cpu" for rows in packed):
-            codes = torch.cat(packed, dim=0).to(device=device, non_blocking=True)
+            codes = torch.cat(packed, dim=0)
+            if batched:
+                from easymagpie_vllm_omni.codec.payload_validity import batched_valid_sample_counts
+
+                valid_sample_counts = batched_valid_sample_counts(self, codes, frame_counts)
+                self._payload_counts["batched_calls"] += 1
+                self._payload_counts["batched_payloads"] += len(frame_counts)
+                self._payload_counts["batched_frames"] += sum(frame_counts)
+            codes = codes.to(device=device, non_blocking=True)
         else:
             codes = torch.cat([rows.to(device=device, non_blocking=True) for rows in packed], dim=0)
         return codes, frame_counts, valid_sample_counts, request_ids

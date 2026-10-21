@@ -299,7 +299,7 @@ def _packed_causal_conv1d_kernel(
                 mask=(channels[:, None] < input_channels) & (output_offsets[None, :] < output_channels),
                 other=0.0,
             )
-            accumulator += tl.dot(values, weights, input_precision="ieee")
+            accumulator += tl.dot(values, weights, input_precision="ieee", out_dtype=tl.float32)
 
     if HAS_BIAS:
         bias = tl.load(bias_ptr + output_offsets, mask=output_offsets < output_channels, other=0.0)
@@ -459,6 +459,12 @@ def _packed_causal_deconv1d_kernel(
             mask=(output_token_offsets[:, None] < output_length) & (output_offsets[None, :] < output_channels),
             other=0.0,
         )
+        # Keep stored activations/history and weights in their original dtype,
+        # but promote operands before multiplication as well as accumulation.
+        current = current.to(tl.float32)
+        current_weights = current_weights.to(tl.float32)
+        previous = previous.to(tl.float32)
+        previous_weights = previous_weights.to(tl.float32)
         accumulator += current * current_weights + previous * previous_weights
 
     if HAS_BIAS:

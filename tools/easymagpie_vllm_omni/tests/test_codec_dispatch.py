@@ -13,6 +13,7 @@
 # limitations under the License.
 """CPU checks of state routing contracts introduced by uniform grouping."""
 import torch
+from easymagpie_vllm_omni.buffer_leases import BufferLeasePool
 from easymagpie_vllm_omni.codec.cuda_graph import uniform_codec_metadata
 from easymagpie_vllm_omni.codec.uniform_groups import CodecUniformGroups
 
@@ -27,6 +28,23 @@ def mixed_metadata():
     metadata.state_indices_tensor_p = torch.tensor([9, 1, 7], dtype=torch.int32)
     metadata.has_initial_states_p = torch.tensor([False, True, False])
     return metadata
+
+
+def test_leased_group_metadata_matches_native_without_reusing_live_scratch():
+    metadata = mixed_metadata()
+    pool, leases = BufferLeasePool(24), []
+    expected = CodecUniformGroups._group_metadata(metadata, [4, 2, 3], 2, torch.device("cpu"))
+    actual = CodecUniformGroups._group_metadata(metadata, [4, 2, 3], 2, torch.device("cpu"), pool, leases)
+    for name in ("state_indices_tensor_p", "has_initial_states_p", "query_start_loc_p"):
+        assert torch.equal(getattr(actual, name), getattr(expected, name))
+    assert pool.status()["active"] == len(leases) > 0
+    held = actual.state_indices_tensor_p.clone()
+    second_leases = []
+    CodecUniformGroups._group_metadata(metadata, [0, 1], 2, torch.device("cpu"), pool, second_leases)
+    assert torch.equal(actual.state_indices_tensor_p, held)
+    for lease in leases + second_leases:
+        lease.release()
+    assert pool.status()["active"] == 0
 
 
 def test_grouping_preserves_shuffled_pages_and_per_request_initial_flags():

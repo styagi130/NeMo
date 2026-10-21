@@ -68,6 +68,15 @@ def _build_adapter_cls() -> type:
 
         def __init__(self, ctx: Any) -> None:
             super().__init__(ctx)
+            from .api_switch import configure_api_switch
+
+            self._api_switch_status = configure_api_switch(ctx)
+            from .http_audio_egress import install_http_audio_egress
+
+            self._http_audio_egress_status = install_http_audio_egress()
+            from .http_unused_talker_output import install_http_unused_talker_output
+
+            self._http_unused_talker_output_status = install_http_unused_talker_output()
             self._tokenizer: Any = None
             self._model_path_cache: str | None = None
             self._prompt_len_cache: dict[tuple[str, str], int] = {}
@@ -187,6 +196,9 @@ def _build_adapter_cls() -> type:
                     "top_k": int(extra.get("top_k", _DEFAULT_TOP_K)),
                 },
             }
+            from .http_audio_egress import mark_legacy_http_audio_prompt
+
+            mark_legacy_http_audio_prompt(prompt, request, self.ctx.engine_client)
             ref_audio = request.ref_audio
             if ref_audio is None:
                 speaker_id = (request.voice or _DEFAULT_SPEAKER).strip()
@@ -290,6 +302,9 @@ def apply_serving_patches(force: bool = False) -> None:
 
     if not force and _SERVING_MODULE not in sys.modules:
         return
+    from .eager_admission import install_eager_admission
+
+    install_eager_admission()  # Validate opt-in runtime requirements before the catch-all.
     try:
         _patch_detection()
         _register_adapter()

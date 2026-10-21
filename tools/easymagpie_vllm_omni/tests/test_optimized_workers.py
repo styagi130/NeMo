@@ -45,9 +45,11 @@ def load_workers():
                 raise RuntimeError('base warmup failed')
             return 7.25
 
-        def prewarm(self, batches, *, frame_sizes):
+        def prewarm(self, batches, *, frame_sizes, descending=False):
             assert state.inference
             events.append(('codec_prewarm', tuple(batches), frame_sizes))
+            if descending:
+                events.append(('descending',))
             if state.fail_prewarm:
                 raise RuntimeError('codec prewarm failed')
 
@@ -72,6 +74,7 @@ def load_workers():
     )
     namespace = dict(
         os=os,
+        sys=SimpleNamespace(setswitchinterval=lambda value: events.append(('switch_interval', value))),
         torch=torch,
         gc=SimpleNamespace(freeze=lambda: events.append(('freeze',))),
         EasyMagpieGPUARWorker=Base,
@@ -164,3 +167,47 @@ def test_failure_cannot_publish_success_or_freeze_gc(workers, monkeypatch, failu
     assert ('freeze',) not in events and not state.inference
     if failure == 'fail_base':
         assert not any(event[0] == 'codec_prewarm' for event in events)
+
+
+@pytest.mark.parametrize('blocking', ['0', '1'])
+def test_c256_talker_sets_copy_event_policy_and_switch_interval(workers, monkeypatch, blocking):
+    module, events, _, torch = workers
+    monkeypatch.setenv('EASYMAGPIE_TALKER_BLOCKING_COPY_EVENT', blocking)
+    worker = module['H100C256TalkerWorker']()
+    assert worker.init_device() == 'device'
+    assert worker.load_model('checkpoint') == 'model'
+    assert events[:3] == [('precision', 'highest'), ('switch_interval', 0.001), ('init_device',)]
+    assert worker.model_runner._omni_snapshot_blocking_event == (blocking == '1')
+    assert not torch.backends.cuda.matmul.allow_tf32
+    assert not torch.backends.cudnn.allow_tf32
+
+
+def test_c256_invalid_copy_flag_rejected_before_loading_model(workers, monkeypatch):
+    module, events, _, _ = workers
+    monkeypatch.setenv('EASYMAGPIE_TALKER_BLOCKING_COPY_EVENT', 'true')
+    with pytest.raises(ValueError, match='must be 0 or 1'):
+        module['H100C256TalkerWorker']().load_model()
+    assert not events
+
+
+def test_c256_codec_captures384_shapes_descending_with_retained_precision(workers, monkeypatch):
+    module, events, _, torch = workers
+    monkeypatch.setenv('EASYMAGPIE_VLLM_CODEC_CUDA_GRAPHS', '1')
+    worker = module['H100C256CodecWorker']()
+    worker.init_device()
+    assert worker.compile_or_warm_up_model() == 7.25
+    assert events[-5:] == [
+        ('inference_enter',),
+        ('codec_prewarm', tuple(range(1, 129)), (2, 6, 8)),
+        ('descending',),
+        ('inference_exit',),
+        ('freeze',),
+    ]
+    assert not any(event[0] == 'switch_interval' for event in events)
+    assert not torch.backends.cuda.matmul.allow_tf32
+    assert not torch.backends.cudnn.allow_tf32
+    assert not torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction
+    assert not torch.backends.cuda.matmul.allow_fp16_accumulation
+    assert not torch.backends.cudnn.deterministic
+    assert not torch.backends.cudnn.benchmark
+    assert worker.codec_prewarm_completed

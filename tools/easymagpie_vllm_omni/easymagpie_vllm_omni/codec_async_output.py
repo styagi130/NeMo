@@ -25,6 +25,7 @@ from collections.abc import Mapping
 import torch
 from vllm.v1.outputs import AsyncModelRunnerOutput
 from vllm_omni.outputs import OmniModelRunnerOutput
+from .buffer_leases import BufferLeasePool, leased_buffers_enabled, storage_owned_host_tensor
 
 
 def codec_async_output_enabled():
@@ -117,20 +118,46 @@ def build_codec_async_output(runner, state):
     """Stage one owning PCM buffer, then construct metadata without reading it."""
     audio = state.multimodal_outputs["model_outputs"]
     sizes = [x.numel() for x in audio]
-    # torch.cat is deliberate ownership: source PCM may alias graph replay data.
-    source = torch.cat([x.detach() for x in audio])
-    host = torch.empty(source.shape, dtype=source.dtype, device="cpu", pin_memory=True)
+    # Packing still creates separate ownership from graph replay outputs. Only
+    # the owning allocation is reused, after its copy event and consumer lease.
+    source_lease = host_lease = None
+    if leased_buffers_enabled() and sum(sizes) > 0:
+        pool = getattr(runner, "_codec_pcm_buffer_pool", None)
+        if pool is None:
+            pool = runner._codec_pcm_buffer_pool = BufferLeasePool(max_entries=8)
+        source_lease = pool.acquire(sum(sizes), dtype=audio[0].dtype, device=audio[0].device)
+        source = source_lease.tensor
+        host_lease = pool.acquire(sum(sizes), dtype=source.dtype, device="cpu", pin_memory=True)
+        host = host_lease.tensor
+        try:
+            torch.cat([x.detach() for x in audio], out=source)
+        except BaseException:
+            torch.cuda.current_stream(source.device).synchronize()
+            raise
+    else:
+        source = torch.cat([x.detach() for x in audio])
+        host = torch.empty(source.shape, dtype=source.dtype, device="cpu", pin_memory=True)
     stream = getattr(runner, "_codec_pcm_copy_stream", None)
     if stream is None:
         stream = runner._codec_pcm_copy_stream = torch.cuda.Stream(device=source.device)
     produced = torch.cuda.Event()
     produced.record(torch.cuda.current_stream(source.device))
     ready = torch.cuda.Event()
-    with torch.cuda.stream(stream):
-        stream.wait_event(produced)
-        host.copy_(source, non_blocking=True)
-        source.record_stream(stream)
-        ready.record(stream)
+    try:
+        with torch.cuda.stream(stream):
+            stream.wait_event(produced)
+            host.copy_(source, non_blocking=True)
+            source.record_stream(stream)
+            ready.record(stream)
+    except BaseException:
+        stream.synchronize()
+        raise
+    owner = source
+    if source_lease is not None:
+        source_lease.ready_after(ready)
+        host_lease.ready_after(ready)
+        host = storage_owned_host_tensor(host_lease)
+        owner = (source, source_lease)
     per_request = [
         {"model_outputs": part, "sr": rate.detach().clone().contiguous()}
         for part, rate in zip(host.split(sizes), state.multimodal_outputs["sr"], strict=True)
@@ -170,4 +197,4 @@ def build_codec_async_output(runner, state):
                 stats["pending_outputs"] -= 1
                 stats["completed_outputs"] += 1
 
-    return DeferredCodecOutput(output, ready, source, on_complete)
+    return DeferredCodecOutput(output, ready, owner, on_complete)
