@@ -25,7 +25,6 @@ class OwnedPooledConnector(PooledConnector):
         receipt = getattr(self._local, 'original_path_receipt', None)
         if targeted and receipt is not None and result[0]:
             receipt['successful_puts'] += 1
-            receipt['flags'] = self._local.context[1]
         return result
 
 
@@ -140,7 +139,7 @@ class ExactOriginalOwner:
     def send_original(self, task):
         owner = self.owner(task)
         flags = int(bool(task['is_finished'])) | (int(bool(task['is_segment_finished'])) << 1)
-        receipt = {'successful_puts': 0, 'flags': 0}
+        receipt = {'successful_puts': 0}
         previous = getattr(self.proxy._local, 'original_path_receipt', None)
         self.proxy._local.original_path_receipt = receipt
         try:
@@ -148,10 +147,7 @@ class ExactOriginalOwner:
                 result = self.original_sender(task)
         finally:
             self.proxy._local.original_path_receipt = previous
-        self.counts['original_path_calls'] += 1
         self.counts['original_path_puts'] += receipt['successful_puts']
-        if receipt['successful_puts'] and flags & 1:
-            self.counts['original_terminal_publications'] += 1
         return result
 
     def status(self):
@@ -159,11 +155,6 @@ class ExactOriginalOwner:
             'enabled': True,
             'version': '1.1',
             'counts': dict(self.counts),
-            'identity_scope': 'pool epoch + exact Request identity + internal/external IDs + generation',
-            'retained_global_request_entries': 0,
-            'lifetime': 'immutable owner token follows existing Request lifetime',
-            'fallback_policy': 'existing generation and exact terminal/segment flags',
-            'unowned_audio_policy': 'fail closed; never invent a transport-only generation',
         }
 
 

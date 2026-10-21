@@ -18,16 +18,9 @@ Scheduler fixture isolates transport only; its schedule/KV/async accounting is
 the original pinned runtime. Ledger comparisons include every manager/pool
 field, every block/refcount/hash/free link, cache/event/statistic and return ID.
 """
-import ast
 import dataclasses
 import enum
-import inspect
 import math
-import threading
-from collections import Counter
-from copy import deepcopy
-from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 import torch
@@ -38,7 +31,7 @@ import vllm.v1.request as current_request
 from easymagpie_vllm_omni import q1_no_growth_allocator as H
 from vllm import SamplingParams
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
-from vllm.v1.core.kv_cache_utils import KVCacheBlock, resolve_kv_cache_block_sizes
+from vllm.v1.core.kv_cache_utils import KVCacheBlock
 from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager, MambaManager
 from vllm.v1.engine.core import EngineCore
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheGroupSpec, MambaSpec
@@ -245,12 +238,23 @@ def paired(left, right, lr, rr, tokens=1, **kwargs):
     return x, y
 
 
-def test_actual_no_growth_preserves_all_ledgers_and_canonical_empty():
-    left, right = manager(), manager()
+def primed_pair(computed=71, **options):
+    left, right = manager(**options), manager(**options)
     lr, rr = request(), request()
-    prime(left, lr)
-    prime(right, rr)
-    candidate = H.NoGrowthAllocator(right)
+    prime(left, lr, computed)
+    prime(right, rr, computed)
+    return left, right, lr, rr, H.NoGrowthAllocator(right)
+
+
+def allocation_outcome(kv, r, tokens=1, **kwargs):
+    try:
+        return ('return', returned(kv.allocate_slots(r, tokens, **kwargs), kv))
+    except Exception as exc:
+        return ('error', type(exc).__module__, type(exc).__qualname__, str(exc))
+
+
+def test_actual_no_growth_preserves_all_ledgers_and_canonical_empty():
+    left, right, lr, rr, candidate = primed_pair()
     assert type(rr) is candidate.types[6]
     for computed, in_flight, placeholders in [(71, 0, 0), (72, 1, 2), (150, 7, 8), (398, 2, 3), (399, 0, 1)]:
         for r in (lr, rr):
@@ -271,11 +275,7 @@ def test_actual_no_growth_preserves_all_ledgers_and_canonical_empty():
 
 @pytest.mark.parametrize('computed', [400, 800, 4096, 4097])
 def test_actual_attention_and_mamba_boundaries_use_original_before_mutation(computed):
-    left, right = manager(), manager()
-    lr, rr = request(), request()
-    prime(left, lr, computed)
-    prime(right, rr, computed)
-    candidate = H.NoGrowthAllocator(right)
+    left, right, lr, rr, candidate = primed_pair(computed)
     paired(left, right, lr, rr)
     assert candidate.counts['fast_hits'] == 0 and candidate.counts['fallback_calls'] == 1
     candidate.close()
@@ -299,11 +299,7 @@ def test_actual_attention_and_mamba_boundaries_use_original_before_mutation(comp
     ],
 )
 def test_unsupported_optional_semantics_follow_original_return_or_exception(kwargs, tokens):
-    left, right = manager(), manager()
-    lr, rr = request(), request()
-    prime(left, lr)
-    prime(right, rr)
-    candidate = H.NoGrowthAllocator(right)
+    left, right, lr, rr, candidate = primed_pair()
     kwleft = dict(kwargs)
     kwright = dict(kwargs)
     if kwargs.get('new_computed_blocks') == 'canonical':
@@ -312,12 +308,7 @@ def test_unsupported_optional_semantics_follow_original_return_or_exception(kwar
     elif kwargs.get('new_computed_blocks') == 'noncanonical':
         kwleft['new_computed_blocks'] = KVCacheBlocks(tuple([] for _ in range(6)))
         kwright['new_computed_blocks'] = KVCacheBlocks(tuple([] for _ in range(6)))
-    outcomes = []
-    for kv, r, kw in ((left, lr, kwleft), (right, rr, kwright)):
-        try:
-            outcomes.append(('return', returned(kv.allocate_slots(r, tokens, **kw), kv)))
-        except Exception as exc:
-            outcomes.append(('error', type(exc).__module__, type(exc).__qualname__, str(exc)))
+    outcomes = [allocation_outcome(kv, r, tokens, **kw) for kv, r, kw in ((left, lr, kwleft), (right, rr, kwright))]
     assert outcomes[0] == outcomes[1] and ledger(left) == ledger(right)
     assert candidate.counts['fast_hits'] == 0 and candidate.counts['fallback_calls'] == 1
     candidate.close()
@@ -325,11 +316,7 @@ def test_unsupported_optional_semantics_follow_original_return_or_exception(kwar
 
 @pytest.mark.parametrize('kind', ['waiting', 'preempted', 'resumable', 'cached', 'partial', 'missing_request'])
 def test_request_lifetime_or_prefix_state_never_uses_fast_path(kind):
-    left, right = manager(), manager()
-    lr, rr = request(), request()
-    prime(left, lr)
-    prime(right, rr)
-    candidate = H.NoGrowthAllocator(right)
+    left, right, lr, rr, candidate = primed_pair()
     if kind == 'waiting':
         lr.status = rr.status = RequestStatus.WAITING
     elif kind == 'preempted':
@@ -346,23 +333,14 @@ def test_request_lifetime_or_prefix_state_never_uses_fast_path(kind):
     else:
         left.free(lr)
         right.free(rr)
-    outcomes = []
-    for kv, r in ((left, lr), (right, rr)):
-        try:
-            outcomes.append(('return', returned(kv.allocate_slots(r, 1), kv)))
-        except Exception as exc:
-            outcomes.append(('error', type(exc).__module__, type(exc).__qualname__, str(exc)))
+    outcomes = [allocation_outcome(kv, r) for kv, r in ((left, lr), (right, rr))]
     assert outcomes[0] == outcomes[1] and ledger(left) == ledger(right)
     assert candidate.counts['fast_hits'] == 0 and candidate.counts['fallback_calls'] == 1
     candidate.close()
 
 
 def test_exhausted_pool_reserved_capacity_and_reused_ID_exact():
-    left, right = manager(blocks=7), manager(blocks=7)
-    lr, rr = request(), request()
-    prime(left, lr)
-    prime(right, rr)
-    candidate = H.NoGrowthAllocator(right)
+    left, right, lr, rr, candidate = primed_pair(blocks=7)
     assert right.block_pool.get_num_free_blocks() == 0
     paired(left, right, lr, rr)  # No-growth remains legal even with no free blocks.
     x, y = paired(left, right, lr, rr, reserved_blocks=1)
@@ -383,22 +361,14 @@ def test_exhausted_pool_reserved_capacity_and_reused_ID_exact():
 
 
 def test_maximum_model_length_clamping_remains_original():
-    left, right = manager(max_model_len=399), manager(max_model_len=399)
-    lr, rr = request(), request()
-    prime(left, lr, 399)
-    prime(right, rr, 399)
-    candidate = H.NoGrowthAllocator(right)
+    left, right, lr, rr, candidate = primed_pair(399, max_model_len=399)
     paired(left, right, lr, rr)
     candidate.close()
 
 
 @pytest.mark.parametrize('options', [{'mamba_size': 2048}, {'mode': 'all'}])
 def test_unsupported_static_geometry_is_original_fallback_only(options):
-    left, right = manager(**options), manager(**options)
-    lr, rr = request(), request()
-    prime(left, lr)
-    prime(right, rr)
-    candidate = H.NoGrowthAllocator(right)
+    left, right, lr, rr, candidate = primed_pair(**options)
     paired(left, right, lr, rr)
     assert candidate.status()['eligible_layout'] is False
     assert candidate.counts['fast_hits'] == 0 and candidate.counts['fallback_calls'] == 1
@@ -407,22 +377,13 @@ def test_unsupported_static_geometry_is_original_fallback_only(options):
 
 @pytest.mark.parametrize('kind', ['prefix_enabled', 'replacement_empty'])
 def test_dynamic_prefix_or_canonical_empty_change_uses_original_before_mutation(kind):
-    left, right = manager(), manager()
-    lr, rr = request(), request()
-    prime(left, lr)
-    prime(right, rr)
-    candidate = H.NoGrowthAllocator(right)
+    left, right, lr, rr, candidate = primed_pair()
     for kv in (left, right):
         if kind == 'prefix_enabled':
             kv.enable_caching = True
         else:
             kv.empty_kv_cache_blocks = KVCacheBlocks(tuple(() for _ in range(6)))
-    outcomes = []
-    for kv, r in ((left, lr), (right, rr)):
-        try:
-            outcomes.append(('return', returned(kv.allocate_slots(r, 1), kv)))
-        except Exception as exc:
-            outcomes.append(('error', type(exc).__module__, type(exc).__qualname__, str(exc)))
+    outcomes = [allocation_outcome(kv, r) for kv, r in ((left, lr), (right, rr))]
     assert outcomes[0] == outcomes[1] and ledger(left) == ledger(right)
     assert candidate.counts['fast_hits'] == 0 and candidate.counts['fallback_calls'] == 1
     candidate.close()

@@ -30,10 +30,7 @@ class MetadataWireCache:
         self._true_wire = serializer.encoder._encode_tensor(self._true)
         self._false_wire = serializer.encoder._encode_tensor(self._false)
         self._encoder = msgspec.msgpack.Encoder(enc_hook=self._hook)
-        self.calls = 0
         self.cache_hits = 0
-        self.generic_hook_calls = 0
-        self.mutation_rejections = 0
 
     def _hook(self, obj):
         if obj is self._true:
@@ -42,27 +39,12 @@ class MetadataWireCache:
         if obj is self._false:
             self.cache_hits += 1
             return self._false_wire
-        self.generic_hook_calls += 1
         return self._original_encoder._enc_hook(obj)
 
     def encode(self, obj):
         if (self._true._version, self._false._version) != self._versions:
-            self.mutation_rejections += 1
             raise RuntimeError('owned metadata scalars were mutated after wire-cache installation')
-        self.calls += 1
         return self._encoder.encode(obj)
-
-    def status(self):
-        return {
-            'enabled': True,
-            'scope': 'two exact BulkSender-owned CPU bool tensors',
-            'strong_references': True,
-            'mutation_guard': 'tensor version',
-            'calls': self.calls,
-            'cache_hits': self.cache_hits,
-            'generic_hook_calls': self.generic_hook_calls,
-            'mutation_rejections': self.mutation_rejections,
-        }
 
 
 def install_metadata_wire_cache(controller):
@@ -84,8 +66,3 @@ def install_metadata_wire_cache(controller):
     connector.serialize_obj = cache.encode
     controller._metadata_wire_cache = cache
     return cache
-
-
-def host_fastpath_status(runner=None, controller=None):
-    cache = getattr(controller, '_metadata_wire_cache', None)
-    return {'metadata_wire_cache': cache.status() if cache is not None else {'enabled': False}}

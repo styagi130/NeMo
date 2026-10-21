@@ -69,6 +69,7 @@ class BulkFreshInputs:
             raise TypeError("bulk fresh inputs require the EasyMagpie talker")
         if runner.requests or runner.input_batch.num_reqs or runner.input_batch.req_ids:
             raise RuntimeError("bulk fresh inputs must initialize before traffic")
+        methods = {}
         for name in (
             "preprocess",
             "_preprocess_prefill",
@@ -77,28 +78,20 @@ class BulkFreshInputs:
             "_embed_phoneme",
             "_maybe_set_lt_sampling_params",
         ):
-            if _function(getattr(model, name)) is not getattr(EasyMagpieTTSForConditionalGeneration, name):
+            method = _function(getattr(model, name))
+            if method is not getattr(EasyMagpieTTSForConditionalGeneration, name):
                 raise RuntimeError("bulk fresh inputs require native model preprocessing")
+            methods[name] = method
         if _function(runner._update_intermediate_buffer) is not EasyMagpieGPUARModelRunner._update_intermediate_buffer:
             raise RuntimeError("bulk fresh inputs require the native metadata update")
         self.runner, self.model = weakref.ref(runner), weakref.ref(model)
-        self.pid, self.runner_identity, self.model_identity = os.getpid(), id(runner), id(model)
+        self.pid = os.getpid()
         self.actor_tid = None
         self.closed = False
         self.close_calls = 0
         self.counts = Counter(dict.fromkeys(COUNTERS, 0))
         self.fallback_reasons = Counter()
-        self.methods = {
-            name: _function(getattr(model, name))
-            for name in (
-                "preprocess",
-                "_preprocess_prefill",
-                "_build_prefill_embeds",
-                "_build_text_prefill_embeds",
-                "_embed_phoneme",
-                "_maybe_set_lt_sampling_params",
-            )
-        }
+        self.methods = methods
         self.update = _function(runner._update_intermediate_buffer)
 
     def binding(self):

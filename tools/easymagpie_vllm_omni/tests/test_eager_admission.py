@@ -18,7 +18,6 @@ from vllm_omni.entrypoints.openai import serving_speech as speech
 from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
 from vllm_omni.entrypoints.openai.tts_adapters.base import PreparedRequest
 
-RESULTS = []
 SCOPE = {
     'type': 'http',
     'method': 'POST',
@@ -151,16 +150,15 @@ def app_for(server, *, before_body=None, send_hook=None):
     return app, sent, send
 
 
-async def check_case(loop_name, name, function):
+async def check_case(function):
     start_active = eager.eager_admission_status()['counts'].get('active', 0)
     await asyncio.wait_for(function(), timeout=10)
     await asyncio.sleep(0)
     assert eager.eager_admission_status()['counts'].get('active', 0) == start_active == 0
     assert not [t for t in asyncio.all_tasks() if t.get_name() == 'easymagpie-eager-admission' and not t.done()]
-    RESULTS.append({'loop': loop_name, 'case': name, 'status': 'PASS'})
 
 
-async def suite(loop_name):
+async def suite():
     async def control_lazy():
         client, observations = make_client(), []
         server = make_serving(client)
@@ -174,7 +172,7 @@ async def suite(loop_name):
         assert observations == ['lazy'] and sent == [b'\x01', b'\x02', b'\x03']
         assert len(client.engine.added) == 1 and not client.engine.aborted and not client.request_states
 
-    await check_case(loop_name, 'original generator remains lazy without HTTP owner', control_lazy)
+    await check_case(control_lazy)
 
     async def actual_factory_request(app):
         global _factory_server
@@ -202,12 +200,12 @@ async def suite(loop_name):
         assert eager._COUNTS['prepared'] == prepared + 1
         assert not client.request_states and not client.engine.aborted
 
-    for factory_name, factory_app in _apps:
+    for _, factory_app in _apps:
 
         async def factory_case(app=factory_app):
             await actual_factory_request(app)
 
-        await check_case(loop_name, 'actual FastAPI factory serves and drains ' + factory_name, factory_case)
+        await check_case(factory_case)
 
     async def eager_all_terminal():
         client, observations = make_client(), []
@@ -226,9 +224,7 @@ async def suite(loop_name):
         assert client.engine.added[0]['prompt'] == {'prompt_token_ids': [1, 2, 3]}
         assert client.engine.added[0]['final_output_stage_ids'] == [1]
 
-    await check_case(
-        loop_name, 'eager enqueue before handoff, one-output bound, ordered complete drain', eager_all_terminal
-    )
+    await check_case(eager_all_terminal)
 
     async def cancel_before_body():
         client = make_client('held')
@@ -250,7 +246,7 @@ async def suite(loop_name):
             pass
         assert not sent and not client.request_states and client.engine.aborted == [rid]
 
-    await check_case(loop_name, 'cancel after admission before response body ever starts', cancel_before_body)
+    await check_case(cancel_before_body)
 
     async def cancel_before_first_audio():
         client = make_client('held')
@@ -271,7 +267,7 @@ async def suite(loop_name):
             pass
         assert not sent and not client.request_states and client.engine.aborted == [rid]
 
-    await check_case(loop_name, 'cancel pending first-audio consumer', cancel_before_first_audio)
+    await check_case(cancel_before_first_audio)
 
     async def disconnect_on_first_audio():
         client = make_client()
@@ -292,7 +288,7 @@ async def suite(loop_name):
         assert seen == [b'\x01'] and not client.request_states
         assert client.engine.aborted == [client.engine.added[0]['request_id']]
 
-    await check_case(loop_name, 'disconnect while first audio is sent', disconnect_on_first_audio)
+    await check_case(disconnect_on_first_audio)
 
     async def abandoned_ready_response():
         client = make_client()
@@ -309,7 +305,7 @@ async def suite(loop_name):
         assert not sent and not client.request_states
         assert client.engine.aborted == [client.engine.added[0]['request_id']]
 
-    await check_case(loop_name, 'abandoned response with already-prefetched output', abandoned_ready_response)
+    await check_case(abandoned_ready_response)
 
     async def admission_error():
         client = make_client('error')
@@ -323,7 +319,7 @@ async def suite(loop_name):
         assert not sent and not client.request_states
         assert client.engine.aborted == [client.engine.added[0]['request_id']]
 
-    await check_case(loop_name, 'original admission exception propagated and state cleaned', admission_error)
+    await check_case(admission_error)
 
     async def reused_external_id():
         client = make_client('held')
@@ -358,9 +354,7 @@ async def suite(loop_name):
                 if not task.done():
                     task.cancel()
 
-    await check_case(
-        loop_name, 'same external ID retains distinct internal cancellation ownership', reused_external_id
-    )
+    await check_case(reused_external_id)
 
     async def paused_cancel():
         client = make_client('held')
@@ -382,7 +376,7 @@ async def suite(loop_name):
             pass
         assert not client.engine.added and not client.engine.aborted and not client.request_states
 
-    await check_case(loop_name, 'paused engine remains paused; cancellation creates no request', paused_cancel)
+    await check_case(paused_cancel)
 
     async def asgi_disconnect_scope():
         client = make_client('held')
@@ -396,7 +390,7 @@ async def suite(loop_name):
         assert not sent and not client.request_states
         assert client.engine.aborted == [client.engine.added[0]['request_id']]
 
-    await check_case(loop_name, 'Starlette ASGI2 disconnect task-group cleanup', asgi_disconnect_scope)
+    await check_case(asgi_disconnect_scope)
 
 
 assert not torch.cuda.is_initialized()
@@ -487,10 +481,10 @@ def test_actual_async_generator_and_asgi_lifetimes(monkeypatch):
             assert seen == [None, None, None]
 
         asyncio.run(check_scope_passthrough())
-        asyncio.run(suite('asyncio'))
+        asyncio.run(suite())
         import uvloop
 
-        uvloop.run(suite('uvloop'))
+        uvloop.run(suite())
         assert not torch.cuda.is_initialized()
         assert eager.eager_admission_status()['counts']['active'] == 0
     finally:

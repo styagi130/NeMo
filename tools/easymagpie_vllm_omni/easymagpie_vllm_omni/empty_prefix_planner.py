@@ -201,30 +201,10 @@ class Planner:
             raise RuntimeError('planner restoration changed')
         if any(getattr(type(self.kv), name) is not original for name, original in self.protected.items()):
             raise RuntimeError('original allocator methods changed')
-        geometry = []
         for manager, mamba, size, spec, mode, functions in self.plan:
             if any(getattr(type(manager), name) is not original for name, original in functions.items()):
                 raise RuntimeError('original group manager methods changed')
-            geometry.append(
-                dict(
-                    manager_class=type(manager).__module__ + '.' + type(manager).__qualname__,
-                    manager=id(manager),
-                    group_id=manager.kv_cache_group_id,
-                    block_size=manager.block_size,
-                    spec_class=type(manager.kv_cache_spec).__qualname__,
-                    spec_block_size=manager.kv_cache_spec.block_size,
-                    mamba_cache_mode=mode,
-                    num_speculative_blocks=manager.num_speculative_blocks if mamba else None,
-                    enable_caching=manager.enable_caching,
-                    admission_cap=manager._max_admission_blocks_per_request,
-                )
-            )
         return dict(
-            pid=self.pid,
-            tid=self.tid,
-            coordinator=id(self.coordinator),
-            kv_manager=id(self.kv),
-            block_pool=id(self.pool),
             counts={
                 k: self.counts[k]
                 for k in (
@@ -238,11 +218,6 @@ class Planner:
             },
             fallbacks=dict(self.fallbacks),
             shadow=self.shadow,
-            groups=geometry,
-            coordinator_class=type(self.coordinator).__module__ + '.' + type(self.coordinator).__qualname__,
-            enable_caching=self.kv.enable_caching,
-            original_allocate_free_remove_methods_unchanged=True,
-            only_predictor_replaced=True,
             installed=not self.closed,
             closed=self.closed,
         )

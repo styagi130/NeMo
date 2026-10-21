@@ -89,16 +89,6 @@ class NoGrowthAllocator:
             (manager, manager.block_size, manager.kv_cache_spec, type(manager) is MambaManager)
             for manager in self.managers
         )
-        self.group_metadata = []
-        for manager in self.managers:
-            self.group_metadata.append(
-                dict(
-                    manager=id(manager),
-                    manager_class=type(manager).__module__ + '.' + type(manager).__qualname__,
-                    block_size=manager.block_size,
-                    mamba_cache_mode=getattr(manager, 'mamba_cache_mode', None),
-                )
-            )
         self.layout_reason_at_install = self._layout_reason(kv)
         self.eligible_layout = self.layout_reason_at_install is None
         state_ref = weakref.ref(self)
@@ -345,23 +335,11 @@ class NoGrowthAllocator:
             closed=self.closed,
             binding_matches=installed,
             binding_restored=restored,
-            tid=self.tid,
-            kv_manager=id(kv),
-            wrapper_function_identity=id(self.function),
-            original_function_identity=id(self.original),
             eligible_layout=self.eligible_layout,
             current_layout_matches=None if self.closed else self._layout_reason(kv) is None,
-            groups=list(self.group_metadata),
             counts={name: self.counts[name] for name in ('calls', 'fast_hits', 'fallback_calls', 'errors')},
             fallbacks=dict(self.fallbacks),
             retained_Request_references=0,
-            original_scheduler_and_class_methods_unchanged=all(
-                getattr(cls, name) is old for cls, name, old in self.original_methods
-            ),
-            return_contract='Same original immutable canonical empty_kv_cache_blocks on hits',
-            GPU_operations_added=False,
-            tensors_payloads_or_capacity_changed=False,
-            performance_claim=False,
         )
 
     def close(self):

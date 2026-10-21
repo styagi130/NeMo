@@ -147,10 +147,8 @@ class BulkSender:
         self._scope_owner = None
         self._scope_depth = 0
         self._lock = threading.RLock()
-        self.producer = Counter()
         self.consumer = Counter()
         self.deadline_policy = None
-        self.timing = Counter()
         self._true = torch.tensor(True, dtype=torch.bool)
         self._false = torch.tensor(False, dtype=torch.bool)
 
@@ -162,23 +160,20 @@ class BulkSender:
                 raise RuntimeError('concurrent scheduler updates are unsupported')
             self._scope_owner = owner
             self._scope_depth += 1
-            self.producer['scheduler_updates'] += 1
         try:
             yield
         finally:
             with self._lock:
                 self._scope_depth -= 1
                 if not self._scope_depth:
-                    self._flush('update_boundary')
+                    self._flush()
                     self._scope_owner = None
 
     def save_async(self, multimodal_output=None, request=None, is_segment_finished=False):
         with self._lock:
-            self.producer['save_async_calls'] += 1
             confirmed = self.adapter._confirmed_num_computed_tokens(request)
             rid = request.external_req_id
             if confirmed < self.adapter.requests_num_chunks_sent.get(rid, 0):
-                self.producer['preemption_skips'] += 1
                 return
             self.adapter.requests_num_chunks_sent[rid] = confirmed
             task = {
@@ -188,33 +183,28 @@ class BulkSender:
                 'is_segment_finished': is_segment_finished,
                 'enqueue_ns': time.monotonic_ns(),
             }
-            self.producer['accepted_tasks'] += 1
             if self._scope_owner == threading.get_ident():
                 self._pending.append(task)
                 if len(self._pending) >= self.max_tasks:
-                    self._flush('size_limit')
+                    self._flush()
             else:
-                self._flush('external_producer')
-                self._enqueue((task,), 'outside_update')
+                self._flush()
+                self._enqueue((task,))
 
     def enqueue_cancellations(self, requests):
         with self._lock:
-            self._flush('cancellation')
+            self._flush()
             tasks = tuple({'request': req, '_bulk_cancel_only': True} for req in requests)
             if tasks:
-                self._enqueue(tasks, 'cancellation')
+                self._enqueue(tasks)
 
-    def _flush(self, reason):
+    def _flush(self):
         if self._pending:
             tasks, self._pending = tuple(self._pending), []
-            self._enqueue(tasks, reason)
+            self._enqueue(tasks)
 
-    def _enqueue(self, tasks, reason):
+    def _enqueue(self, tasks):
         self.adapter._pending_save_reqs.append({_BATCH: tasks, 'request_id': 'bulk-sender'})
-        self.producer['queue_batches'] += 1
-        self.producer['enqueued_tasks'] += len(tasks)
-        self.producer['largest_batch'] = max(self.producer['largest_batch'], len(tasks))
-        self.producer['flush:' + reason] += 1
         with self.adapter._save_cond:
             self.adapter._save_cond.notify()
 
@@ -230,7 +220,6 @@ class BulkSender:
         rid = state.request.external_req_id
         if self.current_owner.get(rid) is state:
             self.current_owner.pop(rid)
-        self.consumer['released_generations'] += 1
 
     def _state(self, task):
         request = task['request']
@@ -249,7 +238,6 @@ class BulkSender:
             and request.request_id == current.request.request_id
             and getattr(current.request, 'status', None) not in _FAILED
         ):
-            self.consumer['copied_terminal_sentinels'] += 1
             return current
         # A new request is a low-frequency point for reclaiming cancellations
         # whose scheduler control message has not yet reached this sender.
@@ -278,8 +266,6 @@ class BulkSender:
         self.current_owner[request.external_req_id] = state
         self.adapter.put_req_chunk[request.external_req_id] += 0
         self.backend.reset(state.slot, state.generation, state.delay)
-        self.consumer['registered_generations'] += 1
-        self.consumer['maximum_live_generations'] = max(self.consumer['maximum_live_generations'], len(self.states))
         return state
 
     @staticmethod
@@ -335,24 +321,11 @@ class BulkSender:
             adapter._emp_requests = {}
         adapter._emp_requests[rid] = state.request
         state.fallback = True
-        self.consumer['fallback_generations'] += 1
 
     def send_envelope(self, envelope):
-        started = time.monotonic_ns()
         tasks = envelope.get(_BATCH)
         if tasks is None:
             tasks = (envelope,)
-        self.consumer['consumed_batches'] += 1
-        self.consumer['consumed_tasks'] += len(tasks)
-        for task in tasks:
-            enqueue = task.get('enqueue_ns')
-            if enqueue is not None:
-                elapsed = max(0, started - enqueue)
-                self.timing['queue_count'] += 1
-                self.timing['queue_sum_ns'] += elapsed
-                self.timing['queue_max_ns'] = max(self.timing['queue_max_ns'], elapsed)
-                upper_ms = 1 << max(0, ((elapsed + 999999) // 1000000 - 1).bit_length())
-                self.timing[f'queue_le_{upper_ms}_ms'] += 1
         # Flush before uncommon fallback/control work to preserve exact global
         # publication order, including multiple rows for one request in a batch.
         pending = []
@@ -364,7 +337,6 @@ class BulkSender:
                 pending.clear()
                 if state is not None:
                     self._release(state)
-                self.consumer['cancelled_tasks'] += 1
                 if not task.get('_bulk_cancel_only') and (task['is_finished'] or task['is_segment_finished']):
                     self._send_original(task)
                 continue
@@ -381,15 +353,10 @@ class BulkSender:
                 pending.clear()
                 if state is not None:
                     self._bridge_fallback(state)
-                self.consumer['original_processor_calls'] += 1
                 self._send_original(task)
                 if state is not None and task['is_finished']:
                     self._release(state)
         self._append_pending(pending)
-        elapsed = time.monotonic_ns() - started
-        self.timing['batch_processing_count'] += 1
-        self.timing['batch_processing_sum_ns'] += elapsed
-        self.timing['batch_processing_max_ns'] = max(self.timing['batch_processing_max_ns'], elapsed)
 
     def _append_pending(self, pending):
         if not pending:
@@ -401,14 +368,9 @@ class BulkSender:
             generations.append(state.generation)
             flags.append(flag)
         events = self.backend.append(rows, slots, generations, flags)
-        self.consumer['backend_batch_calls'] += 1
-        self.consumer['backend_tasks'] += len(pending)
-        self.consumer['original_processor_calls_avoided'] += len(pending)
-        self.consumer['largest_backend_batch'] = max(self.consumer['largest_backend_batch'], len(pending))
         ready = []
         for event in events:
             if event.kind == 'stale':
-                self.consumer['stale_backend_events'] += 1
                 continue
             task, state, _, _ = pending[event.index]
             meta = MetaStruct(
@@ -476,21 +438,16 @@ class BulkSender:
         return bool(success)
 
     def status(self):
-        from .host_fastpath import host_fastpath_status
-
         pool = getattr(self.adapter.connector, 'pool', None)
         return {
             'pooled_publication': pool.status() if pool is not None else {'enabled': False},
-            'host_fastpath': host_fastpath_status(controller=self),
             'enabled': True,
             'backend': self.backend_name,
             'frame_viewless': self.frame_viewless,
             'version': 2,
             'startup_frames': list(self.startup_frames),
             'steady_frames': 8,
-            'producer': dict(self.producer),
             'consumer': dict(self.consumer),
-            'timing': dict(self.timing),
             'live_generations': len(self.states),
             'capacity': self.backend.capacity,
             'collector_pending_tasks': len(self._pending),

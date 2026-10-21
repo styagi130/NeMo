@@ -336,10 +336,6 @@ class BatchedReadyPublisher:
             'max_batch': self.max_batch,
             'counts': dict(self.counts),
             'retry_records': len(self.retry),
-            'no_batch_fill_wait': True,
-            'batch_scope': 'currently ready heads; one inflight record per owner',
-            'ack_boundary': 'actual pool commit plus completed publication bookkeeping',
-            'failure_policy': 'retain inflight record; retry on next callback; never false-ACK',
             'pool_poisoned': self.pool._batch_poisoned,
         }
 

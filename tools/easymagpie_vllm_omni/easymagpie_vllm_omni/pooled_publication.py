@@ -323,13 +323,9 @@ class SharedPublicationPool:
                 'payload_bytes': self.payload_bytes,
                 'occupied': _U64.unpack_from(self.memory, _OCCUPIED_OFFSET)[0],
                 'counts': dict(self.counts),
-                'wire_payload_unchanged': True,
                 'retained_owner_entries': len(self._owners),
                 'retained_cancel_entries': len(self._cancelled),
                 'owner_entry_limit': self.slots * 2,
-                'ack_boundary': 'successful original deserializer completion',
-                'no_batch_fill_wait': True,
-                'lock_scope': 'one shared persistent file; local threads plus processes',
             }
 
     def close(self):
@@ -419,8 +415,7 @@ def install_pooled_publication(target, *, role, controller=None):
     """Call for BOTH scheduler adapters before requests; default is disabled.
 
     For the sender, pass its BulkSender as ``controller`` to attach immutable
-    owner/sequence context and generation-tagged cancellation. Root integration
-    should expose ``adapter.connector.pool.status()`` via scheduler status RPC.
+    owner/sequence context and generation-tagged cancellation.
     """
     if os.environ.get('EASYMAGPIE_POOLED_PUBLICATION', '0') != '1':
         return None
