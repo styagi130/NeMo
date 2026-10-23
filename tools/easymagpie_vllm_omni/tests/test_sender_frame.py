@@ -92,6 +92,39 @@ def request():
     return item
 
 
+def test_bulk_sender_flushes_and_resets_each_dialogue_turn():
+    from easymagpie_vllm_omni.bulk_sender import BulkSender
+
+    adapter, req, outputs = manager(), request(), []
+    req.additional_information = {'reset_codec_on_segment': True}
+    adapter.put_req_chunk = defaultdict(int)
+
+    def send(task):
+        adapter._easymagpie_send_finish = (task['is_finished'], task['is_segment_finished'])
+        payload = candidate.talker2code2wav_async_chunk(adapter, task['multimodal_output'], req)
+        if payload is not None:
+            outputs.append(payload)
+
+    adapter._send_single_request = send
+    sender = BulkSender(adapter, capacity=1)
+    sender.publish_ready = lambda ready: outputs.extend(record['payload'] for record in ready)
+    for turn in range(2):
+        for step in range(2):
+            sender.send_envelope(
+                dict(
+                    request=req,
+                    multimodal_output={'audio_codes': torch.full((1, 16), turn * 2 + step + 1)},
+                    is_finished=False,
+                    is_segment_finished=step == 1,
+                )
+            )
+    assert len(outputs) == 2
+    for turn, payload in enumerate(outputs):
+        assert payload.meta.codec_streaming is False
+        assert torch.equal(payload.codes.audio[0], torch.full((16,), turn * 2 + 2))
+    assert req.external_req_id not in adapter._emp_seen_frames
+
+
 def test_long_stream_exact_payloads_retained_outputs_and_cleanup():
     parents = [manager(), manager()]
     requests = [request(), request()]

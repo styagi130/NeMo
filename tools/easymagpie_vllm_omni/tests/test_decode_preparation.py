@@ -87,15 +87,46 @@ def test_failed_or_cancelled_preparation_does_not_leak_metadata(device):
     assert torch.equal(model._dec_phoneme_tokens[1], torch.tensor([10, 10], device=device))
 
 
-def test_runner_prepares_only_single_token_rows_after_reordering():
+def test_runner_prepares_only_completed_prompt_single_token_rows_after_reordering():
     runner = object.__new__(EasyMagpieGPUARModelRunner)
     observed = []
     runner.model = SimpleNamespace(prepare_decode_batch=lambda rows, device: observed.append((rows, device)))
-    runner.query_start_loc = SimpleNamespace(cpu=np.array([0, 4, 5, 6]))
-    runner._omni_num_scheduled_tokens_np = np.array([4, 1, 1])
-    runner.model_intermediate_buffer = {key: {"decode_offset": i} for i, key in enumerate(("c", "a", "b"))}
-    runner._maybe_run_batch_preprocess(["c", "a", "b"], torch.device("cpu"))
+    runner.query_start_loc = SimpleNamespace(cpu=np.array([0, 4, 5, 6, 7]))
+    runner._omni_num_scheduled_tokens_np = np.array([4, 1, 1, 1])
+    keys = ("c", "a", "b", "one-token-prefill")
+    runner.model_intermediate_buffer = {key: {"decode_offset": i} for i, key in enumerate(keys)}
+    runner.requests = {key: SimpleNamespace(prompt_token_ids=[0] * 4) for key in keys}
+    runner.input_batch = SimpleNamespace(num_computed_tokens_cpu=np.array([0, 4, 4, 3]))
+    runner._maybe_run_batch_preprocess(list(keys), torch.device("cpu"))
     assert observed == [([(4, {"decode_offset": 1}), (5, {"decode_offset": 2})], torch.device("cpu"))]
+
+
+@pytest.mark.parametrize("resident", [False, True])
+def test_user_audio_decode_keeps_speaking_end_token(resident):
+    from easymagpie_vllm_omni.device_decode_state import DeviceDecodeState
+
+    reference, batched = _model("cpu", 0), _model("cpu", 0)
+    for model in (reference, batched):
+        model.arch.use_user_speaking_end_token = True
+        model.arch.audio_user_speaking_end_id = 1030
+    if resident:
+        batched._device_decode_state = DeviceDecodeState(batched, 3, 32, 32)
+    device = torch.device("cpu")
+    ids = torch.zeros(32, dtype=torch.long)
+    infos = [{"decode_offset": 5, "user_audio_prefilled": True}, {"decode_offset": 5}, {"decode_offset": 5}]
+    rows = list(enumerate(infos))
+    keys = {"request_keys": [(str(index), index) for index in range(3)]} if resident else {}
+    batched.prepare_decode_batch(rows, device, **keys)
+    assert 0 not in batched._prepared_decode_updates
+    assert set(batched._prepared_decode_updates) == {1, 2}
+    for start, info in rows:
+        reference._preprocess_decode(ids[start : start + 1], start, device, dict(info))
+        batched._preprocess_decode(ids[start : start + 1], start, device, dict(info))
+    if resident:
+        batched._device_decode_state.stage(batched, torch.arange(3))
+    _assert_buffers(reference, batched, 0)
+    assert batched._dec_audio_codes[0].tolist() == [1030] * 4
+    assert batched._dec_audio_codes[1].tolist() == [1025] * 4
 
 
 @pytest.mark.parametrize("failed", [False, True])

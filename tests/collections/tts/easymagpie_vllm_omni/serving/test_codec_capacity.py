@@ -144,7 +144,7 @@ def _validate_payloads(scheduler, output):
     codec = object.__new__(EasyMagpieCodecForConditionalGeneration)
     torch.nn.Module.__init__(codec)
     codec.config = EasyMagpieCodecConfig(input_dim=5, num_codebooks=1)
-    packed, frames, valid_samples = codec._payload_codes(infos, torch.device("cpu"), spans)
+    packed, frames, valid_samples, _ = codec._payload_codes(infos, torch.device("cpu"), spans)
     assert frames == list(output.num_scheduled_tokens.values())
     assert valid_samples == [count * codec.config.samples_per_frame for count in frames]
     if expected:
@@ -210,6 +210,7 @@ def _scheduler(capacity, retains_state):
     scheduler.scheduler_config = SimpleNamespace(enable_chunked_prefill=False, async_scheduling=False)
     scheduler.policy = SchedulingPolicy.FCFS
     scheduler._retains_state_across_chunks = retains_state
+    scheduler._easymagpie_reset_on_update = set()
     scheduler._pending_finish_reqs = []
     scheduler.input_coordinator = scheduler._latest_omni_connector_output = None
     scheduler.perf_metrics = scheduler.finished_req_ids_dict = None

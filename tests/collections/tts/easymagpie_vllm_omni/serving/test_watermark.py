@@ -10,6 +10,7 @@ from unittest import mock
 import pytest
 import torch
 from easymagpie_vllm_omni import watermark
+from easymagpie_vllm_omni.codec.config import EasyMagpieCodecConfig
 from easymagpie_vllm_omni.watermark import AudioChunk, DisabledAudioWatermarker, TaperedPerthWatermarker
 
 
@@ -112,24 +113,58 @@ def test_disabled_watermarker_is_identity() -> None:
     assert result[1] is waveforms[1]
 
 
-def test_explicit_disable_bypasses_perth_load() -> None:
-    with (
-        mock.patch.dict("os.environ", {"NEMOTRON_TTS_PERTH_WATERMARK": "off"}),
-        mock.patch.object(watermark, "_load_perth_net") as load_perth,
-    ):
-        created = watermark.create_audio_watermarker("cpu", sample_rate=22_050)
+@pytest.mark.parametrize("environment", [None, "1", "true", "off"])
+def test_explicit_disable_bypasses_perth_load(environment, monkeypatch) -> None:
+    if environment is None:
+        monkeypatch.delenv("NEMOTRON_TTS_PERTH_WATERMARK", raising=False)
+    else:
+        monkeypatch.setenv("NEMOTRON_TTS_PERTH_WATERMARK", environment)
+    with mock.patch.object(watermark, "_load_perth_net") as load_perth:
+        created = watermark.create_audio_watermarker("cpu", sample_rate=22_050, enabled=False)
 
     load_perth.assert_not_called()
     assert isinstance(created, DisabledAudioWatermarker)
 
 
-def test_enabled_initialization_failure_is_fatal() -> None:
+@pytest.mark.parametrize("environment", [None, "1", "off"])
+def test_default_enable_ignores_environment(environment, monkeypatch) -> None:
+    if environment is None:
+        monkeypatch.delenv("NEMOTRON_TTS_PERTH_WATERMARK", raising=False)
+    else:
+        monkeypatch.setenv("NEMOTRON_TTS_PERTH_WATERMARK", environment)
+    with mock.patch.object(watermark, "_load_perth_net", return_value=_FakePerthNet()) as load_perth:
+        created = watermark.create_audio_watermarker("cpu", sample_rate=22_050)
+    assert isinstance(created, TaperedPerthWatermarker)
+    load_perth.assert_called_once_with("cpu", models_dir=None)
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_codec_config_watermark_round_trip(enabled) -> None:
+    config = EasyMagpieCodecConfig(watermark_enabled=enabled)
+    assert EasyMagpieCodecConfig.from_dict(config.to_dict()).watermark_enabled is enabled
+    assert EasyMagpieCodecConfig().watermark_enabled is True
+
+
+@pytest.mark.parametrize("enabled", ["true", "false", 0, 1, None])
+def test_watermark_config_requires_boolean(enabled) -> None:
+    with pytest.raises(ValueError, match="must be a boolean"):
+        EasyMagpieCodecConfig(watermark_enabled=enabled)
     with (
-        mock.patch.dict("os.environ", {"NEMOTRON_TTS_PERTH_WATERMARK": "1"}),
+        mock.patch.object(watermark, "_load_perth_net") as load_perth,
+        pytest.raises(ValueError, match="must be a boolean"),
+    ):
+        watermark.create_audio_watermarker("cpu", sample_rate=22_050, enabled=enabled)
+    load_perth.assert_not_called()
+
+
+@pytest.mark.parametrize("environment", ["1", "off"])
+def test_enabled_initialization_failure_is_fatal(environment, monkeypatch) -> None:
+    monkeypatch.setenv("NEMOTRON_TTS_PERTH_WATERMARK", environment)
+    with (
         mock.patch.object(watermark, "_load_perth_net", side_effect=ValueError("bad checkpoint")),
         pytest.raises(RuntimeError, match="could not be initialized"),
     ):
-        TaperedPerthWatermarker("cpu", sample_rate=22_050)
+        watermark.create_audio_watermarker("cpu", sample_rate=22_050, enabled=True)
 
 
 def test_encoder_is_compiled_on_cuda() -> None:
@@ -143,7 +178,6 @@ def test_encoder_is_compiled_on_cuda() -> None:
     compiled = mock.Mock(name="compiled_encoder", side_effect=lambda mag: (mag, None))
 
     with (
-        mock.patch.dict("os.environ", {"NEMOTRON_TTS_PERTH_WATERMARK": "1"}),
         mock.patch.object(watermark, "normalized_device", return_value="cuda:0"),
         mock.patch.object(torch, "compile", return_value=compiled) as compile_fn,
         mock.patch.object(torch.cuda, "is_available", return_value=False),
@@ -161,10 +195,7 @@ def test_encoder_is_not_compiled_on_cpu() -> None:
         encoder=encoder,
         device="cpu",
     )
-    with (
-        mock.patch.dict("os.environ", {"NEMOTRON_TTS_PERTH_WATERMARK": "1"}),
-        mock.patch.object(torch, "compile") as compile_fn,
-    ):
+    with (mock.patch.object(torch, "compile") as compile_fn,):
         result = TaperedPerthWatermarker("cpu", sample_rate=22_050, perth_net=perth_net)
 
     compile_fn.assert_not_called()
@@ -178,16 +209,41 @@ def test_load_perth_net_imports_perthnet_without_sys_modules_shim() -> None:
     assert "perth.perth_net.perth_net_implicit.model.perth_net" in source
 
 
-def test_create_audio_watermarker_forwards_models_dir() -> None:
-    with (
-        mock.patch.dict("os.environ", {"NEMOTRON_TTS_PERTH_WATERMARK": "1"}),
-        mock.patch.object(watermark, "_load_perth_net") as load_perth,
-    ):
-        fake = mock.MagicMock()
-        fake.hp.sample_rate = 32_000
-        fake.device = "cpu"
-        fake.encoder = object()
-        load_perth.return_value = fake
-        watermark.create_audio_watermarker("cpu", sample_rate=22_050, models_dir="/ckpt/watermark/perth")
+@pytest.mark.parametrize("fail", [False, True])
+def test_perth_load_uses_float32_and_restores_default_dtype(fail, tmp_path) -> None:
+    (tmp_path / "implicit").mkdir()
+    (tmp_path / "implicit" / "hparams.yaml").write_text("{}")
 
+    def load(*_args, **_kwargs):
+        assert torch.get_default_dtype() == torch.float32
+        if fail:
+            raise ValueError("bad checkpoint")
+        return torch.nn.Linear(1, 1)
+
+    module = types.SimpleNamespace(PerthNet=types.SimpleNamespace(load=load))
+    previous_dtype = torch.get_default_dtype()
+    try:
+        torch.set_default_dtype(torch.float16)
+        with mock.patch.dict("sys.modules", {"perth.perth_net.perth_net_implicit.model.perth_net": module}):
+            if fail:
+                with pytest.raises(ValueError, match="bad checkpoint"):
+                    watermark._load_perth_net("cpu", models_dir=tmp_path)
+            else:
+                result = watermark._load_perth_net("cpu", models_dir=tmp_path)
+                assert next(result.parameters()).dtype == torch.float32
+        assert torch.get_default_dtype() == torch.float16
+    finally:
+        torch.set_default_dtype(previous_dtype)
+
+
+@pytest.mark.parametrize("environment", ["1", "off"])
+def test_config_enable_initializes_and_forwards_models_dir(environment, monkeypatch) -> None:
+    monkeypatch.setenv("NEMOTRON_TTS_PERTH_WATERMARK", environment)
+    with mock.patch.object(watermark, "_load_perth_net", return_value=_FakePerthNet()) as load_perth:
+        config = EasyMagpieCodecConfig(watermark_enabled=True)
+        created = watermark.create_audio_watermarker(
+            "cpu", sample_rate=22_050, enabled=config.watermark_enabled, models_dir="/ckpt/watermark/perth"
+        )
+
+    assert isinstance(created, TaperedPerthWatermarker)
     load_perth.assert_called_once_with("cpu", models_dir="/ckpt/watermark/perth")

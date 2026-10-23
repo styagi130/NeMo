@@ -266,6 +266,8 @@ class BulkSender:
         self.current_owner[request.external_req_id] = state
         self.adapter.put_req_chunk[request.external_req_id] += 0
         self.backend.reset(state.slot, state.generation, state.delay)
+        if info.get('reset_codec_on_segment', False):
+            self._bridge_fallback(state)
         return state
 
     @staticmethod

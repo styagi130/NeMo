@@ -227,7 +227,7 @@ class DeviceDecodeState:
     def _eligible(self, info, model):
         if int(info.get("decode_offset", 0) or 0) < 0:
             return False
-        if isinstance(info.get("additional_information"), dict):
+        if isinstance(info.get("additional_information"), dict) or info.get("user_audio_prefilled"):
             return False
         for key, width in (("last_audio_codes", model.num_codebooks), ("last_phoneme_token", self.phoneme_width)):
             value = info.get(key)

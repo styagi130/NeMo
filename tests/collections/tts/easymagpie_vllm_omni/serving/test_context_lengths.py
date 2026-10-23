@@ -58,7 +58,7 @@ def _context_fixture(tmp_path, num_tasks=0):
     model.task_embedding = torch.nn.Embedding(num_tasks, 3) if num_tasks else None
     model.num_task_embeddings = num_tasks
     model.text_embedding = torch.nn.Embedding(128, 3)
-    model.arch = SimpleNamespace(text_prefill_num=4)
+    model.arch = SimpleNamespace(text_prefill_num=4, condition_on_user_speech=False)
     model.has_phoneme = False
     model._maybe_set_lt_sampling_params = lambda _info: None
     return adapter, model
@@ -82,9 +82,15 @@ def test_http_context_length_matches_exact_model_prefill(tmp_path, num_tasks, co
     chunks = []
     for start, stop in ((0, 3), (3, expected - 2), (expected - 2, expected)):
         ids = torch.zeros(stop - start, dtype=torch.long)
-        _, chunk, update = model._preprocess_prefill(ids, len(ids), ids.device, dict(info, prefill_offset=start))
+        _, chunk, update = model._preprocess_prefill(
+            ids,
+            None,
+            len(ids),
+            ids.device,
+            dict(info, _omni_num_computed_tokens=start, _omni_prompt_len=expected),
+        )
         chunks.append(chunk)
-        assert update["prefill_offset"] == stop
+        torch.testing.assert_close(chunk, embeds[start:stop], rtol=0, atol=0)
         assert update["decode_offset"] == 4
     torch.testing.assert_close(torch.cat(chunks), embeds, rtol=0, atol=0)
 

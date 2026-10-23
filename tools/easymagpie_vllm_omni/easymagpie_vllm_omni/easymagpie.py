@@ -1638,7 +1638,7 @@ class EasyMagpieTTSForConditionalGeneration(
             return
         eligible = []
         for start, info in rows:
-            if isinstance(info.get("additional_information"), dict):
+            if isinstance(info.get("additional_information"), dict) or info.get("user_audio_prefilled"):
                 continue
             widths = {"last_audio_codes": self.num_codebooks}
             if self.has_phoneme:

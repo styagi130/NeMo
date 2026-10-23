@@ -71,7 +71,7 @@ async def test_patch_marks_segment_before_delegating_and_is_idempotent(monkeypat
 
 
 @pytest.mark.asyncio
-async def test_terminal_update_publishes_completion_when_stages_are_already_waiting(monkeypatch):
+async def test_terminal_update_waits_for_stage_output_before_completing(monkeypatch):
     calls = []
 
     async def original(self, msg):
@@ -82,10 +82,6 @@ async def test_terminal_update_publishes_completion_when_stages_are_already_wait
     patched = Orchestrator._handle_streaming_update
 
     request_state = SimpleNamespace(final_stage_id=1, stage_submit_ts={1: 42.0})
-    final_pool = SimpleNamespace(
-        stage_client=SimpleNamespace(final_output_type="audio", audio_sample_rate=22050),
-        get_bound_replica_id=lambda request_id: 3,
-    )
     cleanups = []
 
     async def cleanup(request_ids):
@@ -93,7 +89,6 @@ async def test_terminal_update_publishes_completion_when_stages_are_already_wait
 
     orchestrator = SimpleNamespace(
         request_states={"request": request_state},
-        stage_pools=[None, final_pool],
         output_async_queue=asyncio.Queue(),
         _cleanup_request_ids=cleanup,
     )
@@ -102,14 +97,6 @@ async def test_terminal_update_publishes_completion_when_stages_are_already_wait
     await patched(orchestrator, msg)
 
     assert calls == [msg]
-    assert not orchestrator.output_async_queue.empty()
-    result = orchestrator.output_async_queue.get_nowait()
-    assert result.request_id == "request"
-    assert result.stage_id == 1
-    assert result.replica_id == 3
-    assert result.finished is True
-    assert result.stage_submit_ts == 42.0
-    audio = result.engine_outputs.outputs[0].multimodal_output
-    assert audio["audio"].numel() == 0
-    assert audio["sr"] == 22050
-    assert cleanups == [["request"]]
+    assert patched is original
+    assert orchestrator.output_async_queue.empty()
+    assert cleanups == []

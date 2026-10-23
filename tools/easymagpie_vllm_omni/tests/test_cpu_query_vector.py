@@ -152,6 +152,16 @@ def test_actual_decode_fastpath_preserves_acceptance_updates_padding(count, elig
     assert status.get('decode_fastpath_calls', 0) == int(bool(count and eligible))
 
 
+def test_multimodal_capability_does_not_disable_completed_prompt_decode():
+    runner = make(SOURCE, True, [1, 1])
+    runner.supports_mm_inputs = True
+    runner.model._prepared_decode_updates = {index: {'decode_offset': 4} for index in range(2)}
+    embeds = torch.full((2, 4), 123.0)
+    assert runner._try_complete_decode_preprocess(torch.zeros(2, dtype=torch.long), embeds, [1, 1])
+    assert torch.equal(embeds, torch.zeros_like(embeds))
+    assert not runner.model._prepared_decode_updates
+
+
 @pytest.mark.parametrize(
     'host,count',
     [

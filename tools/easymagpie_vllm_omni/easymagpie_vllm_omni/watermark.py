@@ -12,7 +12,6 @@ context per request without changing the codec call site.
 from __future__ import annotations
 
 import logging
-import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
@@ -21,8 +20,6 @@ import torch
 import torch.nn.functional as F
 
 logger = logging.getLogger(__name__)
-
-_DISABLED_VALUES = {"0", "false", "no", "off"}
 
 
 @dataclass
@@ -46,16 +43,10 @@ class AudioWatermarker(Protocol):
 
 
 class DisabledAudioWatermarker:
-    """Pass-through used when ``NEMOTRON_TTS_PERTH_WATERMARK`` disables watermarking."""
+    """Pass-through used when watermarking is disabled in codec config."""
 
     def apply(self, chunks: list[AudioChunk]) -> list[torch.Tensor]:
         return [chunk.audio for chunk in chunks]
-
-
-def watermarking_enabled() -> bool:
-    """Return whether production Perth watermarking is enabled."""
-    value = os.environ.get("NEMOTRON_TTS_PERTH_WATERMARK", "1")
-    return value.strip().lower() not in _DISABLED_VALUES
 
 
 def normalized_device(device: str | torch.device) -> str:
@@ -69,11 +60,13 @@ def create_audio_watermarker(
     device: str | torch.device,
     *,
     sample_rate: int,
+    enabled: bool = True,
     models_dir: str | Path | None = None,
 ) -> AudioWatermarker:
-    """Build a watermarker owned by the codec (or a no-op when disabled)."""
-    if not watermarking_enabled():
-        logger.warning("Perth watermarking is explicitly disabled by NEMOTRON_TTS_PERTH_WATERMARK")
+    """Build a codec watermarker unless its config explicitly disables it."""
+    if not isinstance(enabled, bool):
+        raise ValueError("watermark enabled must be a boolean")
+    if not enabled:
         return DisabledAudioWatermarker()
     return TaperedPerthWatermarker(device, sample_rate=sample_rate, models_dir=models_dir)
 
@@ -94,7 +87,14 @@ def _load_perth_net(device: str, models_dir: str | Path | None = None) -> Any:
             f"Perth watermark checkpoint not found at {checkpoint_dir}. "
             "Re-run convert_to_vllm.py so codec_native/watermark/perth is bundled."
         )
-    perth_net = PerthNet.load("implicit", models_dir=str(pretrained_dir))
+    # vLLM may construct the codec under an FP16 default; Perth consumes FP32
+    # spectrograms, so keep both its initialization and checkpoint copies FP32.
+    previous_dtype = torch.get_default_dtype()
+    try:
+        torch.set_default_dtype(torch.float32)
+        perth_net = PerthNet.load("implicit", models_dir=str(pretrained_dir))
+    finally:
+        torch.set_default_dtype(previous_dtype)
     return perth_net.to(device).eval()
 
 
@@ -175,7 +175,7 @@ class TaperedPerthWatermarker:
         dummy_lengths = (window * 4, window * 8)
         with torch.inference_mode():
             for length in dummy_lengths:
-                dummy = torch.zeros(length, device=perth_net.device)
+                dummy = torch.zeros(length, device=perth_net.device, dtype=torch.float32)
                 magnitudes, _ = perth_net.ap.signal_to_magphase(dummy.unsqueeze(0))
                 perth_net.encoder(magnitudes)
 

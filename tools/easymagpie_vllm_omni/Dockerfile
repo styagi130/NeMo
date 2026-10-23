@@ -9,7 +9,9 @@ RUN python3 -m pip wheel --no-cache-dir --no-index --no-deps --no-build-isolatio
 FROM vllm/vllm-openai:v0.26.0@sha256:ffb2d59b1c059a5bd8d781320c9f5189de8293693b7d95da54befddaa54abf52
 
 COPY tools/easymagpie_vllm_omni/requirements.txt /tmp/easymagpie-requirements.txt
-RUN python3 -m pip install --no-cache-dir -r /tmp/easymagpie-requirements.txt
+COPY tools/easymagpie_vllm_omni/requirements-perth.txt /tmp/easymagpie-perth-requirements.txt
+RUN python3 -m pip install --no-cache-dir -r /tmp/easymagpie-requirements.txt \
+    && python3 -m pip install --no-cache-dir --no-deps -r /tmp/easymagpie-perth-requirements.txt
 
 COPY --from=cairo_builder /wheels /wheels
 RUN python3 -m pip install --no-cache-dir --no-deps /wheels/pycairo-*.whl nixl-cu13==1.3.1

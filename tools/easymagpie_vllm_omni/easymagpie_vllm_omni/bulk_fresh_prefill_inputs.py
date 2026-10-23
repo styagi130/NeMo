@@ -121,7 +121,6 @@ class BulkFreshInputs:
             or self.actor_tid is not None
             and self.actor_tid != threading.get_ident()
             or getattr(runner, "has_talker_mtp", False)
-            or getattr(runner, "supports_mm_inputs", False)
             or getattr(runner, "enable_prompt_embeds", False)
             or getattr(runner, "speculative_config", None) is not None
             or getattr(runner.model_config, "is_encoder_decoder", False)
@@ -194,6 +193,7 @@ class BulkFreshInputs:
                 or computed != 0
                 or prompt_len != 71
                 or type(info) is not dict
+                or getattr(request, "mm_features", None)
                 or "additional_information" in info
                 or type(info.get("text_tokens")) is not list
                 or not info["text_tokens"]
@@ -227,11 +227,15 @@ class BulkFreshInputs:
                 or type(context) not in (str, type(None))
                 or info.get("speaker_embedding") is not None
                 or type(task) not in (int, type(None))
+                or task not in (None, 0)
+                or info.get("text") is not None
+                or info.get("text_token")
+                or info.get("speaker_reference_prefilled")
+                or info.get("user_audio_prefilled")
             ):
                 return "conditioning_metadata"
             context = context or "[EN]"
-            task = task or 0
-            task = max(0, min(task, model.num_task_embeddings - 1)) if model.task_embedding is not None else 0
+            task = 0
             key = (task, speaker, context, str(input_ids.device))
             if conditioning is None:
                 conditioning = key
@@ -371,7 +375,7 @@ class BulkFreshInputs:
             destination[:, 67:].copy_(target)
             input_ids[: b * 71].fill_(0)
             for req_id, request, info, span, start, computed, prompt_len in metadata:
-                runner._update_intermediate_buffer(req_id, {"prefill_offset": 71, "decode_offset": 4})
+                runner._update_intermediate_buffer(req_id, {"decode_offset": 4})
             self.counts["bulk_batches"] += 1
             self.counts["bulk_rows"] += b
             if input_ids.numel() > b * 71:

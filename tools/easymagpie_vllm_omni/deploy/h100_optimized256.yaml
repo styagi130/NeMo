@@ -31,7 +31,7 @@ stages:
   output_connectors:
     to_stage_1: connector_of_shared_memory
   mamba_ssm_cache_dtype: float32
-  skip_tokenizer_init: true
+  skip_tokenizer_init: false
   engine_extras:
     worker_cls: easymagpie_vllm_omni.optimized_workers.H100C256TalkerWorker
     compilation_config:

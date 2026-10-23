@@ -76,7 +76,7 @@ def make_model(tmp_path, dtype=torch.float16, *, deployed=False):
     nn.Module.__init__(model)
     model.embedding_dim = 8
     stacks = 1 if deployed else 2
-    model.arch = SimpleNamespace(text_prefill_num=4, phoneme_stacking_factor=stacks)
+    model.arch = SimpleNamespace(text_prefill_num=4, phoneme_stacking_factor=stacks, condition_on_user_speech=False)
     model.num_task_embeddings = 0 if deployed else 2
     model.task_embedding = None if deployed else nn.Embedding(2, 8, dtype=dtype)
     model.text_embedding = nn.Embedding(32, 8, dtype=dtype)
@@ -315,7 +315,7 @@ def test_metadata_mirrors_and_sampling_setters_preserve_native_row_order(monkeyp
     assert candidate.model.code_predictor.top_k == 7
     for index, key in enumerate(candidate.input_batch.req_ids):
         value = candidate.model_intermediate_buffer[key]
-        assert value["request_id"] == key and value["prefill_offset"] == 71
+        assert value["request_id"] == key and value["prefill_offset"] == 0
         assert value["decode_offset"] == 4 and value["_omni_num_computed_tokens"] == 0
         assert value["_omni_prompt_len"] == value["duplex_prompt_len"] == 71
         assert value["_omni_is_prefill"] is True
@@ -333,6 +333,42 @@ def test_original_complete_q1_hook_runs_first_and_consumes_updates_once(monkeypa
     assert candidate._batched_decode_input_requests == 3
     assert candidate.model._prepared_decode_updates == {}
     assert candidate._bulk_fresh_prefill_inputs.status()["counts"].get("bulk_rows", 0) == 0
+
+
+@pytest.mark.parametrize("multimodal", [False, True])
+def test_named_speaker_bulk_prefill_requires_no_request_multimodal_features(tmp_path, multimodal):
+    runner = empty_runner(make_model(tmp_path))
+    state = install(runner)
+    populate(runner, [info(), info()])
+    runner.supports_mm_inputs = True
+    if multimodal:
+        runner.requests["owner-0"].mm_features = [object()]
+    before = observations(runner)
+    with torch.inference_mode():
+        prepared = state.try_prepare(runner.input_ids.gpu, runner.inputs_embeds.gpu, np.array([71, 71], np.int32))
+    assert prepared is not multimodal
+    if multimodal:
+        assert observations(runner) == before
+
+
+@pytest.mark.parametrize("replacement", [{"text": "replacement"}, {"text_token": [9, 10], "text_token_start": 0}])
+def test_fresh_prefill_replaces_previous_target_text(monkeypatch, tmp_path, replacement):
+    _, candidate, _, _ = pair(monkeypatch, tmp_path, [info(**replacement), info()])
+    assert candidate._bulk_fresh_prefill_inputs.counts["bulk_rows"] == 0
+    expected = [6, 7, 31] if "text" in replacement else [9, 10]
+    assert candidate.model_intermediate_buffer["owner-0"]["text_tokens"] == expected
+
+
+def test_unsupported_task_cannot_reuse_a_warm_context(tmp_path):
+    runner = empty_runner(make_model(tmp_path, deployed=True))
+    state = install(runner)
+    populate(runner, [info(task_mode_id=1), info(task_mode_id=1)])
+    before = observations(runner)
+    with torch.inference_mode():
+        assert not state.try_prepare(runner.input_ids.gpu, runner.inputs_embeds.gpu, np.array([71, 71], np.int32))
+        with pytest.raises(ValueError, match="Only task_mode_id=0"):
+            runner.model._build_prefill_embeds(CPU, info(task_mode_id=1))
+    assert observations(runner) == before
 
 
 def test_mixed_q1_and_cold_rows_fall_back_to_entire_native_loop(monkeypatch, tmp_path):
@@ -372,14 +408,15 @@ def test_singleton_and_partial_resumed_native_fallback(monkeypatch, tmp_path):
         setup=one_token_prefill,
     )
     assert candidate.model_intermediate_buffer["owner-0"]["_omni_is_prefill"] is True
-    assert candidate.model._prepared_decode_updates == {}
+    # Prefill does not consume a decode update; the runner clears it after the batch.
+    assert candidate.model._prepared_decode_updates == {0: {"decode_offset": 1}}
     assert candidate._bulk_fresh_prefill_inputs.status()["counts"]["bulk_rows"] == 0
 
 
-def test_nested_information_and_custom_speaker_keep_native_fallback(monkeypatch, tmp_path):
+def test_nested_information_and_raw_reference_keep_native_fallback(monkeypatch, tmp_path):
     requests = [
         info(additional_information={"temperature": 0.1, "prefill_text_tokens": [1]}),
-        info(speaker_id=None, speaker_embedding=torch.full((64, 8), 0.25)),
+        info(speaker_id=None, reference_audio_num_rows=64),
     ]
     _, candidate, _, _ = pair(monkeypatch, tmp_path, requests)
     assert candidate._bulk_fresh_prefill_inputs.status()["counts"].get("bulk_rows", 0) == 0
@@ -423,9 +460,8 @@ def test_invalid_middle_row_preserves_error_and_prefix_of_native_side_effects(mo
     assert "request_id" not in b.model_intermediate_buffer["owner-2"]
     assert b._bulk_fresh_prefill_inputs.status()["counts"].get("bulk_rows", 0) == 0
 
-    # A repeated ID or shared metadata dictionary is not a valid bulk cohort:
-    # the first native row advances its prefill offset, so the second fails.
-    # The candidate must decline before touching either row.
+    # A repeated ID or shared metadata dictionary is not a valid bulk cohort.
+    # Preserve native absolute-offset processing by declining the whole batch.
     for case in ("repeated_ID", "shared_info"):
         left = empty_runner(make_model(tmp_path / case / "native"))
         right = empty_runner(make_model(tmp_path / case / "candidate"))
@@ -438,11 +474,8 @@ def test_invalid_middle_row_preserves_error_and_prefix_of_native_side_effects(mo
             else:
                 runner.model_intermediate_buffer["owner-1"] = runner.model_intermediate_buffer["owner-0"]
         with torch.inference_mode():
-            with pytest.raises(AssertionError) as expected_alias:
-                runtime.OmniGPUModelRunner._preprocess(left, *left_args)
-            with pytest.raises(type(expected_alias.value)) as actual_alias:
-                runtime.OmniGPUModelRunner._preprocess(right, *right_args)
-        assert str(actual_alias.value) == str(expected_alias.value)
+            runtime.OmniGPUModelRunner._preprocess(left, *left_args)
+            runtime.OmniGPUModelRunner._preprocess(right, *right_args)
         assert observations(left) == observations(right)
         assert right._bulk_fresh_prefill_inputs.status()["counts"].get("bulk_rows", 0) == 0
 

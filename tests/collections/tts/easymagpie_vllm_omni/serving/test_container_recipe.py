@@ -55,6 +55,7 @@ class ContainerRecipeTests(unittest.TestCase):
         )
         self.assertIn(
             'RUN python3 -m pip install --no-cache-dir --no-deps --no-build-isolation /opt/easymagpie'
+            ' && python3 /opt/easymagpie/scripts/apply_runtime_patches.py'
             ' && python3 -m pip check',
             lines,
         )
@@ -77,6 +78,7 @@ class ContainerRecipeTests(unittest.TestCase):
             values,
             {
                 'XDG_CACHE_HOME': '/tmp/easymagpie-cache',
+                'XDG_CONFIG_HOME': '/tmp/easymagpie-config',
                 'VLLM_CACHE_ROOT': '/tmp/easymagpie-vllm',
                 'TORCHINDUCTOR_CACHE_DIR': '/tmp/easymagpie-inductor',
                 'TRITON_CACHE_DIR': '/tmp/easymagpie-triton',

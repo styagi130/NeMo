@@ -77,7 +77,7 @@ python -m ipykernel install --user \
 ```
 
 The `perth` extra is required for default watermarking. `pip install -r requirements-perth.txt`
-is equivalent if you install the package without extras.
+is equivalent if you install the package without extras. The standalone Docker image includes this dependency.
 
 Mamba's selective-state-update kernel requires shape- and GPU-specific tuning, so an untuned cache can give
 suboptimal performance. Reuse the same Triton/vLLM cache directories across launches so repeated runs accumulate
@@ -85,8 +85,27 @@ better kernels; for an explicit sweep, run `python scripts/tune_mamba_ssu.py --m
 
 ### Perth watermarking
 
-EasyMagpie audio is watermarked with [Perth](https://github.com/resemble-ai/perth) after native codec decoding and before float
-PCM leaves the vLLM-Omni codec stage. Pass `NEMOTRON_TTS_PERTH_WATERMARK=0` to disable it.
+[Perth](https://github.com/resemble-ai/perth) watermarking is enabled by default,
+including the H100 C256 profile. To disable it, add this config override to codec
+stage 1 in your deployment YAML, preserving its other settings:
+
+```yaml
+stages:
+  - stage_id: 1
+    engine_extras:
+      hf_overrides:
+        watermark_enabled: false
+```
+
+Set the same value to `true` to enable it explicitly. Alternatively, set
+`"watermark_enabled"` to a boolean in `codec_native/config.json`. Strings such as
+`"false"` are rejected. The legacy `NEMOTRON_TTS_PERTH_WATERMARK` environment
+variable has no effect.
+
+Conversion bundles the pinned Perth assets and records their `watermark_checkpoint`
+path relative to the codec directory. Perth processes audio after native codec
+decoding and before float PCM leaves the codec stage. Initialization fails if
+enabled watermarking cannot load its model.
 
 ### Optimized H100 profile
 
@@ -128,7 +147,7 @@ It exports the selected optimization flags with defaults of `1`; explicit enviro
 overrides and `EASYMAGPIE_DEPLOY_CONFIG` remain available for controlled comparisons.
 Keep persistent compilation caches and run a representative workload before timing.
 
-The measured source reached a two-run C64 median of **329.22× RTFx** with zero
+With watermarking disabled, the measured source reached a two-run C64 median of **329.22× RTFx** with zero
 underruns across 8,192 requests. C128 after an additional 4,096-request warmup reached
 **415.68×**, mean TTFA **221.11 ms**, P90 **281.47 ms**, P95 **310.44 ms**, and
 2,563 affected responses out of 4,096 (62.57%) under immediate playback with no
@@ -156,7 +175,7 @@ The native builder requires a C++17 compiler (`CXX`, default `c++`). The launche
 compiles it into `EASYMAGPIE_NATIVE_CACHE_DIR` or `$XDG_CACHE_HOME/easymagpie/native`
 and creates a unique shared-publication namespace for each server.
 
-Validation on 2026-10-21: **212.82 ms P95 TTFA / 416.49× RTFx**, 4,096 measured
+Validation on 2026-10-21 with watermarking disabled: **212.82 ms P95 TTFA / 416.49× RTFx**, 4,096 measured
 requests, zero failures, 20 responses with underruns. This single H100 run used
 MPS at 100%, 16 server and six client physical CPU cores, and 512 rolling warmup
 completions before measurement. RTFx counts all audio arriving in the measured

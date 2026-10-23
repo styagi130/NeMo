@@ -102,6 +102,7 @@ class EasyMagpieCodecForConditionalGeneration(nn.Module):
         self.watermarker = create_audio_watermarker(
             vllm_config.device_config.device,
             sample_rate=self.config.output_sample_rate,
+            enabled=self.config.watermark_enabled,
             models_dir=self._watermark_models_dir(self.config, vllm_config),
         )
 

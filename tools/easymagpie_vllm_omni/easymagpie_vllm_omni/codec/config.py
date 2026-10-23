@@ -49,6 +49,7 @@ class EasyMagpieCodecConfig(PretrainedConfig):
         num_levels_per_group: list[int] | None = None,
         frame_stacking_factor: int = 2,
         output_sample_rate: int = 22050,
+        watermark_enabled: bool = True,
         watermark_checkpoint: str | None = None,
         **kwargs,
     ) -> None:
@@ -72,6 +73,7 @@ class EasyMagpieCodecConfig(PretrainedConfig):
         self.num_levels_per_group = list(num_levels_per_group or [4, 4, 4, 4, 4])
         self.frame_stacking_factor = int(frame_stacking_factor)
         self.output_sample_rate = int(output_sample_rate)
+        self.watermark_enabled = watermark_enabled
         self.watermark_checkpoint = watermark_checkpoint
         # Minimal language-model-shaped fields used by generic vLLM input allocation.
         self.vocab_size = max(self.codebook_size + 1, 2)
@@ -80,6 +82,8 @@ class EasyMagpieCodecConfig(PretrainedConfig):
 
     def validate(self) -> None:
         """Reject codec architectures the native decoder does not implement."""
+        if not isinstance(self.watermark_enabled, bool):
+            raise ValueError("watermark_enabled must be a boolean")
         positive_fields = (
             "input_dim",
             "input_filters",

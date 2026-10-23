@@ -136,7 +136,7 @@ def test_dialogue_turn_boundary_flushes_and_resets_codec_state():
     request.finished = True
     turn = talker2code2wav_async_chunk(manager, _output(2), request, is_finished=True)
 
-    torch.testing.assert_close(turn.codes.audio, torch.tensor([[1, 101], [2, 102]]))
+    torch.testing.assert_close(turn.codes.audio, torch.tensor([[1, 101], [2, 102], [-1, -1], [-1, -1]]))
     assert turn.meta.codec_streaming is False
     assert request.external_req_id not in manager._emp_seen_frames
     assert request.external_req_id not in manager._emp_request_speech_delay

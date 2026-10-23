@@ -19,6 +19,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 from easymagpie_vllm_omni.codec.model import EasyMagpieCodecForConditionalGeneration
+from easymagpie_vllm_omni.watermark import DisabledAudioWatermarker
 
 
 def _payload(frames: int, codebooks: int = 16) -> dict:
@@ -134,8 +135,10 @@ def test_payload_codes_only_trims_control_from_the_terminal_row():
 
 
 class _FakeCodec(torch.nn.Module):
+    dtype = torch.float32
+
     def forward(self, codes: torch.Tensor) -> torch.Tensor:
-        return torch.arange(codes.shape[0] * 6, dtype=torch.float32, device=codes.device)
+        return torch.arange(codes.shape[0] * 6, dtype=self.dtype, device=codes.device)
 
 
 @pytest.mark.parametrize(
@@ -145,8 +148,7 @@ class _FakeCodec(torch.nn.Module):
         ([1025, 3, 1025, 103], 6),
     ],
 )
-def test_forward_trims_terminal_control_subframes(terminal_row, expected_samples, monkeypatch):
-    monkeypatch.setenv("NEMOTRON_TTS_PERTH_WATERMARK", "0")
+def test_forward_trims_terminal_control_subframes(terminal_row, expected_samples):
     model = EasyMagpieCodecForConditionalGeneration.__new__(EasyMagpieCodecForConditionalGeneration)
     torch.nn.Module.__init__(model)
     model.config = SimpleNamespace(
@@ -190,3 +192,126 @@ def test_forward_keeps_request_offsets_when_terminal_audio_is_trimmed():
     first, second = output.multimodal_outputs["model_outputs"]
     torch.testing.assert_close(first, torch.arange(9, dtype=torch.float32))
     torch.testing.assert_close(second, torch.arange(12, 18, dtype=torch.float32))
+
+
+class _RecordingWatermarker:
+    def __init__(self):
+        self.calls = []
+
+    def apply(self, chunks):
+        self.calls.append(chunks)
+        return [chunk.audio + 100 for chunk in chunks]
+
+
+def _watermark_model(watermarker):
+    value = _model(num_stacked_codebooks=4, output_sample_rate=22050)
+    value.vllm_config = SimpleNamespace(device_config=SimpleNamespace(device=torch.device("cpu")))
+    value.codec = _FakeCodec()
+    value.codec.dtype = torch.float16
+    value.watermarker = watermarker
+    return value
+
+
+def _watermark_payload(rows, **metadata):
+    return {"codes": {"audio": torch.tensor(rows, dtype=torch.long)}, **metadata}
+
+
+@pytest.mark.parametrize("dispatch", ["native", "graphs", "groups"])
+def test_marking_follows_decode_and_trim_with_scheduled_request_identity(dispatch):
+    marker = _RecordingWatermarker()
+    value = _watermark_model(marker)
+    calls = []
+    if dispatch == "graphs":
+
+        def run(codes):
+            calls.append("graphs")
+            return value.codec(codes)
+
+        value._codec_graphs = SimpleNamespace(run=run)
+    elif dispatch == "groups":
+
+        def run(codes, frame_counts):
+            calls.append(frame_counts)
+            return value.codec(codes)
+
+        value._codec_groups = SimpleNamespace(run=run)
+    normal = [1, 2, 101, 102]
+    padding = [-1, -1, -1, -1]
+    infos = [
+        _watermark_payload([normal, normal], request_id="alpha"),
+        {"codes": "unscheduled payload must not be parsed"},
+        _watermark_payload([normal, [3, 1025, 103, 1025], padding], req_id="beta"),
+        _watermark_payload([normal, padding]),
+        _watermark_payload([padding, padding], external_req_id="empty"),
+        _watermark_payload([normal, [1025, 3, 1025, 103]], request_id="delta"),
+    ]
+    result = value.forward(
+        input_ids=torch.zeros(11, dtype=torch.long),
+        runtime_additional_information=infos,
+        request_token_spans=[(0, 2), (2, 2), (2, 5), (5, 7), (7, 9), (9, 11)],
+    ).multimodal_outputs
+    assert len(marker.calls) == 1
+    chunks = marker.calls[0]
+    assert [chunk.request_id for chunk in chunks] == ["alpha", "beta", "codec-3", "empty", "delta"]
+    assert [chunk.is_final for chunk in chunks] == [False, True, False, False, True]
+    assert [chunk.audio.numel() for chunk in chunks] == [12, 9, 6, 0, 6]
+    expected = [(0, 12), (12, 21), (30, 36), (42, 42), (54, 60)]
+    for chunk, output, (start, end) in zip(chunks, result["model_outputs"], expected, strict=True):
+        assert chunk.audio.dtype == output.dtype == torch.float32
+        torch.testing.assert_close(chunk.audio, torch.arange(start, end, dtype=torch.float32))
+        torch.testing.assert_close(output, chunk.audio + 100)
+    assert [rate.item() for rate in result["sr"]] == [22050] * 5
+    assert calls == ({"native": [], "graphs": ["graphs"], "groups": [[2, 3, 2, 2, 2]]}[dispatch])
+
+
+@pytest.mark.parametrize("marker", [None, DisabledAudioWatermarker()])
+def test_disabled_marking_keeps_original_output_and_skips_terminal_read(marker):
+    value = _watermark_model(marker)
+
+    def unexpected(*args):
+        raise AssertionError("disabled watermark read terminal codes")
+
+    value._chunk_terminal_flags = unexpected
+    result = value.forward(
+        input_ids=torch.zeros(2, dtype=torch.long),
+        codec_codes=torch.tensor([[1, 2, 101, 102], [3, 1025, 103, 1025]]),
+    ).multimodal_outputs
+    torch.testing.assert_close(result["model_outputs"][0], torch.arange(9, dtype=torch.float32))
+
+
+def test_profile_bypasses_watermark_and_terminal_reads():
+    marker = _RecordingWatermarker()
+    value = _watermark_model(marker)
+
+    def unexpected(*args):
+        raise AssertionError("profile read terminal codes")
+
+    value._chunk_terminal_flags = unexpected
+    result = value.forward(input_ids=torch.zeros(2, dtype=torch.long)).multimodal_outputs
+    assert marker.calls == []
+    torch.testing.assert_close(result["model_outputs"][0], torch.arange(12, dtype=torch.float32))
+
+
+def test_direct_codes_keep_terminal_identity_and_apply_marker():
+    marker = _RecordingWatermarker()
+    value = _watermark_model(marker)
+    result = value.forward(
+        input_ids=torch.zeros(2, dtype=torch.long),
+        codec_codes=torch.tensor([[1, 2, 101, 102], [1025, 3, 1025, 103]]),
+    ).multimodal_outputs
+    assert len(marker.calls) == 1
+    (chunk,) = marker.calls[0]
+    assert chunk.request_id == "codec-codes" and chunk.is_final
+    torch.testing.assert_close(result["model_outputs"][0], torch.arange(6, dtype=torch.float32) + 100)
+
+
+def test_empty_scheduled_batch_does_not_create_phantom_chunks():
+    marker = _RecordingWatermarker()
+    value = _watermark_model(marker)
+    result = value.forward(
+        input_ids=torch.empty(0, dtype=torch.long),
+        runtime_additional_information=[{"codes": "ignored"}],
+        request_token_spans=[(0, 0)],
+    ).multimodal_outputs
+    assert marker.calls == [[]]
+    assert result == {"model_outputs": [], "sr": []}

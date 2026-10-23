@@ -123,8 +123,10 @@ class EasyMagpieGPUARModelRunner(GPUARModelRunner):
             if use_device_state or getattr(self.model, "_prefill_graphs_enabled", False):
                 self.model.prepare_query_dispatch(starts, counts, device)
             rows, request_keys = [], []
-            for req_id, start, count in zip(req_ids, starts, counts, strict=True):
-                if count == 1:
+            for index, (req_id, start, count) in enumerate(zip(req_ids, starts, counts, strict=True)):
+                request = self.requests[req_id]
+                computed = int(self.input_batch.num_computed_tokens_cpu[index])
+                if count == 1 and computed >= len(request.prompt_token_ids or []):
                     rows.append((start, self.model_intermediate_buffer.get(req_id, {})))
                     if use_device_state:
                         request_keys.append((req_id, id(self.requests[req_id])))
@@ -167,7 +169,6 @@ class EasyMagpieGPUARModelRunner(GPUARModelRunner):
         if (
             getattr(model, "_device_decode_state", None) is None
             or getattr(self, "has_talker_mtp", False)
-            or getattr(self, "supports_mm_inputs", False)
             or getattr(self, "enable_prompt_embeds", False)
             or getattr(self, "speculative_config", None) is not None
             or getattr(self.model_config, "is_encoder_decoder", False)
