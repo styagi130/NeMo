@@ -69,18 +69,48 @@ def test_equal_length_waveforms_are_batched_and_length_is_preserved() -> None:
     torch.testing.assert_close(result[1], 0.5 + 0.125 * envelope)
 
 
-def test_perth_resample_uses_wideband_kaiser() -> None:
+def test_perth_resamplers_are_reused_with_wideband_float32_kernels() -> None:
     perth_net = _FakePerthNet()
     perth_net.hp.sample_rate = 32_000
-    fake = mock.Mock(side_effect=lambda waveform, *_args, **_kwargs: waveform)
-    with mock.patch("torchaudio.functional.resample", fake):
-        TaperedPerthWatermarker("cpu", sample_rate=22_050, perth_net=perth_net).apply(_chunks(torch.zeros(16)))
+    with mock.patch(
+        "torchaudio.transforms.Resample", side_effect=lambda *_args, **_kwargs: torch.nn.Identity()
+    ) as fake:
+        watermarker = TaperedPerthWatermarker("cpu", sample_rate=22_050, perth_net=perth_net)
+        for _ in range(2):
+            watermarker.apply(_chunks(torch.zeros(16)))
 
     assert fake.call_count == 2
+    assert [call.args for call in fake.call_args_list] == [(22_050, 32_000), (32_000, 22_050)]
     for call in fake.call_args_list:
         assert call.kwargs["resampling_method"] == "sinc_interp_kaiser"
         assert call.kwargs["lowpass_filter_width"] == 64
         assert call.kwargs["rolloff"] == 0.999
+        assert call.kwargs["dtype"] == torch.float32
+
+
+def test_cached_resampling_matches_functional_after_half_precision_construction() -> None:
+    from torchaudio.functional import resample
+
+    perth_net = _FakePerthNet()
+    perth_net.hp.sample_rate = 32_000
+    previous_dtype = torch.get_default_dtype()
+    try:
+        torch.set_default_dtype(torch.float16)
+        watermarker = TaperedPerthWatermarker("cpu", sample_rate=22_050, perth_net=perth_net)
+    finally:
+        torch.set_default_dtype(previous_dtype)
+    waveform = torch.linspace(-0.5, 0.5, 3528, dtype=torch.float32)
+    watermarker.apply(_chunks(waveform))
+    for cached in watermarker._resamplers:
+        expected = resample(
+            waveform,
+            cached.orig_freq,
+            cached.new_freq,
+            resampling_method="sinc_interp_kaiser",
+            lowpass_filter_width=64,
+            rolloff=0.999,
+        )
+        torch.testing.assert_close(cached(waveform), expected, rtol=0, atol=0)
 
 
 def test_watermark_delta_taper_preserves_chunk_edge_samples() -> None:

@@ -318,7 +318,11 @@ class EasyMagpieCodecForConditionalGeneration(nn.Module):
             and not isinstance(watermarker, DisabledAudioWatermarker)
             and (codec_codes is not None or runtime_additional_information)
         ):
-            final_flags = self._chunk_terminal_flags(codes, frame_counts, valid_sample_counts)
+            final_flags = (
+                self._chunk_terminal_flags(codes, frame_counts, valid_sample_counts)
+                if getattr(watermarker, "needs_terminal_flags", True)
+                else [False] * len(outputs)
+            )
             chunks = [
                 AudioChunk(request_id=request_id, is_final=is_final, audio=audio)
                 for request_id, is_final, audio in zip(request_ids, final_flags, outputs, strict=True)

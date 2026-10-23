@@ -19,7 +19,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 from easymagpie_vllm_omni.codec.model import EasyMagpieCodecForConditionalGeneration
-from easymagpie_vllm_omni.watermark import DisabledAudioWatermarker
+from easymagpie_vllm_omni.watermark import DisabledAudioWatermarker, TaperedPerthWatermarker
 
 
 def _payload(frames: int, codebooks: int = 16) -> dict:
@@ -277,6 +277,34 @@ def test_disabled_marking_keeps_original_output_and_skips_terminal_read(marker):
         codec_codes=torch.tensor([[1, 2, 101, 102], [3, 1025, 103, 1025]]),
     ).multimodal_outputs
     torch.testing.assert_close(result["model_outputs"][0], torch.arange(9, dtype=torch.float32))
+
+
+@pytest.mark.parametrize("source", ["direct", "scheduled"])
+def test_independent_chunk_marking_skips_unused_terminal_read(source):
+    marker = TaperedPerthWatermarker.__new__(TaperedPerthWatermarker)
+    recording = _RecordingWatermarker()
+    marker.apply = recording.apply
+    value = _watermark_model(marker)
+
+    def unexpected(*args):
+        raise AssertionError("independent-chunk watermark read terminal codes")
+
+    value._chunk_terminal_flags = unexpected
+    codes = torch.tensor([[1, 2, 101, 102], [3, 1025, 103, 1025]])
+    kwargs = (
+        {"codec_codes": codes}
+        if source == "direct"
+        else {"runtime_additional_information": [{"codes": {"audio": codes}, "request_id": "request"}]}
+    )
+    result = value.forward(input_ids=torch.zeros(2, dtype=torch.long), **kwargs).multimodal_outputs
+
+    assert marker.needs_terminal_flags is False
+    assert len(recording.calls) == 1
+    (chunk,) = recording.calls[0]
+    assert chunk.request_id == ("codec-codes" if source == "direct" else "request")
+    assert chunk.is_final is False
+    torch.testing.assert_close(chunk.audio, torch.arange(9, dtype=torch.float32))
+    torch.testing.assert_close(result["model_outputs"][0], chunk.audio + 100)
 
 
 def test_profile_bypasses_watermark_and_terminal_reads():

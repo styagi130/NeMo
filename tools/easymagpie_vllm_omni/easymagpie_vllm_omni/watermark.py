@@ -36,6 +36,8 @@ class AudioWatermarker(Protocol):
 
     Implementations may ignore ``request_id`` / ``is_final`` (tapered Perth) or
     accumulate left context keyed by ``request_id`` and flush on ``is_final``.
+    Stateless implementations can set ``needs_terminal_flags = False`` to skip
+    the codec's GPU-to-host terminal-code readback.
     """
 
     def apply(self, chunks: list[AudioChunk]) -> list[torch.Tensor]:
@@ -142,6 +144,8 @@ class TaperedPerthWatermarker:
     for overlap-save (~150 ms history and delay) without changing ``apply``.
     """
 
+    needs_terminal_flags = False
+
     def __init__(
         self,
         device: str | torch.device,
@@ -162,6 +166,7 @@ class TaperedPerthWatermarker:
                     self._warmup_compiled_encoder()
         except Exception as error:
             raise RuntimeError("Perth watermarking is enabled but its model could not be initialized") from error
+        self._resamplers: tuple[torch.nn.Module, ...] | None = None
         self._short_audio_warning_emitted = False
         logger.info(
             "Perth watermarking enabled on device=%s (model sample rate=%d)",
@@ -197,9 +202,22 @@ class TaperedPerthWatermarker:
             1,
         )
 
-        resample = None
-        if sample_rate != perth_rate:
-            from torchaudio.functional import resample
+        if sample_rate != perth_rate and self._resamplers is None:
+            from torchaudio.transforms import Resample
+
+            # Cache wideband FP32 filters during inference, outside vLLM's FP16
+            # model-construction scope. Functional resample rebuilds both each call.
+            self._resamplers = tuple(
+                Resample(
+                    source_rate,
+                    target_rate,
+                    resampling_method="sinc_interp_kaiser",
+                    lowpass_filter_width=64,
+                    rolloff=0.999,
+                    dtype=torch.float32,
+                ).to(perth_device)
+                for source_rate, target_rate in ((sample_rate, perth_rate), (perth_rate, sample_rate))
+            )
 
         length_groups: dict[int, list[int]] = {}
         for index, waveform in enumerate(waveforms):
@@ -214,16 +232,8 @@ class TaperedPerthWatermarker:
                 )
                 signals = originals
                 if sample_rate != perth_rate:
-                    assert resample is not None
-                    # Wider Kaiser than torchaudio defaults so codec highs survive 22.05 <-> 32 kHz.
-                    signals = resample(
-                        signals,
-                        sample_rate,
-                        perth_rate,
-                        resampling_method="sinc_interp_kaiser",
-                        lowpass_filter_width=64,
-                        rolloff=0.999,
-                    )
+                    assert self._resamplers is not None
+                    signals = self._resamplers[0](signals)
 
                 if signals.shape[-1] < minimum_samples:
                     if not self._short_audio_warning_emitted:
@@ -239,15 +249,8 @@ class TaperedPerthWatermarker:
                 marked_magnitudes, _ = perth_net.encoder(magnitudes)
                 marked = perth_net.ap.magphase_to_signal(marked_magnitudes, phases)
                 if sample_rate != perth_rate:
-                    assert resample is not None
-                    marked = resample(
-                        marked,
-                        perth_rate,
-                        sample_rate,
-                        resampling_method="sinc_interp_kaiser",
-                        lowpass_filter_width=64,
-                        rolloff=0.999,
-                    )
+                    assert self._resamplers is not None
+                    marked = self._resamplers[1](marked)
                 marked = _restore_length(marked, originals)
                 marked = taper_watermark_delta(
                     marked,
