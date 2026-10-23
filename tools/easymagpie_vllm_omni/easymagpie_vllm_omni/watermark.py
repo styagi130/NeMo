@@ -168,6 +168,7 @@ class TaperedPerthWatermarker:
             raise RuntimeError("Perth watermarking is enabled but its model could not be initialized") from error
         self._resamplers: tuple[torch.nn.Module, ...] | None = None
         self._short_audio_warning_emitted = False
+        self._cuda_graphs = None
         logger.info(
             "Perth watermarking enabled on device=%s (model sample rate=%d)",
             requested_device,
@@ -193,14 +194,6 @@ class TaperedPerthWatermarker:
         perth_rate = int(perth_net.hp.sample_rate)
         sample_rate = self.sample_rate
         waveforms = [chunk.audio for chunk in chunks]
-        minimum_samples = int(perth_net.hp.n_fft // 2 + 1)
-        # Perth reconstructs each chunk independently with an STFT. Tapering its
-        # perturbation across one half-window preserves the codec waveform at both
-        # edges and prevents audible seams when streaming chunks are concatenated.
-        edge_samples = max(
-            (int(perth_net.hp.n_fft) // 2 * sample_rate + perth_rate - 1) // perth_rate,
-            1,
-        )
 
         if sample_rate != perth_rate and self._resamplers is None:
             from torchaudio.transforms import Resample
@@ -230,35 +223,65 @@ class TaperedPerthWatermarker:
                 originals = torch.stack(
                     [waveforms[index].detach().float().reshape(-1).to(perth_device) for index in indices]
                 )
-                signals = originals
-                if sample_rate != perth_rate:
-                    assert self._resamplers is not None
-                    signals = self._resamplers[0](signals)
+                marked = None
+                if originals.is_cuda:
+                    if self._cuda_graphs is None:
+                        from .watermark_graphs import PerthCudaGraphs
 
-                if signals.shape[-1] < minimum_samples:
-                    if not self._short_audio_warning_emitted:
-                        logger.warning(
-                            "Skipping Perth for audio shorter than %d samples at %d Hz",
-                            minimum_samples,
-                            perth_rate,
-                        )
-                        self._short_audio_warning_emitted = True
+                        self._cuda_graphs = PerthCudaGraphs(perth_net, sample_rate)
+                    marked = self._cuda_graphs(originals, self._watermark_batch)
+                if marked is None:
+                    marked = self._watermark_batch(originals)
+                if marked is None:
                     continue
-
-                magnitudes, phases = perth_net.ap.signal_to_magphase(signals)
-                marked_magnitudes, _ = perth_net.encoder(magnitudes)
-                marked = perth_net.ap.magphase_to_signal(marked_magnitudes, phases)
-                if sample_rate != perth_rate:
-                    assert self._resamplers is not None
-                    marked = self._resamplers[1](marked)
-                marked = _restore_length(marked, originals)
-                marked = taper_watermark_delta(
-                    marked,
-                    originals,
-                    edge_samples=edge_samples,
-                ).clamp_(-1.0, 1.0)
-
                 for batch_index, waveform_index in enumerate(indices):
                     waveforms[waveform_index] = marked[batch_index].reshape(-1)
 
         return waveforms
+
+    def _watermark_batch(self, originals, *, inverse=None):
+        perth_net = self.perth_net
+        perth_rate = int(perth_net.hp.sample_rate)
+        sample_rate = self.sample_rate
+        minimum_samples = int(perth_net.hp.n_fft // 2 + 1)
+        # Perth reconstructs each chunk independently with an STFT. Tapering its
+        # perturbation across one half-window preserves the codec waveform at both
+        # edges and prevents audible seams when streaming chunks are concatenated.
+        edge_samples = max(
+            (int(perth_net.hp.n_fft) // 2 * sample_rate + perth_rate - 1) // perth_rate,
+            1,
+        )
+
+        signals = originals
+        if sample_rate != perth_rate:
+            assert self._resamplers is not None
+            signals = self._resamplers[0](signals)
+
+        if signals.shape[-1] < minimum_samples:
+            if not self._short_audio_warning_emitted:
+                logger.warning(
+                    "Skipping Perth for audio shorter than %d samples at %d Hz",
+                    minimum_samples,
+                    perth_rate,
+                )
+                self._short_audio_warning_emitted = True
+            return None
+
+        magnitudes, phases = perth_net.ap.signal_to_magphase(signals)
+        marked_magnitudes, _ = perth_net.encoder(magnitudes)
+        if inverse is None:
+            marked = perth_net.ap.magphase_to_signal(marked_magnitudes, phases)
+        else:
+            from perth.perth_net.perth_net_implicit.utils import magphase_to_cx
+
+            marked = inverse(magphase_to_cx(perth_net.hp, marked_magnitudes, phases))
+        if sample_rate != perth_rate:
+            assert self._resamplers is not None
+            marked = self._resamplers[1](marked)
+        marked = _restore_length(marked, originals)
+        marked = taper_watermark_delta(
+            marked,
+            originals,
+            edge_samples=edge_samples,
+        ).clamp_(-1.0, 1.0)
+        return marked
