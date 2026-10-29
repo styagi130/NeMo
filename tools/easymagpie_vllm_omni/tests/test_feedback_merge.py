@@ -91,8 +91,10 @@ def test_batch_merge_exact_rows_and_eos_preserves_unrelated_state(names, phoneme
         assert 'phoneme_ended' not in runner.model_intermediate_buffer[names[1]]
 
 
-def test_real_async_eager_hook_with_full_filter_hits_and_preserves_return():
+@pytest.mark.parametrize('rolling', [False, True])
+def test_real_async_eager_hook_with_full_filter_hits_and_preserves_return(rolling):
     model, runner, hidden, output = setup()
+    model.rolling_enabled = rolling
     runner._resolve_pooler_payload_req_ids = lambda names: ([], names)
     result = runner._maybe_run_eager_omni_postprocess_before_async_output(
         hidden_states=hidden,
@@ -103,7 +105,7 @@ def test_real_async_eager_hook_with_full_filter_hits_and_preserves_return():
         query_start_loc_cpu=torch.arange(4),
     )
     assert result is True
-    assert runner.get_prepost_status()['feedback_merge']['hits'] == 1
+    assert runner.get_prepost_status()['feedback_merge']['hits'] == (0 if rolling else 1)
     assert_values(runner, expected(model, runner, hidden, output))
 
 

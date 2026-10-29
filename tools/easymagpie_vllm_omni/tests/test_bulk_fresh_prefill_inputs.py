@@ -105,6 +105,8 @@ def make_model(tmp_path, dtype=torch.float16, *, deployed=False):
     speaker_rows = 65 if deployed else 64
     speaker = (torch.arange(speaker_rows * 8, dtype=torch.float32).reshape(speaker_rows, 8) - 256) / 100
     torch.save(speaker, directory / "eng.pt")
+    model._speaker_embedding_buffers = {}
+    model._preload_known_speaker_embeddings()
     with torch.no_grad():
         layers = [
             layer

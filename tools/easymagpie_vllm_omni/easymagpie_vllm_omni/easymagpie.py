@@ -29,8 +29,12 @@ one or more ``text_token`` ids per decode chunk and terminate the stream with ``
 from __future__ import annotations
 
 import bisect
+import hashlib
+import json
+import math
 import os
 from collections.abc import Callable, Iterable
+from pathlib import Path
 from typing import Any, Optional
 
 import torch
@@ -111,6 +115,8 @@ def _merge_streaming_text_chunk(
 
 # Context text used when the request omits ``context_text``
 _DEFAULT_CONTEXT_TEXT = "[EN]"
+_CONTEXT_REGISTRY_FILE = "contexts.json"
+_CONTEXT_BUNDLE_FILE = "contexts.safetensors"
 
 
 # This class is not wrapped in ``@support_torch_compile``: the Nemotron-H
@@ -151,7 +157,7 @@ class EasyMagpieTTSForConditionalGeneration(
     have_multimodal_outputs: bool = True
     use_async_omni_output: bool = True
     eager_omni_postprocess_before_async_output: bool = True
-    postprocess_uses_req_infos: bool = False
+    postprocess_uses_req_infos: bool = True
 
     # Stage 1 (Code2Wav) consumes only the sampled codes (multimodal outputs),
     # never the backbone hidden states. Opt out of attaching ``hidden`` to the
@@ -164,6 +170,7 @@ class EasyMagpieTTSForConditionalGeneration(
         "last_audio_codes",
         "last_phoneme_token",
         "phoneme_ended",
+        "rolling_tail",
     }
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
@@ -312,18 +319,13 @@ class EasyMagpieTTSForConditionalGeneration(
         # ``compute_logits``
         self._sample_stop = torch.zeros(max_num_tokens, dtype=torch.bool)
 
-        # ── Assembled prefill context embeddings (the only context cache) ──
-        # ``preprocess`` runs on the host, once per request, serially on the
-        # runner's critical path, so per-request speaker-tensor transfer + the
-        # tokenize/embed/cat dominate TTFT under concurrency. Cache the *whole*
-        # assembled context ``[task | speaker | context_text]`` per
-        # ``(task_mode_id, speaker_id, context_text, device)`` (see
-        # :meth:`_build_prefill_embeds`): for a known speaker it is identical on
-        # every request, so the cache subsumes a separate speaker-embedding table
-        # — the speaker ``.pt`` is read from disk only on the (first) cache miss
-        # for that combo (see :meth:`_load_known_speaker_embedding`), then never
-        # again. Raw-reference embeddings are owned by vLLM's multimodal cache.
+        # Cache assembled [task | speaker | context text] for known-speaker
+        # combinations. Original tensors load once; dynamic continuation
+        # tensors bypass this cache. Raw-reference audio uses vLLM's MM cache.
+        self._speaker_embedding_buffers: dict[str, str] = {}
+        self._preload_known_speaker_embeddings()
         self._prefill_cache: dict[tuple, torch.Tensor] = {}
+        self._initialize_rolling_context()
         self._max_decode_batch_size = vllm_config.scheduler_config.max_num_seqs
         self._prefill_graphs_enabled = os.environ.get("EASYMAGPIE_PREFILL_GRAPHS", "0") == "1"
         self._batched_owned_feedback_enabled = os.environ.get("EASYMAGPIE_BATCHED_OWNED_FEEDBACK", "0") == "1"
@@ -346,6 +348,186 @@ class EasyMagpieTTSForConditionalGeneration(
                 text_capacity=vllm_config.model_config.max_model_len,
                 max_tokens=max_num_tokens,
             )
+
+    def _initialize_rolling_context(self):
+        """Validate metadata against the original contexts already resident on GPU."""
+        self.rolling_enabled = False
+        self.rolling_total_frames = None
+        self.rolling_original_has_audio = {}
+        self.rolling_tail_limit = None
+        path = Path(self.model_path) / "rolling_context"
+        if not path.exists():
+            return
+        config = json.loads((path / "config.json").read_text())
+        if config.get("schema_version") != 5:
+            raise ValueError("rolling context requires schema 5; rebuild the bundle for direct embeddings")
+        total, limit, fps = (config.get(key) for key in ("total_frames", "max_generated_frames", "frames_per_second"))
+        if (
+            type(total) is not int
+            or type(limit) is not int
+            or not 0 < limit < total
+            or type(fps) not in (int, float)
+            or not math.isfinite(fps)
+            or fps <= 0
+            or config.get("total_duration_seconds") != total / fps
+            or config.get("embedding_dim") != self.embedding_dim
+        ):
+            raise ValueError("invalid rolling context duration or embedding width")
+        flags, initial = config.get("original_has_audio", {}), config.get("initial_contexts", {})
+        if (
+            not isinstance(flags, dict)
+            or not isinstance(initial, dict)
+            or set(flags) != set(self._speaker_embedding_buffers)
+            or set(initial) != set(flags)
+            or any(type(value) is not bool for value in flags.values())
+        ):
+            raise ValueError("original context metadata disagrees with resident voices")
+        for voice, name in self._speaker_embedding_buffers.items():
+            saved = getattr(self, name)
+            original = initial[voice]
+            # Preflight validates raw saved hashes before the normal serving cast.
+            # A resident FP16/BF16 tensor cannot reproduce its source FP32 hash.
+            digest = (
+                hashlib.sha256(saved.detach().cpu().contiguous().numpy().tobytes()).hexdigest()
+                if saved.dtype == torch.float32
+                else None
+            )
+            if (
+                not isinstance(original, dict)
+                or saved.shape[0] < 2
+                or (not flags[voice] and saved.shape[0] != 2)
+                or original.get("rows") != saved.shape[0]
+                or (digest is not None and original.get("sha256") != digest)
+            ):
+                raise ValueError(f"complete saved context differs from rolling metadata for {voice!r}")
+        self.rolling_total_frames = total
+        self.rolling_tail_limit = limit
+        self.rolling_original_has_audio = flags
+        self.rolling_enabled = True
+
+    def _validate_rolling_request(self, info_dict):
+        """Validate rolling inputs before the normal prefill/decode dispatch."""
+        n = info_dict.get("context_tail_tokens", 0)
+        if not n:
+            return
+        if not self.rolling_enabled:
+            raise ValueError("rolling context requested without exported saved-context metadata")
+        if type(n) is not int or not 0 < n <= self.rolling_tail_limit:
+            raise ValueError("requested generated tail exceeds the exported frame limit")
+        voice = info_dict.get("rolling_voice")
+        if voice not in self.rolling_original_has_audio:
+            raise ValueError(f"no saved reference context for {voice!r}")
+
+    @torch.inference_mode()
+    def _update_rolling_context(self, multimodal_outputs, info, update):
+        """At acoustic EOS, return the next tensor through the existing output map."""
+        n = int(info.get("context_tail_tokens", 0))
+        if not n or info.get("_omni_is_prefill", False) or info.get("rolling_ended"):
+            return update
+        if "decode_offset" in info and int(info["decode_offset"]) - 1 < self.speech_delay:
+            return update
+        codes = update.get("last_audio_codes")
+        if codes is None:
+            return update
+        tail, ended = _append_rolling_tail(
+            info.get("rolling_tail"),
+            codes,
+            codebooks=self.arch.num_audio_codebooks,
+            stacking_factor=self.arch.frame_stacking_factor,
+            eos_id=self.arch.audio_eos_id,
+            maximum=n,
+        )
+        update["rolling_tail"] = tail
+        if not ended:
+            return update
+        update["rolling_ended"] = True
+        voice = info["rolling_voice"]
+        saved = getattr(self, self._speaker_embedding_buffers[voice])
+        speaker = _build_rolling_context(
+            saved,
+            tail,
+            embed_audio=self.code_predictor.embed_audio_frame,
+            codebook_size=self.arch.codebook_size,
+            stacking_factor=self.arch.frame_stacking_factor,
+            total_frames=self.rolling_total_frames,
+            has_audio=self.rolling_original_has_audio[voice],
+        )
+        # Eager postprocess precedes the runner's request-specific async D2H snapshot.
+        # AsyncOmni may suffix the public request ID. Route by the runner's
+        # authoritative ID; direct EngineCore callers retain their supplied key.
+        request_id = info.get("request_id", info["rolling_request_key"])
+        multimodal_outputs.setdefault("rolling_contexts", {})[request_id] = speaker
+        return update
+
+    def _register_speaker_embedding(self, speaker_id: str, embedding: torch.Tensor) -> None:
+        if not isinstance(embedding, torch.Tensor) or embedding.ndim != 2:
+            raise RuntimeError(
+                f"EasyMagpieTTS speaker {speaker_id!r} must have a 2-D (T_audio, embedding_dim) tensor, "
+                f"got {type(embedding).__name__}"
+            )
+        if embedding.shape[0] <= 0 or embedding.shape[1] != self.embedding_dim:
+            raise RuntimeError(
+                f"EasyMagpieTTS speaker {speaker_id!r} has incompatible shape {tuple(embedding.shape)}; "
+                f"expected (*, {self.embedding_dim})"
+            )
+        if not bool(torch.isfinite(embedding).all()):
+            raise RuntimeError(f"EasyMagpieTTS speaker {speaker_id!r} contains non-finite values")
+        buffer_name = f"_speaker_context_{len(self._speaker_embedding_buffers)}"
+        self.register_buffer(
+            buffer_name,
+            embedding.to(device=self._combined_embeddings.device, dtype=self._combined_embeddings.dtype),
+            persistent=False,
+        )
+        self._speaker_embedding_buffers[speaker_id] = buffer_name
+
+    def _preload_known_speaker_embeddings(self) -> None:
+        """Load every bundle-defined speaker tensor during Stage-0 initialization."""
+        speaker_dir = Path(self.model_path) / "speaker_embeddings"
+        registry_path = speaker_dir / _CONTEXT_REGISTRY_FILE
+        bundle_path = speaker_dir / _CONTEXT_BUNDLE_FILE
+        if registry_path.exists() or bundle_path.exists():
+            if not registry_path.is_file() or not bundle_path.is_file():
+                raise RuntimeError(
+                    "EasyMagpieTTS requires both speaker_embeddings/contexts.json and "
+                    "speaker_embeddings/contexts.safetensors"
+                )
+            registry = json.loads(registry_path.read_text())
+            contexts = registry.get("contexts")
+            if registry.get("schema_version") != 1 or not isinstance(contexts, dict) or not contexts:
+                raise RuntimeError("EasyMagpieTTS context registry is invalid")
+            from safetensors.torch import load_file
+
+            tensors = load_file(bundle_path, device="cpu")
+            expected_keys = set()
+            for speaker_id in sorted(contexts):
+                entry = contexts[speaker_id]
+                if not isinstance(entry, dict):
+                    raise RuntimeError(f"EasyMagpieTTS context registry entry {speaker_id!r} is invalid")
+                tensor_key = entry.get("tensor_key")
+                context_text = entry.get("context_text")
+                prompt_len = entry.get("prompt_len")
+                if (
+                    not isinstance(tensor_key, str)
+                    or not isinstance(context_text, str)
+                    or not context_text
+                    or not isinstance(prompt_len, int)
+                    or prompt_len <= 0
+                ):
+                    raise RuntimeError(f"EasyMagpieTTS context registry entry {speaker_id!r} is invalid")
+                expected_keys.add(tensor_key)
+                if tensor_key not in tensors:
+                    raise RuntimeError(
+                        f"EasyMagpieTTS context tensor key {tensor_key!r} for speaker {speaker_id!r} is missing"
+                    )
+                self._register_speaker_embedding(speaker_id, tensors[tensor_key])
+            if set(tensors) != expected_keys:
+                raise RuntimeError("EasyMagpieTTS context bundle keys do not match contexts.json")
+        else:
+            for path in sorted(speaker_dir.glob("*.pt")):
+                loaded = torch.load(path, map_location="cpu", weights_only=True)
+                embedding = loaded["speaker_encoding"] if isinstance(loaded, dict) else loaded
+                self._register_speaker_embedding(path.stem, embedding)
+        logger.info("EasyMagpieTTS preloaded %d speaker context tensor(s)", len(self._speaker_embedding_buffers))
 
     # ------------------------------------------------------------------
     # Embedding helpers
@@ -900,6 +1082,7 @@ class EasyMagpieTTSForConditionalGeneration(
                 merged.setdefault(k, v)
             info_dict = merged
 
+        self._validate_rolling_request(info_dict)
         device = input_ids.device
         span_len = int(input_ids.shape[0])
         if span_len <= 0:
@@ -952,8 +1135,10 @@ class EasyMagpieTTSForConditionalGeneration(
         continuing_reference_prefill = (
             reference_prefilled and reference_prompt_len > 0 and offset < reference_prompt_len
         )
-        uses_raw_reference = not info_dict.get("speaker_id") and (
-            not reference_prefilled or continuing_reference_prefill
+        uses_raw_reference = (
+            not info_dict.get("speaker_id")
+            and info_dict.get("speaker_embedding") is None
+            and (not reference_prefilled or continuing_reference_prefill)
         )
         reference_rows = 0
 
@@ -1253,7 +1438,8 @@ class EasyMagpieTTSForConditionalGeneration(
         from the per-request inputs:
 
         * ``speaker_id`` — identifies a known speaker whose embedding is stored
-          in the converted artifact.
+          in the converted artifact. A supplied ``speaker_embedding`` replaces
+          that tensor for this request and bypasses the prefill cache.
         * ``context_text`` — a plain string (e.g. ``"[EN]"``); tokenized in-model
           and embedded through the baked per-subword ``text_embedding`` table.
         * ``task_mode_id`` — must be row 0; the default task ("service token")
@@ -1270,12 +1456,13 @@ class EasyMagpieTTSForConditionalGeneration(
         cached instance is safe.
         """
         speaker_id = info_dict.get("speaker_id")
-        if not speaker_id:
+        dynamic = info_dict.get("speaker_embedding")
+        if not speaker_id and dynamic is None:
             raise ValueError("Known-speaker prefill requires additional_information.speaker_id")
         context_text = info_dict.get("context_text") or _DEFAULT_CONTEXT_TEXT
         task_mode_id = self._require_default_task_mode(info_dict)
 
-        cache_key = (task_mode_id, speaker_id, context_text, str(device))
+        cache_key = (task_mode_id, speaker_id, context_text, str(device)) if dynamic is None else None
         cached = self._prefill_cache.get(cache_key)
         if cached is not None:
             if not include_text_prefill:
@@ -1291,8 +1478,15 @@ class EasyMagpieTTSForConditionalGeneration(
             task_row = self.task_embedding(torch.tensor([task_mode_id], device=device, dtype=torch.long))
             parts.append(task_row.to(dtype))
 
-        # Speaker-encoded context audio stored in the converted checkpoint.
-        parts.append(self._load_known_speaker_embedding(speaker_id, device, dtype))
+        if dynamic is None:
+            parts.append(self._load_known_speaker_embedding(speaker_id, device, dtype))
+        else:
+            dynamic = torch.as_tensor(dynamic, device=device, dtype=dtype)
+            if dynamic.ndim != 2 or dynamic.shape[0] < 2 or dynamic.shape[1] != self.embedding_dim:
+                raise ValueError("speaker_embedding must have shape [context rows >= 2, embedding_dim]")
+            if not bool(torch.isfinite(dynamic).all()):
+                raise ValueError("speaker_embedding contains non-finite values")
+            parts.append(dynamic)
 
         # Context text: tokenized in-model and embedded through the baked table.
         ctx_ids = self._encode_context_text(context_text, device)
@@ -1300,7 +1494,8 @@ class EasyMagpieTTSForConditionalGeneration(
             parts.append(self.text_embedding(ctx_ids).to(dtype))
 
         embeds = torch.cat(parts, dim=0)
-        self._prefill_cache[cache_key] = embeds
+        if cache_key is not None:
+            self._prefill_cache[cache_key] = embeds
         if not include_text_prefill:
             return embeds
         target_prefill = self._build_text_prefill_embeds(device, dtype, info_dict)
@@ -1352,35 +1547,16 @@ class EasyMagpieTTSForConditionalGeneration(
         return task_mode_id
 
     def _load_known_speaker_embedding(self, speaker_id: str, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-        """Read one known speaker's embedding from ``<model_path>/speaker_embeddings/<id>.pt``.
-
-        The file holds either a bare ``(T_audio, embedding_dim)`` tensor or a dict
-        with a ``speaker_encoding`` key (the converter/caller layout); it is moved
-        to ``device`` in model dtype. Called only on a prefill-cache miss, so each
-        known speaker is read at most once per ``(context_text, task)`` combo and
-        the result is then baked into ``self._prefill_cache``. Read from disk (not
-        via :meth:`load_weights`) so known speakers work even under
-        ``--load-format dummy``, which skips weight loading.
-        """
-        import glob
-        import os
-
-        spk_dir = os.path.join(self.model_path, "speaker_embeddings")
-        path = os.path.join(spk_dir, f"{speaker_id}.pt")
-        if not os.path.exists(path):
-            known = sorted(os.path.splitext(os.path.basename(p))[0] for p in glob.glob(os.path.join(spk_dir, "*.pt")))
+        """Return a known speaker tensor that was loaded during initialization."""
+        buffer_name = self._speaker_embedding_buffers.get(speaker_id)
+        if buffer_name is None:
+            known = sorted(self._speaker_embedding_buffers)
             raise AssertionError(
                 f"EasyMagpieTTS preprocess got unknown speaker_id {speaker_id!r}; known speakers: {known}. "
-                "Register it under the checkpoint's speaker_embeddings/ dir, or supply raw reference audio."
+                "Register it in the checkpoint context bundle, or pass a raw speaker_embedding "
+                "tensor for a custom voice."
             )
-        loaded = torch.load(path, map_location="cpu")
-        embedding = loaded["speaker_encoding"] if isinstance(loaded, dict) else loaded
-        assert isinstance(embedding, torch.Tensor) and embedding.ndim == 2, (
-            f"EasyMagpieTTS: speaker embedding {path} must be a 2-D (T_audio, embedding_dim) tensor; "
-            f"got {type(embedding).__name__}"
-            + (f" with ndim={embedding.ndim}" if isinstance(embedding, torch.Tensor) else "")
-        )
-        return embedding.to(device=device, dtype=dtype)
+        return getattr(self, buffer_name).to(device=device, dtype=dtype)
 
     def _maybe_set_lt_sampling_params(self, info_dict: dict[str, Any]) -> None:
         """Apply per-request audio sampling params to the local transformer.
@@ -1485,6 +1661,19 @@ class EasyMagpieTTSForConditionalGeneration(
         """
         import json
         import os
+
+        registry_path = os.path.join(model_path, "speaker_embeddings", _CONTEXT_REGISTRY_FILE)
+        if os.path.isfile(registry_path):
+            with open(registry_path, encoding="utf-8") as stream:
+                registry = json.load(stream)
+            entry = registry.get("contexts", {}).get(speaker_id)
+            if entry is None:
+                raise FileNotFoundError(f"EasyMagpieTTS: no context for speaker_id {speaker_id!r}")
+            # The stored length includes the registry's original style text.
+            # Preserve the existing API's context_text override and size it exactly.
+            original_text_rows = len(list(tokenize(entry["context_text"])))
+            context_rows = len(list(tokenize(context_text or _DEFAULT_CONTEXT_TEXT)))
+            return int(entry["prompt_len"]) - original_text_rows + context_rows
 
         path = os.path.join(model_path, "speaker_embeddings", f"{speaker_id}.pt")
         if not os.path.exists(path):
@@ -1736,7 +1925,9 @@ class EasyMagpieTTSForConditionalGeneration(
         """Discard host preparation results before request rows can be reused."""
         self._prepared_decode_updates: dict[int, dict[str, Any]] = {}
 
-    def postprocess(self, hidden_states: torch.Tensor, multimodal_outputs: Optional[dict[str, Any]] = None, **_: Any):
+    def postprocess(
+        self, hidden_states: torch.Tensor, multimodal_outputs: Optional[dict[str, Any]] = None, **info: Any
+    ):
         """Stash the last frame's codes (and phoneme) for the next decode step."""
         if hidden_states.numel() == 0:
             return {}
@@ -1762,7 +1953,7 @@ class EasyMagpieTTSForConditionalGeneration(
             if getattr(self, "_batched_owned_feedback_enabled", False):
                 owned = owned_feedback_outputs(audio_codes, last)
                 if owned is not None:
-                    return owned
+                    return self._update_rolling_context(multimodal_outputs, info, owned)
             out["last_audio_codes"] = audio_codes[last : last + 1].detach()
         if self.has_phoneme:
             # The runner takes an owning copy before the next model invocation.
@@ -1772,7 +1963,7 @@ class EasyMagpieTTSForConditionalGeneration(
             ended = device_state.ended_for_row(last)
             if ended is not None:
                 out["phoneme_ended"] = ended
-        return out
+        return self._update_rolling_context(multimodal_outputs, info, out)
 
     # ------------------------------------------------------------------
     # weight loading
@@ -1873,3 +2064,59 @@ class EasyMagpieTTSForConditionalGeneration(
 
         logger.info("Loaded %d weights for EasyMagpieTTSForConditionalGeneration", len(loaded))
         return loaded
+
+
+def _append_rolling_tail(previous, stacked_rows, *, codebooks, stacking_factor, eos_id, maximum):
+    """Keep the last valid frames strictly BEFORE the first EOS in any codebook.
+
+    One time position across all codebooks is one context token. In particular,
+    EOS in the first half of a stacked row excludes its second half as well.
+    The boolean reports EOS even when it leaves an empty valid prefix.
+    """
+    if maximum <= 0 or stacked_rows.ndim != 2:
+        raise ValueError("context_tail_tokens must be positive and codes must be [rows, C*S]")
+    frames = stacked_rows.reshape(-1, codebooks, stacking_factor).permute(1, 0, 2)
+    frames = frames.reshape(codebooks, -1).long()
+    stops = (frames == eos_id).any(dim=0).nonzero().flatten()
+    ended = bool(stops.numel())
+    if ended:
+        frames = frames[:, : int(stops[0])]
+    if previous is not None:
+        frames = torch.cat((previous, frames), dim=-1)
+    return frames[:, -maximum:].contiguous(), ended
+
+
+def _context_codes(codes, *, bos_id, eos_id, stacking_factor):
+    """Match NeMo's context BOS/EOS insertion and BOS-preserving frame stacking."""
+    if codes.ndim != 2 or codes.shape[0] == 0 or stacking_factor <= 0:
+        raise ValueError("context codes must be [nonempty codebooks, frames]")
+    channels = codes.shape[0]
+    body = torch.cat((codes, codes.new_full((channels, 1), eos_id)), dim=-1)
+    tail = (-body.shape[-1]) % stacking_factor
+    body = torch.nn.functional.pad(body, (0, tail), value=eos_id)
+    body = body.reshape(channels, -1, stacking_factor).permute(0, 2, 1)
+    body = body.reshape(channels * stacking_factor, -1)
+    bos = codes.new_full((channels * stacking_factor, 1), bos_id)
+    return torch.cat((bos, body), dim=-1)
+
+
+@torch.inference_mode()
+def _build_rolling_context(saved, tail, *, embed_audio, codebook_size, stacking_factor, total_frames, has_audio):
+    """Keep reference rows unchanged and append native generated-code embeddings.
+
+    A saved encoded row cannot be split into raw codec frames. Round the
+    reference share up to whole rows and cap at the available saved payload.
+    The caller supplies only valid, EOS-excluded, bounded model-namespace codes.
+    """
+    if tail.ndim != 2 or bool(((tail < 0) | (tail >= codebook_size)).any()):
+        raise ValueError("invalid generated model-namespace payload codes")
+    if not tail.shape[1]:
+        return saved
+    wrapped = _context_codes(tail, bos_id=codebook_size + 2, eos_id=codebook_size + 3, stacking_factor=stacking_factor)
+    embedded = embed_audio(wrapped.T.long()).float()
+    if not has_audio:
+        return embedded.contiguous()
+    requested = total_frames - tail.shape[1]
+    payload_rows = min(math.ceil(requested / stacking_factor), saved.shape[0] - 2)
+    # Keep the saved BOS; remove only the generated BOS, retaining context EOS.
+    return torch.cat((saved[: 1 + payload_rows], embedded[1:]), dim=0).contiguous()

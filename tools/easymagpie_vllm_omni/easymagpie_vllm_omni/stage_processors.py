@@ -291,22 +291,21 @@ def _persistent_list_state(transfer_manager: Any, attr: str) -> dict:
     return state
 
 
-def _is_true_request_finish(request: Any) -> bool:
-    """True only at the real end of the utterance, not at a segment stop.
+def _is_true_request_finish(request: Any, is_finished: bool | None = None) -> bool:
+    """Honor the snapshot's completion signal, excluding resumable segments.
 
-    Mirrors the transfer adapter's own ``request.is_finished() and not
-    request.resumable`` rule: a resumable streaming request reports
-    ``is_finished()`` at every segment boundary while still expecting more
-    input, so it must not be treated as the terminal finish.
+    Mutable request status may have advanced before an earlier queued snapshot
+    is sent. Direct callers without a captured signal use the current status.
     """
-    return bool(getattr(request, "is_finished", lambda: False)()) and not bool(getattr(request, "resumable", False))
+    finished = request.is_finished() if is_finished is None else is_finished
+    return bool(finished) and not bool(getattr(request, "resumable", False))
 
 
 def talker2code2wav_async_chunk(
     transfer_manager: Any,
     multimodal_output: OmniPayload | dict[str, Any] | None,
     request: Any,
-    is_finished: bool = False,
+    is_finished: bool | None = None,
 ) -> OmniPayloadStruct | None:
     """Emit newly generated time-major codec rows to the stateful native codec.
 
@@ -324,8 +323,8 @@ def talker2code2wav_async_chunk(
     # Queued sends outlive Request status changes; use their captured finish flags.
     send_finish = getattr(transfer_manager, "_easymagpie_send_finish", None)
     if send_finish is None:
-        finished = bool(is_finished or request.is_finished())
-        true_finished = _is_true_request_finish(request)
+        finished = bool(request.is_finished() if is_finished is None else is_finished)
+        true_finished = _is_true_request_finish(request, finished)
     else:
         true_finished, segment_finished = send_finish
         finished = bool(true_finished or segment_finished)

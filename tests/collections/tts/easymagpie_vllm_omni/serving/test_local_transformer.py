@@ -221,3 +221,49 @@ def test_code_loop_cuda_graph_replay_matches_full_buffer(batch_size):
         with torch.no_grad():
             expected = _full_buffer_codes(cp, hidden, noise, temperature)
         assert torch.equal(actual, expected)
+
+
+@pytest.mark.unit
+def test_temperature_updates_sampling_buffer_before_forward():
+    """Host-side updates must reach the stable graph input before any forward call."""
+    cp, _ = _build_predictor(ARCH_PROFILES["equal_dims"])
+    address = cp._temperature_buf.data_ptr()
+    assert cp._temperature_buf.item() == pytest.approx(0.7)
+
+    for temperature in (0.3, 1.1, 0.0, 0.7):
+        cp.temperature = temperature
+        assert cp.temperature == temperature
+        assert cp._temperature_buf.data_ptr() == address
+        assert cp._temperature_buf.item() == pytest.approx(max(temperature, 1e-4))
+
+
+@pytest.mark.unit
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph regression requires a GPU")
+def test_temperature_changes_survive_outer_cuda_graph_replay(monkeypatch):
+    """An outer graph must not restore the warmup temperature on each replay."""
+    with torch.device("cuda"):
+        cp, arch = _build_predictor(ARCH_PROFILES["equal_dims"])
+        dec_hidden = torch.ones(2, arch.hidden_dim)
+    # Keep graph coverage focused on generate_codes' staging, independent of
+    # stochastic code selection or local-transformer compilation.
+    monkeypatch.setattr(
+        cp._code_loop, "forward", lambda hidden, noise, temperature: hidden[:, : cp.num_codebooks] / temperature
+    )
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            cp.generate_codes(dec_hidden)
+    stream.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        output = cp.generate_codes(dec_hidden)
+    address = cp._temperature_buf.data_ptr()
+
+    for temperature in (0.7, 0.3, 1.1, 0.7):
+        cp.temperature = temperature
+        graph.replay()
+        torch.cuda.synchronize()
+        assert cp._temperature_buf.data_ptr() == address
+        assert cp._temperature_buf.item() == pytest.approx(temperature)
+        torch.testing.assert_close(output, torch.full_like(output, 1.0 / temperature))

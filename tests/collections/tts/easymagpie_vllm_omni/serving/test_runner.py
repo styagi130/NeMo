@@ -22,10 +22,10 @@ import numpy as np
 import pytest
 import torch
 import yaml
-
 from conftest import EASYMAGPIE_ROOT
 from easymagpie_vllm_omni.easymagpie import EasyMagpieTTSForConditionalGeneration
 from easymagpie_vllm_omni.runner import EasyMagpieGPUARModelRunner, merge_streaming_additional_information
+from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
 
 WORKER_CLS = "easymagpie_vllm_omni.runner.EasyMagpieGPUARWorker"
 
@@ -218,3 +218,16 @@ def test_offline_demo_reuses_one_engine_with_self_contained_requests():
     assert "ASSISTANT_TURN_1_TEXT" in source
     assert "ASSISTANT_TURN_2_TEXT" in source
     assert "class MultiturnInput" not in source
+
+
+def test_rolling_contexts_are_selected_per_request(monkeypatch):
+    monkeypatch.setattr(GPUARModelRunner, "_build_omni_mm_payload", lambda self, *, mm_cpu, **kwargs: dict(mm_cpu))
+    runner = object.__new__(EasyMagpieGPUARModelRunner)
+    a, b = torch.ones(3, 4), torch.zeros(5, 4)
+    mm = {"rolling_contexts": {"a": a, "b": b}, "codes.audio": torch.ones(2, 8)}
+    for rid, expected in (("a", a), ("b", b)):
+        result = runner._build_omni_mm_payload(mm_cpu=mm, rid=rid)
+        assert set(result) == {"codes.audio", "model_outputs.rolling_context"}
+        torch.testing.assert_close(result["model_outputs.rolling_context"], expected)
+        assert result["model_outputs.rolling_context"].data_ptr() != expected.data_ptr()
+    assert set(runner._build_omni_mm_payload(mm_cpu=mm, rid="other")) == {"codes.audio"}
