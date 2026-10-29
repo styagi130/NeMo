@@ -267,7 +267,7 @@ class EasyMagpieGPUARModelRunner(GPUARModelRunner):
         req_ids=None,
         query_start_loc_cpu=None,
     ):
-        if try_merge_feedback(
+        if not getattr(self.get_model(), "rolling_enabled", False) and try_merge_feedback(
             self,
             hidden_states,
             multimodal_outputs,
@@ -351,6 +351,16 @@ class EasyMagpieGPUARModelRunner(GPUARModelRunner):
             setattr(self.requests[req_id], "additional_information_cpu", merged)
 
         return super()._update_streaming_request(req_id, new_req_data)
+
+    def _build_omni_mm_payload(self, *, mm_cpu, rid, **kwargs):
+        # Keep each EOS continuation tensor on its own request and off the codec connector.
+        contexts = (mm_cpu or {}).get("rolling_contexts", {})
+        context = contexts.get(rid)
+        clean = {key: value for key, value in (mm_cpu or {}).items() if key != "rolling_contexts"}
+        result = super()._build_omni_mm_payload(mm_cpu=clean, rid=rid, **kwargs)
+        if context is not None:
+            result["model_outputs.rolling_context"] = context.clone()
+        return result
 
 
 class EasyMagpieGPUARWorker(GPUARWorker):

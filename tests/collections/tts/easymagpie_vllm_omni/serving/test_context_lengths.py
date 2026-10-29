@@ -32,7 +32,7 @@ from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
 _LONG_CONTEXT = " ".join(f"word{i}" for i in range(25))
 
 
-def _context_fixture(tmp_path, num_tasks=0):
+def _context_fixture(tmp_path, num_tasks=0, bundle=False):
     tokenizer = Tokenizer(models.WordLevel({"[UNK]": 0, "[": 1, "EN": 2, "]": 3}, unk_token="[UNK]"))
     tokenizer.pre_tokenizer = pre_tokenizers.Whitespace()
     tokenizer = EasyMagpieTextTokenizer(PreTrainedTokenizerFast(tokenizer_object=tokenizer), text_vocab_size=128)
@@ -42,6 +42,18 @@ def _context_fixture(tmp_path, num_tasks=0):
     torch.save(
         {"speaker_encoding": torch.arange(12, dtype=torch.float32).view(4, 3)}, tmp_path / "speaker_embeddings/eng.pt"
     )
+    if bundle:
+        from safetensors.torch import save_file
+
+        save_file(
+            {"eng": torch.arange(12, dtype=torch.float32).view(4, 3)},
+            tmp_path / "speaker_embeddings/contexts.safetensors",
+        )
+        registry = {
+            "schema_version": 1,
+            "contexts": {"eng": {"tensor_key": "eng", "context_text": "[EN]", "prompt_len": 7 + bool(num_tasks)}},
+        }
+        (tmp_path / "speaker_embeddings/contexts.json").write_text(json.dumps(registry))
     (tmp_path / "config.json").write_text(json.dumps({"num_task_embeddings": num_tasks}))
     adapter = _build_adapter_cls()(SimpleNamespace(engine_client=None))
     adapter._model_path_cache = str(tmp_path)
@@ -54,6 +66,8 @@ def _context_fixture(tmp_path, num_tasks=0):
     model.embedding_dim = 3
     model._combined_embeddings = torch.zeros(1, 3)
     model._prefill_cache = {}
+    model._speaker_embedding_buffers = {}
+    model._preload_known_speaker_embeddings()
     model._text_tokenizer = tokenizer
     model.task_embedding = torch.nn.Embedding(num_tasks, 3) if num_tasks else None
     model.num_task_embeddings = num_tasks
@@ -66,8 +80,9 @@ def _context_fixture(tmp_path, num_tasks=0):
 
 @pytest.mark.parametrize("num_tasks", [0, 2])
 @pytest.mark.parametrize("context_text", ["[EN]", _LONG_CONTEXT, None, ""])
-def test_http_context_length_matches_exact_model_prefill(tmp_path, num_tasks, context_text):
-    adapter, model = _context_fixture(tmp_path, num_tasks)
+@pytest.mark.parametrize("bundle", [False, True])
+def test_http_context_length_matches_exact_model_prefill(tmp_path, num_tasks, context_text, bundle):
+    adapter, model = _context_fixture(tmp_path, num_tasks, bundle=bundle)
     request = OpenAICreateSpeechRequest(
         input="one two three four five", voice="eng", extra_params={"context_text": context_text}
     )
