@@ -1066,14 +1066,15 @@ class EasyMagpieTTSForConditionalGeneration(
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
         """Build per-request ``(input_ids, inputs_embeds)`` for this step.
 
-        Prefill (as marked by vLLM-Omni): assemble the full context embedding
+        Context/audio prefill: assemble the full context embedding
         (``[task_embedding | speaker_embedding | context_text_embedded]`` from
         the per-request inputs; see :meth:`_build_prefill_embeds`), slice this
         chunk out of it, and return it;
         ``input_ids`` are placeholders. Decode (``span_len == 1``): write the per-token decode
         inputs (previous codes, current text token, previous phoneme) into the
         model buffers at ``start`` and return a zero embedding that
-        :meth:`forward` accumulates into.
+        :meth:`forward` accumulates into. A text-only streaming resume uses
+        decode even when vLLM-Omni marks its dummy prompt row as prefill.
         """
         nested = info_dict.get("additional_information")
         if isinstance(nested, dict):
@@ -1089,7 +1090,16 @@ class EasyMagpieTTSForConditionalGeneration(
             base = input_embeds if input_embeds is not None else self.embed_input_ids(input_ids)
             return input_ids, base, {}
 
-        if bool(info_dict["_omni_is_prefill"]):
+        # A text-only resume appends a dummy prompt row after retained output.
+        # The runner marks its absolute position so it can use decode feedback
+        # without changing real (including one-row) context/audio prefills.
+        resume_offset = info_dict.get("_easymagpie_text_resume_offset")
+        is_text_resume = (
+            span_len == 1
+            and resume_offset is not None
+            and int(info_dict["_omni_num_computed_tokens"]) == resume_offset
+        )
+        if bool(info_dict["_omni_is_prefill"]) and not is_text_resume:
             return self._preprocess_prefill(input_ids, input_embeds, span_len, device, info_dict)
 
         start = self._batch_slot_offset(input_ids, start)

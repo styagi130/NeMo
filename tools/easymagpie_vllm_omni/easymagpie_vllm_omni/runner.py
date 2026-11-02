@@ -342,11 +342,28 @@ class EasyMagpieGPUARModelRunner(GPUARModelRunner):
     def _update_streaming_request(self, req_id, new_req_data):
         payload = getattr(new_req_data, "additional_information", None)
         incoming = deserialize_additional_information(payload)
+        cached = self.model_intermediate_buffer.get(req_id, {})
+        # This marker belongs only to the latest input update, never a later
+        # user-audio turn or a replay of the retained context.
+        cached.pop("_easymagpie_text_resume_offset", None)
         if isinstance(incoming, dict) and incoming:
             model = getattr(self, "model", None)
             accumulated_keys = getattr(model, "streaming_accumulated_keys", set())
-            cached = self.model_intermediate_buffer.get(req_id, {})
             merged = merge_streaming_additional_information(cached, incoming, accumulated_keys)
+            prompt_ids = new_req_data.prompt_token_ids or []
+            computed = new_req_data.num_computed_tokens
+            if (
+                isinstance(incoming.get("text_token"), list)
+                and computed > 0
+                and len(prompt_ids) == computed + 1
+                and prompt_ids[-1] == 0
+                and new_req_data.prompt_embeds is None
+                and len(new_req_data.mm_features or []) == len(self.requests[req_id].mm_features or [])
+            ):
+                # vLLM folds past output into prompt_token_ids and appends one
+                # dummy row for text/EOS/tail updates. That row continues the
+                # model's decode state even though Omni calls it prefill.
+                merged["_easymagpie_text_resume_offset"] = computed
             self.model_intermediate_buffer[req_id] = merged
             setattr(self.requests[req_id], "additional_information_cpu", merged)
 
