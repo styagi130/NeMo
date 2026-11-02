@@ -330,7 +330,7 @@ class EasyMagpieCodePredictor(nn.Module):
         # is captured into the compiled loop graph (see ``EasyMagpieCodeLoop``),
         # so per-request ``top_k`` changes are not honored once captured;
         # per-request ``temperature`` is, since it is fed as a runtime tensor.
-        self.temperature: float = 0.7
+        self._temperature: float = 0.7
         self.top_k: int = _DEFAULT_TOP_K
         self.lt_hidden = lt_hidden
         self._sample_top_k = min(self.top_k, self.num_tokens_per_codebook)
@@ -349,7 +349,21 @@ class EasyMagpieCodePredictor(nn.Module):
         # Gumbel noise drawn eagerly each frame and injected into the graph; fp32
         # so the small ``-log(-log(u))`` values don't underflow in fp16.
         self._gumbel_buf = torch.zeros(max_num_tokens, self.num_codebooks, self._sample_top_k, dtype=torch.float32)
-        self._temperature_buf = torch.zeros(1, dtype=torch.float32)
+        self._temperature_buf = torch.full((1,), self._temperature, dtype=torch.float32)
+
+    @property
+    def temperature(self) -> float:
+        """Requested audio temperature, applied by the host before graph replay."""
+        return self._temperature
+
+    @temperature.setter
+    @torch.no_grad()
+    def temperature(self, value: float) -> None:
+        # Called by the outer model's host-side preprocess hook. Keep the graph
+        # input address stable and never refill it inside a captured forward:
+        # that would replay a fill with the capture-time Python scalar.
+        self._temperature = float(value)
+        self._temperature_buf.fill_(max(self._temperature, _MIN_SAMPLING_TEMPERATURE))
 
     @torch.no_grad()
     def init_forbidden_mask(self) -> None:
@@ -414,7 +428,6 @@ class EasyMagpieCodePredictor(nn.Module):
         noise.uniform_(1e-20, 1.0 - 1e-20)
         noise.log_().neg_().log_().neg_()
 
-        self._temperature_buf.fill_(max(float(self.temperature), _MIN_SAMPLING_TEMPERATURE))
         # Respect vLLM's graph dispatcher. Forcing FULL here bypasses the
         # PIECEWISE wrapper that captures this unsplit dense subgraph.
         return self._code_loop(in_buf, noise, self._temperature_buf)

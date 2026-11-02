@@ -12,12 +12,18 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import hashlib
+import json
 from types import SimpleNamespace
 
 import pytest
 import torch
 from easymagpie_vllm_omni.codec.encoder import EasyMagpieCodecEncoderOutput
 from easymagpie_vllm_omni.easymagpie import EasyMagpieTTSForConditionalGeneration
+from easymagpie_vllm_omni.easymagpie import _append_rolling_tail as append_tail
+from easymagpie_vllm_omni.easymagpie import _build_rolling_context as build_context
+from easymagpie_vllm_omni.easymagpie import _context_codes as context_codes
+from safetensors.torch import save_file
 from torch import nn
 
 
@@ -641,3 +647,311 @@ def test_load_weights_maps_hf_backbone_names_with_auto_loader():
     torch.testing.assert_close(model.backbone.embed_tokens.weight, embeddings)
     torch.testing.assert_close(model.backbone.layers[0].mixer.A, mamba_a)
     torch.testing.assert_close(model.text_embedding.weight, embeddings + 1)
+
+
+class TestRollingContext:
+
+    def test_existing_reference_rows_and_direct_generated_embeddings_match_native_layout(self):
+        saved = torch.arange(384).reshape(96, 4).float()
+
+        def embed(codes):
+            return codes.float()
+
+        for count in (1, 2, 62, 63, 64, 75, 124, 125):
+            tail = torch.arange(count * 2).reshape(2, count).remainder(16)
+            actual = build_context(
+                saved, tail, embed_audio=embed, codebook_size=16, stacking_factor=2, total_frames=250, has_audio=True
+            )
+            rows = 1 + min((250 - count + 1) // 2, 94)
+            expected = context_codes(tail, bos_id=18, eos_id=19, stacking_factor=2).T.float()[1:]
+            torch.testing.assert_close(actual[:rows], saved[:rows], atol=0, rtol=0)
+            torch.testing.assert_close(actual[rows:], expected, atol=0, rtol=0)
+            assert not bool((actual[rows:] == 18).any())
+        assert actual.shape == (127, 4)
+
+    def test_generation_specials_are_rejected_in_model_namespace(self):
+        for bad in (-1, 16, 17, 18, 19):
+            with pytest.raises(ValueError, match='invalid generated'):
+                build_context(
+                    torch.randn(96, 4),
+                    torch.tensor([[bad], [1]]),
+                    embed_audio=None,
+                    codebook_size=16,
+                    stacking_factor=2,
+                    total_frames=250,
+                    has_audio=True,
+                )
+
+    def select(self, rows, previous=None, n=3):
+        return append_tail(previous, torch.tensor(rows), codebooks=2, stacking_factor=2, eos_id=99, maximum=n)
+
+    def test_eos_in_second_stacked_frame_keeps_first_frame(self):
+        (tail, ended) = self.select([[1, 2, 11, 12], [3, 99, 13, 14]])
+        assert ended
+        assert tail.tolist() == [[1, 2, 3], [11, 12, 13]]
+
+    def test_eos_in_any_codebook_discards_that_frame_and_every_later_frame(self):
+        (tail, ended) = self.select([[1, 2, 11, 12], [3, 4, 99, 14], [5, 6, 15, 16]])
+        assert ended
+        assert tail.tolist() == [[1, 2], [11, 12]]
+
+    def test_eos_first_frame_preserves_previous_tail_without_eos(self):
+        previous = torch.tensor([[1, 2, 3], [11, 12, 13]])
+        (tail, ended) = self.select([[99, 4, 14, 15]], previous)
+        assert ended
+        assert tail.tolist() == previous.tolist()
+
+    def test_tail_is_bounded_across_decode_steps(self):
+        (tail, ended) = self.select([[1, 2, 11, 12]])
+        assert not ended
+        (tail, ended) = self.select([[3, 4, 13, 14]], tail)
+        assert not ended
+        assert tail.tolist() == [[2, 3, 4], [12, 13, 14]]
+
+    def test_context_special_tokens_and_stacking_match_nemo_layout(self):
+        actual = context_codes(torch.tensor([[1, 2, 3, 4], [11, 12, 13, 14]]), bos_id=98, eos_id=99, stacking_factor=2)
+        assert actual.tolist() == [[98, 1, 3, 99], [98, 2, 4, 99], [98, 11, 13, 99], [98, 12, 14, 99]]
+
+    def test_factor_one_and_odd_length_have_exact_context_boundaries(self):
+        for factor in (1, 2, 3):
+            actual = context_codes(torch.arange(10).reshape(2, 5), bos_id=98, eos_id=99, stacking_factor=factor)
+            assert (actual[:, 0] == 98).all()
+            assert actual.shape[1] == 1 + (6 + factor - 1) // factor
+
+
+class _RollingEmbedder:
+    def embed_audio_frame(self, codes):
+        self.last_codes = codes.clone()
+        return codes.float()
+
+
+class TestRollingModel:
+
+    def setup_method(self):
+        self.model = EasyMagpieTTSForConditionalGeneration.__new__(EasyMagpieTTSForConditionalGeneration)
+        torch.nn.Module.__init__(self.model)
+        self.model.has_phoneme = False
+        self.model.arch = SimpleNamespace(
+            num_audio_codebooks=2, frame_stacking_factor=2, audio_eos_id=17, codebook_size=16
+        )
+        self.model.code_predictor = _RollingEmbedder()
+        self.model.rolling_enabled = True
+        self.model.rolling_total_frames = 250
+        self.model.rolling_tail_limit = 125
+        self.model.rolling_original_has_audio = {'voice': True}
+        self.model.speech_delay = 5
+        self.model.embedding_dim = 4
+        self.model.register_buffer('original', torch.arange(384).reshape(96, 4).float())
+        self.model._speaker_embedding_buffers = {'voice': 'original'}
+
+    def test_single_row_rolling_prefill_uses_scheduler_phase(self):
+        self.model._preprocess_decode = lambda *args: 'decode'
+        self.model._preprocess_prefill = lambda *args: 'prefill'
+        inputs = torch.zeros(1, dtype=torch.long)
+        assert self.model.preprocess(inputs, None, _omni_is_prefill=False) == 'decode'
+        assert (
+            self.model.preprocess(inputs, None, context_tail_tokens=3, rolling_voice='voice', _omni_is_prefill=True)
+            == 'prefill'
+        )
+        assert (
+            self.model.preprocess(
+                inputs,
+                None,
+                additional_information=dict(context_tail_tokens=3, rolling_voice='voice'),
+                _omni_is_prefill=True,
+            )
+            == 'prefill'
+        )
+        assert self.model.postprocess_uses_req_infos
+        assert 'rolling_tail' in self.model.gpu_resident_buffer_keys
+
+    def test_interleaved_requests_only_emit_their_own_context(self):
+        hidden = torch.zeros(2, 4)
+        mm = {'codes': {'audio': torch.tensor([[1, 2, 3, 4], [5, 17, 6, 7]])}}
+        a = self.model.postprocess(
+            hidden[:1], mm, context_tail_tokens=3, rolling_voice='voice', rolling_request_key='a'
+        )
+        b = self.model.postprocess(
+            hidden[1:],
+            mm,
+            context_tail_tokens=3,
+            rolling_voice='voice',
+            rolling_request_key='b',
+            request_id='internal-b',
+        )
+        assert set(mm['rolling_contexts']) == {'internal-b'}
+        assert a['rolling_tail'].tolist() == [[1, 2], [3, 4]]
+        assert b['rolling_tail'].tolist() == [[5], [6]]
+        later = {'codes': {'audio': torch.tensor([[8, 17, 9, 10]])}}
+        self.model.postprocess(
+            hidden[:1],
+            later,
+            context_tail_tokens=3,
+            rolling_tail=a['rolling_tail'],
+            rolling_voice='voice',
+            rolling_request_key='a',
+        )
+        assert set(later['rolling_contexts']) == {'a'}
+        assert not torch.equal(later['rolling_contexts']['a'], mm['rolling_contexts']['internal-b'])
+
+    def test_prefill_and_pre_speech_predictions_do_not_enter_the_tail(self):
+        for flags in [dict(_omni_is_prefill=True), dict(decode_offset=5)]:
+            mm = {'codes': {'audio': torch.full((1, 4), 17)}}
+            result = self.model.postprocess(torch.zeros(1, 4), mm, context_tail_tokens=3, **flags)
+            assert 'rolling_tail' not in result
+            assert 'rolling_contexts' not in mm
+
+    def test_short_generated_payload_keeps_saved_prefix_and_native_context_eos(self):
+        mm = {'codes': {'audio': torch.tensor([[2, 17, 3, 4]])}}
+        result = self.model.postprocess(
+            torch.zeros(1, 4), mm, context_tail_tokens=125, rolling_voice='voice', rolling_request_key='a'
+        )
+        assert result['rolling_tail'].tolist() == [[2], [3]]
+        context = mm['rolling_contexts']['a']
+        torch.testing.assert_close(context[:95], self.model.original[:95], rtol=0, atol=0)
+        assert context.shape == (96, 4)
+        assert not bool((self.model.code_predictor.last_codes == 17).any())
+        assert bool((self.model.code_predictor.last_codes == 19).any())
+        assert result['rolling_ended']
+        other = {'codes': {'audio': torch.tensor([[2, 17, 3, 4]])}}
+        self.model.postprocess(torch.zeros(1, 4), other, context_tail_tokens=125, rolling_ended=True)
+        assert 'rolling_contexts' not in other
+
+    def test_empty_generated_payload_falls_back_to_complete_saved_tensor(self):
+        mm = {'codes': {'audio': torch.tensor([[17, 2, 3, 4]])}}
+        self.model.postprocess(
+            torch.zeros(1, 4), mm, context_tail_tokens=125, rolling_voice='voice', rolling_request_key='a'
+        )
+        assert mm['rolling_contexts']['a'] is self.model.original
+
+    def test_text_only_continuation_is_direct_generated_audio(self):
+        self.model.rolling_original_has_audio['voice'] = False
+        self.model.original = self.model.original[:2]
+        mm = {'codes': {'audio': torch.tensor([[2, 17, 3, 4]])}}
+        self.model.postprocess(
+            torch.zeros(1, 4),
+            mm,
+            context_tail_tokens=125,
+            rolling_tail=torch.ones(2, 124, dtype=torch.long),
+            rolling_voice='voice',
+            rolling_request_key='a',
+        )
+        tail = torch.cat((torch.ones(2, 124, dtype=torch.long), torch.tensor([[2], [3]])), dim=-1)
+        expected = context_codes(tail, bos_id=18, eos_id=19, stacking_factor=2).T.float()
+        torch.testing.assert_close(mm['rolling_contexts']['a'], expected)
+        assert expected.shape == (64, 4)
+
+    def test_continuation_context_is_placed_before_unchanged_style_text(self):
+        model = self.model
+        model._combined_embeddings = torch.zeros(1, 4)
+        model._prefill_cache = {}
+        model.task_embedding = None
+        model.text_embedding = torch.nn.Embedding(3, 4)
+        model.text_embedding.weight.data.fill_(3.0)
+        model._encode_context_text = lambda text, device: torch.tensor([1, 2])
+        model._build_text_prefill_embeds = lambda *args: None
+        generated = torch.full((11, 4), 5.0)
+        output = model._build_prefill_embeds(
+            torch.device('cpu'), dict(rolling_voice='voice', context_text='style', speaker_embedding=generated)
+        )
+        torch.testing.assert_close(output, torch.cat((generated, torch.full((2, 4), 3.0))))
+        model._maybe_set_lt_sampling_params = lambda info: None
+        model.arch.condition_on_user_speech = False
+        model._encode_text_stream = lambda text: [1, 2]
+        inputs = torch.zeros(13, dtype=torch.long)
+        (_, prefill, update) = model.preprocess(
+            inputs,
+            None,
+            speaker_embedding=generated,
+            context_text='style',
+            text='next',
+            context_tail_tokens=125,
+            rolling_voice='voice',
+            _omni_is_prefill=True,
+            _omni_num_computed_tokens=0,
+            _omni_prompt_len=13,
+        )
+        torch.testing.assert_close(prefill, output)
+        assert update['text_tokens'] == [1, 2]
+        assert model._prefill_cache == {}
+
+    def test_metadata_is_validated_without_loading_additional_weights(self, tmp_path):
+        self.model.model_path = str(tmp_path)
+        self.model._initialize_rolling_context()
+        assert not self.model.rolling_enabled
+        root = tmp_path / 'rolling_context'
+        root.mkdir()
+        self.model.original.add_(0.0001)
+        config = dict(
+            schema_version=5,
+            embedding_dim=4,
+            original_has_audio={'voice': True},
+            initial_contexts={
+                'voice': dict(rows=96, sha256=hashlib.sha256(self.model.original.numpy().tobytes()).hexdigest())
+            },
+            max_generated_frames=125,
+            total_frames=250,
+            frames_per_second=25.0,
+            total_duration_seconds=10.0,
+        )
+        (root / 'config.json').write_text(json.dumps(config))
+        self.model._initialize_rolling_context()
+        assert self.model.rolling_enabled
+        assert not hasattr(self.model, 'rolling_encoder')
+        original = self.model.original
+        for dtype in (torch.float16, torch.bfloat16):
+            self.model.original = original.to(dtype)
+            self.model._initialize_rolling_context()
+            assert self.model.rolling_enabled
+            assert self.model.original.dtype == dtype
+        self.model.original = original
+        config['initial_contexts']['voice']['sha256'] = 'changed'
+        (root / 'config.json').write_text(json.dumps(config))
+        with pytest.raises(ValueError, match='complete saved context'):
+            self.model._initialize_rolling_context()
+        config['schema_version'] = 3
+        (root / 'config.json').write_text(json.dumps(config))
+        with pytest.raises(ValueError, match='schema 5'):
+            self.model._initialize_rolling_context()
+
+
+def _speaker_model(model_path, embedding_dim=3):
+    model = EasyMagpieTTSForConditionalGeneration.__new__(EasyMagpieTTSForConditionalGeneration)
+    nn.Module.__init__(model)
+    model.model_path = str(model_path)
+    model.embedding_dim = embedding_dim
+    model._combined_embeddings = torch.zeros(1, embedding_dim)
+    model._speaker_embedding_buffers = {}
+    return model
+
+
+def test_context_bundle_is_preloaded_as_nonpersistent_buffers(tmp_path):
+    speaker_dir = tmp_path / "speaker_embeddings"
+    speaker_dir.mkdir()
+    registry = {
+        "schema_version": 1,
+        "contexts": {
+            "eng": {"tensor_key": "speaker.eng", "context_text": "[EN]", "prompt_len": 67},
+            "deu": {"tensor_key": "speaker.deu", "context_text": "[DE]", "prompt_len": 69},
+        },
+    }
+    (speaker_dir / "contexts.json").write_text(json.dumps(registry))
+    tensors = {"speaker.eng": torch.ones(2, 3), "speaker.deu": torch.full((4, 3), 2.0)}
+    save_file(tensors, speaker_dir / "contexts.safetensors")
+    model = _speaker_model(tmp_path)
+
+    model._preload_known_speaker_embeddings()
+
+    assert sorted(model._speaker_embedding_buffers) == ["deu", "eng"]
+    torch.testing.assert_close(
+        model._load_known_speaker_embedding("eng", torch.device("cpu"), torch.float32), tensors["speaker.eng"]
+    )
+    assert not any(name.startswith("_speaker_context_") for name in model.state_dict())
+
+    assert EasyMagpieTTSForConditionalGeneration.get_prompt_len("eng", str(tmp_path), tokenize=list) == 67
+    with pytest.raises(FileNotFoundError, match="speaker_id 'missing'"):
+        EasyMagpieTTSForConditionalGeneration.get_prompt_len("missing", str(tmp_path), tokenize=list)
+
+    assert EasyMagpieTTSForConditionalGeneration.get_prompt_len(
+        "eng", str(tmp_path), tokenize=list, context_text="longer style"
+    ) == 67 - len("[EN]") + len("longer style")

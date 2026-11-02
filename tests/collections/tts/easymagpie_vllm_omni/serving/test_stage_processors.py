@@ -697,3 +697,31 @@ def _adapter_manager(monkeypatch=None):
         scheduler.chunk_transfer_adapter = manager
         scheduler.__init__()
     return manager
+
+
+def test_async_codec_uses_captured_finish_flag_when_request_already_finished():
+    manager = _manager()
+    manager.config.hf_config.streaming_speech_delay = 0
+    manager.connector.config["extra"]["codec_chunk_frames"] = 4
+    request = _Request()
+    request.resumable = False
+    request.finished = True  # save-loop observes later scheduler state.
+    assert talker2code2wav_async_chunk(manager, _output(1), request, is_finished=False) is None
+    assert talker2code2wav_async_chunk(manager, _output(2), request, is_finished=False) is None
+    terminal = talker2code2wav_async_chunk(manager, _output(1025), request, is_finished=True)
+    assert bool(terminal.meta.finished)
+    torch.testing.assert_close(terminal.codes.audio[:2], torch.tensor([[1, 101], [2, 102]]))
+    assert request.external_req_id not in manager._emp_frame_buffer
+
+
+def test_async_codec_captured_terminal_flushes_before_request_status_changes():
+    manager = _manager()
+    manager.config.hf_config.streaming_speech_delay = 0
+    manager.connector.config["extra"]["codec_chunk_frames"] = 4
+    request = _Request()
+    request.resumable = False
+    assert talker2code2wav_async_chunk(manager, _output(1), request, is_finished=False) is None
+    terminal = talker2code2wav_async_chunk(manager, _output(1025), request, is_finished=True)
+    assert terminal is not None
+    assert bool(terminal.meta.finished)
+    assert request.external_req_id not in manager._emp_frame_buffer

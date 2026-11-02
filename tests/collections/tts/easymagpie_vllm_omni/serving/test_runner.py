@@ -22,12 +22,175 @@ import numpy as np
 import pytest
 import torch
 import yaml
-
 from conftest import EASYMAGPIE_ROOT
 from easymagpie_vllm_omni.easymagpie import EasyMagpieTTSForConditionalGeneration
 from easymagpie_vllm_omni.runner import EasyMagpieGPUARModelRunner, merge_streaming_additional_information
+from vllm_omni.engine.serialization import serialize_additional_information
+from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
 
 WORKER_CLS = "easymagpie_vllm_omni.runner.EasyMagpieGPUARWorker"
+
+
+@pytest.mark.parametrize("incoming", [[25, 26], [3], []], ids=["text", "text_eos", "audio_tail"])
+def test_streaming_text_resume_decodes_after_retained_context(incoming):
+    """NVBug 7022145: a 43-token resumed prompt must not re-prefill a 31-row context."""
+    runner = _streaming_resume_runner()
+    model = runner.model
+    initial_text = list(range(10, 25))
+    info = {
+        "speaker_id": "speaker",
+        "text_token": initial_text,
+        "text_token_start": 0,
+        "text_prefill_num": 4,
+        "prefill_text_tokens": initial_text[:4],
+    }
+    runner.model_intermediate_buffer["request"] = info
+    _, rows, update = model.preprocess(
+        torch.zeros(31, dtype=torch.long),
+        None,
+        **info,
+        _omni_is_prefill=True,
+        _omni_num_computed_tokens=0,
+        _omni_prompt_len=31,
+    )
+    assert rows.shape == (31, 3)
+    runner._update_intermediate_buffer("request", update)
+    runner._update_intermediate_buffer(
+        "request",
+        {"last_audio_codes": torch.tensor([[5, 6]]), "last_phoneme_token": torch.tensor([[7]])},
+    )
+    # The first segment has consumed all 15 text tokens when the next input arrives.
+    for computed in range(31, 42):
+        _, _, update = model.preprocess(
+            torch.zeros(1, dtype=torch.long),
+            None,
+            **runner.model_intermediate_buffer["request"],
+            _omni_is_prefill=False,
+            _omni_num_computed_tokens=computed,
+            _omni_prompt_len=31,
+        )
+        runner._update_intermediate_buffer("request", update)
+
+    request = runner._update_streaming_request(
+        "request", _streaming_resume_data({"text_token": incoming, "text_token_start": 15})
+    )
+    assert request.num_computed_tokens == 42
+    assert len(request.prompt_token_ids) == 43
+    input_ids = torch.zeros(4, dtype=torch.long)
+    _, rows, update = model.preprocess(
+        input_ids[2:3],
+        None,
+        **runner.model_intermediate_buffer["request"],
+        _omni_is_prefill=True,
+        _omni_num_computed_tokens=42,
+        _omni_prompt_len=43,
+    )
+    runner._update_intermediate_buffer("request", update)
+    state = runner.model_intermediate_buffer["request"]
+    assert state["decode_offset"] == 16
+    assert state["text_tokens"] == initial_text + incoming
+    assert rows.shape == (1, 3)
+    assert model._dec_text_mask[2].item() == bool(incoming)
+    if incoming:
+        assert model._dec_text_tokens[2].item() == incoming[0]
+    assert model._dec_audio_codes[2].tolist() == [5, 6]
+    assert model._dec_phoneme_tokens[2].tolist() == [7]
+    assert model._dec_audio_valid[2].item() == 1
+    assert model._dec_phoneme_valid[2].item() == 1
+
+    # Persistent chunk metadata is consumed once on the following decode step.
+    _, _, update = model.preprocess(
+        input_ids[2:3],
+        None,
+        **state,
+        _omni_is_prefill=False,
+        _omni_num_computed_tokens=43,
+        _omni_prompt_len=43,
+    )
+    runner._update_intermediate_buffer("request", update)
+    state = runner.model_intermediate_buffer["request"]
+    assert state["decode_offset"] == 17
+    assert state["text_tokens"] == initial_text + incoming
+
+
+def test_single_row_context_prefill_remains_prefill():
+    runner = _streaming_resume_runner()
+    model = runner.model
+    info = {
+        "speaker_id": "speaker",
+        "text_token": [10, 11, 12, 13],
+        "text_token_start": 0,
+        "text_prefill_num": 4,
+        "prefill_text_tokens": [10, 11, 12, 13],
+    }
+    chunks = []
+    for computed, count in ((0, 30), (30, 1)):
+        _, rows, update = model.preprocess(
+            torch.zeros(count, dtype=torch.long),
+            None,
+            **info,
+            _omni_is_prefill=True,
+            _omni_num_computed_tokens=computed,
+            _omni_prompt_len=31,
+        )
+        chunks.append(rows)
+        info.update(update)
+    torch.testing.assert_close(torch.cat(chunks), model._build_prefill_embeds(torch.device("cpu"), info))
+    assert info["decode_offset"] == 4
+
+
+@pytest.mark.parametrize(
+    "info,tokens,mm_features",
+    [
+        ({"text": "New user-audio turn"}, [1], [object()]),
+        ({"text_token": [25], "text_token_start": 15}, [1], [object()]),
+        ({"text_token": [25], "text_token_start": 15}, [0], [object()]),
+        ({"text_token": [25], "text_token_start": 15}, [0, 0], []),
+        ({}, [0], []),
+    ],
+    ids=["user_audio", "tokenized_user_audio", "new_multimodal_input", "multiple_rows", "empty_metadata"],
+)
+def test_later_prefill_clears_text_resume_state(info, tokens, mm_features):
+    runner = _streaming_resume_runner()
+    runner._update_streaming_request("request", _streaming_resume_data({"text_token": [25], "text_token_start": 15}))
+    runner._update_streaming_request(
+        "request", _streaming_resume_data(info, computed=43, tokens=tokens, mm_features=mm_features)
+    )
+    # A one-row audio prefill must still reach the audio/context path, even if
+    # the previous update was a text resume and its metadata remains cached.
+    expected = torch.full((len(tokens), 3), 7.0)
+    runner.model._preprocess_prefill = lambda ids, embeds, count, device, info: (ids, expected, {})
+    _, rows, _ = runner.model.preprocess(
+        torch.tensor(tokens),
+        None,
+        **runner.model_intermediate_buffer["request"],
+        _omni_is_prefill=True,
+        _omni_num_computed_tokens=43,
+        _omni_prompt_len=43 + len(tokens),
+    )
+    torch.testing.assert_close(rows, expected)
+
+
+def test_text_resume_does_not_override_context_replay():
+    runner = _streaming_resume_runner()
+    runner.model_intermediate_buffer["request"] = {
+        "speaker_id": "speaker",
+        "text_token": [10, 11, 12, 13],
+        "text_tokens": [10, 11, 12, 13],
+        "text_token_start": 0,
+        "text_prefill_num": 4,
+        "prefill_text_tokens": [10, 11, 12, 13],
+    }
+    runner._update_streaming_request("request", _streaming_resume_data({"text_token": [14], "text_token_start": 4}))
+    _, rows, _ = runner.model.preprocess(
+        torch.zeros(1, dtype=torch.long),
+        None,
+        **runner.model_intermediate_buffer["request"],
+        _omni_is_prefill=True,
+        _omni_num_computed_tokens=0,
+        _omni_prompt_len=43,
+    )
+    torch.testing.assert_close(rows, torch.ones(1, 3))
 
 
 @pytest.mark.parametrize("padded,active", [(8, 3), (16, 9), (40, 34), (128, 65)])
@@ -218,3 +381,65 @@ def test_offline_demo_reuses_one_engine_with_self_contained_requests():
     assert "ASSISTANT_TURN_1_TEXT" in source
     assert "ASSISTANT_TURN_2_TEXT" in source
     assert "class MultiturnInput" not in source
+
+
+def test_rolling_contexts_are_selected_per_request(monkeypatch):
+    monkeypatch.setattr(GPUARModelRunner, "_build_omni_mm_payload", lambda self, *, mm_cpu, **kwargs: dict(mm_cpu))
+    runner = object.__new__(EasyMagpieGPUARModelRunner)
+    a, b = torch.ones(3, 4), torch.zeros(5, 4)
+    mm = {"rolling_contexts": {"a": a, "b": b}, "codes.audio": torch.ones(2, 8)}
+    for rid, expected in (("a", a), ("b", b)):
+        result = runner._build_omni_mm_payload(mm_cpu=mm, rid=rid)
+        assert set(result) == {"codes.audio", "model_outputs.rolling_context"}
+        torch.testing.assert_close(result["model_outputs.rolling_context"], expected)
+        assert result["model_outputs.rolling_context"].data_ptr() != expected.data_ptr()
+    assert set(runner._build_omni_mm_payload(mm_cpu=mm, rid="other")) == {"codes.audio"}
+
+
+def _streaming_resume_runner():
+    model = EasyMagpieTTSForConditionalGeneration.__new__(EasyMagpieTTSForConditionalGeneration)
+    torch.nn.Module.__init__(model)
+    model.arch = SimpleNamespace(
+        condition_on_user_speech=False, text_prefill_num=4, phoneme_stacking_factor=1, audio_bos_id=32
+    )
+    model.embedding_dim = 3
+    model.num_codebooks = 2
+    model.has_phoneme = True
+    model.phonemes_delay = 3
+    model.speech_delay = 5
+    model.phoneme_bos_id = 8
+    model.phoneme_eos_id = 9
+    model.text_embedding = torch.nn.Embedding(64, 3)
+    model.phoneme_embeddings = torch.nn.ModuleList([torch.nn.Embedding(64, 3)])
+    model._prefill_cache = {(0, "speaker", "[EN]", "cpu"): torch.ones(27, 3)}
+    model._combined_embeddings = torch.zeros(4, 3)
+    for name, shape in (
+        ("_dec_text_tokens", (4,)),
+        ("_dec_text_mask", (4,)),
+        ("_dec_phoneme_tokens", (4, 1)),
+        ("_dec_phoneme_valid", (4,)),
+        ("_dec_audio_codes", (4, 2)),
+        ("_dec_audio_valid", (4,)),
+    ):
+        setattr(model, name, torch.zeros(shape, dtype=torch.long))
+    runner = object.__new__(EasyMagpieGPUARModelRunner)
+    runner.model = model
+    runner.requests = {"request": SimpleNamespace(mm_features=[], output_token_ids=[])}
+    runner.model_intermediate_buffer = {}
+    runner.input_batch = SimpleNamespace(remove_request=lambda req_id: None)
+    runner.late_interaction_runner = SimpleNamespace(register_request=lambda req_id, params: None)
+    runner.uses_mrope = False
+    return runner
+
+
+def _streaming_resume_data(info, *, computed=42, tokens=None, mm_features=None):
+    return SimpleNamespace(
+        prompt_token_ids=[0] * computed + ([0] if tokens is None else tokens),
+        num_computed_tokens=computed,
+        additional_information=serialize_additional_information(info),
+        mm_features=mm_features or [],
+        prompt_embeds=None,
+        sampling_params=None,
+        pooling_params=None,
+        block_ids=([0],),
+    )

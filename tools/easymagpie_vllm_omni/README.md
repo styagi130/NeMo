@@ -423,3 +423,45 @@ server finish reasons/token counts to identify truncations before using these nu
 for quality or complete-utterance comparisons. Verify small/large caps at the backend
 and first PCM arrival before generation completion; several network chunks alone do
 not establish generation-time streaming. Client concurrency is not engine batch capacity.
+
+
+## Rolling speaker context
+
+The first request uses its complete saved context tensor unchanged. At acoustic
+EOS, the existing model and runner return `model_outputs.rolling_context` for the
+next fresh request. No speaker encoder runs for continuation, and generated PCM
+is never re-encoded.
+
+For audio-bearing originals, combine an unchanged saved-reference prefix with
+direct embeddings of the preceding request's last valid codes: up to 125 raw
+frames (five seconds at 25 fps), within a nominal ten-second budget. Short tails
+use more reference rows, capped by the available saved payload; empty tails keep
+the full saved tensor. Stacked reference rows round up to whole rows (40 ms extra
+for a five-second prefix at factor two). Slicing encoded rows is not equivalent
+to cropping the original waveform.
+
+For text-only originals, continuations use `[task | generated audio | original
+context text]`. Keep original style text and voice identity throughout. Exclude
+generation EOS and later frames in every codebook; apply native context BOS/EOS
+and stacking, omitting the duplicate generated BOS when joining reference rows.
+
+Export schema-5 metadata from existing tensors and converted codec metadata:
+
+```bash
+python -m easymagpie_vllm_omni.export_rolling_context --contexts contexts.json \
+  --output converted_model --context-audio-duration 10 --context-tail-tokens 125
+```
+
+Older schemas require rebuilding. Export needs no NeMo model, reference recording,
+encoder weights or raw-code reserve. Original tensors load once at initialization.
+
+Supply `context_tail_tokens`, `rolling_voice` and `rolling_request_key`; feed the
+returned tensor as the next request's `speaker_embedding`, using its actual
+prefill length. Only the immediately preceding request contributes generated
+codes. Disable prefix caching. Dynamic tensors bypass the static prefill cache
+and raw-audio encoder; rolling exports use per-request feedback collection while
+retaining owned snapshots. Existing raw-reference and multiturn paths remain.
+
+Audio temperature updates a stable GPU tensor before graph replay (default
+`0.7`); batched requests must share it. Graph-captured `top_k` remains fixed.
+Codec transfer uses captured completion flags to preserve asynchronous tails.
