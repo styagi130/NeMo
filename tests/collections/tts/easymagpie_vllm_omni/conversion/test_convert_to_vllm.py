@@ -140,7 +140,8 @@ def test_extract_speaker_embedding_without_reference_transformer(monkeypatch):
     torch.testing.assert_close(result, torch.arange(6, dtype=torch.float32).view(2, 3))
 
 
-def test_build_config_exports_multiturn_text_metadata(monkeypatch):
+@pytest.mark.parametrize("order", [None, "codebook_major", "frame_major"])
+def test_build_config_exports_multiturn_text_metadata(monkeypatch, order):
     class _FakeNemotronHConfig:
         def __init__(self, **kwargs):
             self.__dict__.update(kwargs)
@@ -187,8 +188,11 @@ def test_build_config_exports_multiturn_text_metadata(monkeypatch):
         mask_token_id=36,
     )
 
+    if order is not None:
+        model.cfg.local_transformer_order = order
     config = converter.build_config(model, vocab_size=104, torch_dtype="float32")
 
+    assert config["local_transformer_order"] == (order or "codebook_major")
     assert config["text_eos_id"] == 101
     assert config["text_interruption_id"] == 103
     assert config["use_multiturn_dataset"] is True

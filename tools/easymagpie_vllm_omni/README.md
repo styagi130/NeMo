@@ -27,6 +27,12 @@ fresh, pre-drawn Gumbel noise, and vLLM selects the CUDA graph mode. Changing th
 projection shapes can change floating-point results and sampled codes. The codec
 runs in FP32 in the default and C128 profiles; the opt-in C256 profile uses FP16.
 
+Conversion preserves the checkpoint's `local_transformer_order`. RC5 frame-major
+checkpoints predict every codebook for one frame before advancing to the next
+frame in the stack. The sampled codes keep the same codebook-major layout used
+by the backbone and codec. Checkpoints without this field retain the original
+`codebook_major` order; reconvert RC5 checkpoints with the updated converter.
+
 The EasyMagpie runner batches resident decode feedback and text metadata after
 assigning request rows. Startup delays, phoneme EOS, streamed text offsets and
 request-owned feedback retain their existing semantics. Partial or nonresident

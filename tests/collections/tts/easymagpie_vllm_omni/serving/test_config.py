@@ -39,6 +39,19 @@ def test_derived_codebook_counts():
     assert arch.num_all_tokens_per_codebook == 1024 + NUM_SPECIAL_AUDIO_TOKENS
 
 
+@pytest.mark.parametrize("order", [None, "codebook_major", "frame_major"])
+@pytest.mark.parametrize("stacking", [1, 2, 3])
+def test_local_transformer_channel_order(order, stacking):
+    config = dict(num_audio_codebooks=8, frame_stacking_factor=stacking)
+    if order is not None:
+        config["local_transformer_order"] = order
+    arch = EasyMagpieOmniArch.from_hf_config(types.SimpleNamespace(**config))
+    channels = tuple(range(8 * stacking))
+    expected = tuple(k for frame in range(stacking) for k in channels[frame::stacking])
+    assert arch.local_transformer_order == (order or "codebook_major")
+    assert arch.local_transformer_channel_order == (expected if order == "frame_major" else channels)
+
+
 def test_special_token_ids_default_to_codebook_offsets():
     arch = EasyMagpieOmniArch(codebook_size=1024)
     assert arch.audio_eos_id == 1024 + SPECIAL_AUDIO_EOS
@@ -115,6 +128,7 @@ def test_text_prefill_includes_first_phoneme_bos_position():
     [
         ({"hidden_dim": 1024, "embedding_dim": 1536}, "hidden_dim.*embedding_dim"),
         ({"local_transformer_n_heads": 7}, "local_transformer_hidden_dim.*divisible"),
+        ({"local_transformer_order": "invalid"}, "local_transformer_order"),
         ({"phoneme_stacking_factor": 0, "phoneme_vocab_size": 2051}, "both enabled or both disabled"),
         (
             {"streaming_phonemes_delay": 3, "streaming_speech_delay": 3},

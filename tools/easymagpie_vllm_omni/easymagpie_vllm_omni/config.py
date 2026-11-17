@@ -93,6 +93,7 @@ class EasyMagpieOmniArch:
     local_transformer_n_layers: int = 3
     local_transformer_n_heads: int = 12
     local_transformer_hidden_dim: int = 1536
+    local_transformer_order: str = "codebook_major"
 
     # Optional checkpoint-specific special-token ids.
     forced_audio_bos_id: int | None = None
@@ -139,6 +140,12 @@ class EasyMagpieOmniArch:
                 "local_transformer_hidden_dim must be divisible by local_transformer_n_heads for the current "
                 "attention implementation; extend EasyMagpieCodePredictor to support other head layouts. Got "
                 f"{self.local_transformer_hidden_dim} and {self.local_transformer_n_heads}."
+            )
+
+        if self.local_transformer_order not in {"codebook_major", "frame_major"}:
+            raise ValueError(
+                "local_transformer_order must be 'codebook_major' or 'frame_major', "
+                f"got {self.local_transformer_order!r}"
             )
 
         phonemes_enabled = self.phoneme_vocab_size > 0 and self.phoneme_stacking_factor > 0
@@ -235,6 +242,17 @@ class EasyMagpieOmniArch:
     def num_stacked_codebooks(self) -> int:
         """Number of independent codebooks the model autoregresses over (``C * S``)."""
         return self.num_audio_codebooks * self.frame_stacking_factor
+
+    @property
+    def local_transformer_channel_order(self) -> tuple[int, ...]:
+        """Prediction order of canonical ``codebook * stacking + frame`` channels."""
+        if self.local_transformer_order == "frame_major":
+            return tuple(
+                codebook * self.frame_stacking_factor + frame
+                for frame in range(self.frame_stacking_factor)
+                for codebook in range(self.num_audio_codebooks)
+            )
+        return tuple(range(self.num_stacked_codebooks))
 
     @property
     def codec_samples_per_row(self) -> int:
@@ -428,6 +446,7 @@ class EasyMagpieOmniArch:
             "local_transformer_n_layers",
             "local_transformer_n_heads",
             "local_transformer_hidden_dim",
+            "local_transformer_order",
             "forced_audio_bos_id",
             "forced_audio_eos_id",
             "forced_mask_token_id",
